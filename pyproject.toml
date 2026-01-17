@@ -1,3 +1,4 @@
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -18,13 +19,6 @@ dependencies = [
 dev = [
   "pytest",
 ]
-
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["models*", "datasets*", "toolbox*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
