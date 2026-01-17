@@ -21,7 +21,7 @@ import pytest
 import tensorflow as tf
 
 # If this file lives in choice_learn/models/, keep the import relative.
-from .featurebased import BaseFeatureBasedDeepHalo, FeatureBasedDeepHalo
+from models.featurebased import BaseFeatureBasedDeepHalo, FeatureBasedDeepHalo
 
 
 def _make_base(
