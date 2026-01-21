@@ -2,42 +2,27 @@ import numpy as np
 from numpy.random import default_rng
 
 
-def generate_dgp(
-    T=25,  # number of markets
-    J=15,  # products per market
-    N=1000,  # consumers per market
-    dgp_type=1,  # 1,2,3,4
-    beta_p=-1.0,
-    beta_w=0.5,
-    sigma=1.5,
-    seed=None,
-):
+def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
     """
-    Generate artificial data following Lu–Shimizu (Section 4).
-
-    DGP types:
-        1: sparse Ejt, exogenous price
-        2: sparse Ejt, endogenous price
-        3: non-sparse Ejt, exogenous price
-        4: non-sparse Ejt, endogenous price
+    Generate market/product primitives for Lu–Shimizu Section 4.
 
     Returns:
-        pjt  : (T, J) prices
-        wjt  : (T, J) exogenous characteristic
-        Ejt  : (T, J) unobserved demand shocks
-        jt  : (T, J) quantities sod
+      wjt   : (T,J) exogenous characteristic
+      E_bar_t : (T,) market-level shock baseline
+      njt   : (T,J) product deviations
+      Ejt   : (T,J) unobserved demand shocks
+      ujt   : (T,J) price shock (paper: u_jt)
+      alpha : (T,J) endogeneity shifter
     """
-
     rng = default_rng(seed)
 
-    # ------------------------------------------------------------------
-    # 1. Exogenous product characteristic
-    # ------------------------------------------------------------------
+    if dgp_type not in (1, 2, 3, 4):
+        raise ValueError("dgp_type must be 1, 2, 3, or 4")
+
+    # Observed characteristic
     wjt = rng.uniform(1.0, 2.0, size=(T, J))
 
-    # ------------------------------------------------------------------
-    # 2. Unobserved demand shocks: Ejt = E_bar_t + njt
-    # ------------------------------------------------------------------
+    # Unobserved demand shocks
     E_bar_t = -1.0 * np.ones(T)
     njt = np.zeros((T, J))
 
@@ -46,57 +31,84 @@ def generate_dgp(
         for t in range(T):
             for j in range(n_active):
                 njt[t, j] = 1.0 if j % 2 == 0 else -1.0
-
-    elif dgp_type in (3, 4):  # non-sparse
+    else:  # non-sparse
         njt = rng.normal(0.0, 1.0 / 3.0, size=(T, J))
-
-    else:
-        raise ValueError("dgp_type must be 1, 2, 3, or 4")
 
     Ejt = E_bar_t[:, None] + njt
 
-    # ------------------------------------------------------------------
-    # 3. Price equation
-    # ------------------------------------------------------------------
-    cost_shock = rng.normal(0.0, 0.7, size=(T, J))
+    # Price equation components
+    ujt = rng.normal(0.0, 0.7, size=(T, J))
     alpha = np.zeros((T, J))
 
     if dgp_type == 2:  # sparse endogenous
         alpha[njt == 1.0] = 0.3
         alpha[njt == -1.0] = -0.3
-
     elif dgp_type == 4:  # non-sparse endogenous
-        alpha[njt >= 1.0 / 3.0] = 0.3
-        alpha[njt <= -1.0 / 3.0] = -0.3
+        thr = 1.0 / 3.0
+        alpha[njt >= thr] = 0.3
+        alpha[njt <= -thr] = -0.3
 
-    pjt = alpha + 0.3 * wjt + cost_shock
+    return wjt, E_bar_t, njt, Ejt, ujt, alpha
 
-    # ------------------------------------------------------------------
-    # 4. Simulate consumers and aggregate choices
-   ------------------------------------------------------------------
-    qjt = np.zeros((T, J))
 
-    # for each market
-    for t in range(T):
-        # Sample individual-specific price sensitivities for each consumer in market t
-        beta_p_i = rng.normal(beta_p, sigma, size=N)
+class BasicLuChoiceModel:
+    """
+    Basic Lu–Shimizu simulation-side choice model (Section 4).
+    """
 
-        # for each consumer
-        for i in range(N):
-            # Compute utility for each product for consumer i in market t
-            utility = beta_p_i[i] * pjt[t] + beta_w * wjt[t] + Ejt[t]
+    def __init__(self, N: int, beta_p: float, beta_w: float, sigma: float, seed: int):
+        rng = default_rng(seed)
 
-            # Numerator of softmax choice probability (exp(utility) for all products)
-            exp_u = np.exp(utility)
-            # Denominator includes outside option utility (normalized to zero)
-            denom = 1.0 + exp_u.sum()  # 1.0 = outside option
-            # Choice probabilities for all products (excluding outside)
-            probs = exp_u / denom
+        self.N = int(N)
+        self.beta_w = float(beta_w)
+        self.beta_p_i = rng.normal(beta_p, sigma, size=self.N)
 
-            # Simulate the consumer's choice (J+1 options: J products + outside option)
-            choice = rng.choice(J + 1, p=np.append(probs, 1.0 - probs.sum()))
-            if choice < J:
-                # Aggregate: Add to demand count for chosen product
-                qjt[t, choice] += 1
+    def utilities(
+        self, pjt: np.ndarray, wjt: np.ndarray, Ejt: np.ndarray
+    ) -> np.ndarray:
+        """
+        Returns:
+          uijt : (T,N,J) systematic utility
+        """
+        T, J = pjt.shape
+        uijt = np.zeros((T, self.N, J))
 
-    return pjt, wjt, Ejt, qjt
+        for t in range(T):
+            uijt[t] = (
+                self.beta_p_i[:, None] * pjt[t][None, :]
+                + self.beta_w * wjt[t][None, :]
+                + Ejt[t][None, :]
+            )
+        return uijt
+
+
+def generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert systematic utilities into market shares by averaging choice probabilities
+    across consumers (no discrete sampling).
+
+    Inputs:
+      uijt : (T, N, J) systematic utility
+
+    Returns:
+      sjt  : (T, J) inside good shares
+      s0t  : (T,) outside good shares
+    """
+    if uijt.ndim != 3:
+        raise ValueError("uijt must have shape (T, N, J)")
+
+    # Stable logit probabilities:
+    # For each (t,i), compute softmax over J goods with an outside option.
+    # Outside utility is normalized to 0, so its exp is 1.
+    T, N, J = uijt.shape
+
+    # subtract max per (t,i) for numerical stability
+    m = np.max(uijt, axis=2, keepdims=True)  # (T, N, 1)
+    exp_u = np.exp(uijt - m)  # (T, N, J)
+    denom = 1.0 + np.sum(exp_u, axis=2)  # (T, N)
+    probs = exp_u / denom[..., None]  # (T, N, J)
+
+    sjt = np.mean(probs, axis=1)  # (T, J)
+    s0t = 1.0 - np.sum(sjt, axis=1)  # (T,)
+
+    return sjt, s0t
