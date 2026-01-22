@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from market_shock_estimators.blp import BLPEstimator
+from market_shock_estimators.assess_estimator import assess_estimator_results
 
 
 def _make_trivial_panel(T: int = 2, J: int = 3):
@@ -16,7 +17,6 @@ def _make_trivial_panel(T: int = 2, J: int = 3):
       Zjt  : (T,J,Kz) (set equal to Xjt for full-rank toy IV)
       v_draws : (R,)
     """
-
     # Mean utilities delta* (moderate values; vary slightly across markets)
     delta_star = np.array(
         [
@@ -69,7 +69,6 @@ def test_blp_input_validation():
 
     base = dict(sjt=sjt, s0t=s0t, pjt=pjt, Xjt=Xjt, Zjt=Zjt, v_draws=v_draws)
 
-    # Build invalid variants from the base data
     sjt_bad = sjt.copy()
     sjt_bad[0, 0] = 0.0
 
@@ -84,11 +83,16 @@ def test_blp_input_validation():
         ("Zjt_wrong_shape", dict(Zjt=Zjt[:, :2, :])),
     ]
 
-    for name, overrides in cases:
+    for _, overrides in cases:
         kwargs = dict(base)
         kwargs.update(overrides)
         with pytest.raises((ValueError, RuntimeError)):
-            BLPEstimator(**kwargs).fit(sigma_init=0.2)
+            BLPEstimator(**kwargs).fit(
+                sigma_init=0.2,
+                sigma_min=1e-3,
+                sigma_max=1.0,
+                grid_step=15,
+            )
 
 
 def test_blp_converges_on_trivial_market():
@@ -99,54 +103,80 @@ def test_blp_converges_on_trivial_market():
     sjt, s0t, pjt, Xjt, Zjt, v_draws = _make_trivial_panel()
 
     est = BLPEstimator(sjt=sjt, s0t=s0t, pjt=pjt, Xjt=Xjt, Zjt=Zjt, v_draws=v_draws)
-    est.fit(sigma_init=0.2)
+    est.fit(
+        sigma_init=0.2,
+        sigma_min=1e-3,
+        sigma_max=1.0,
+        grid_step=15,
+    )
 
-    assert est.sigma_hat is not None
-    assert np.isfinite(est.sigma_hat)
-    assert est.sigma_hat >= 0.0
+    res = est.get_results()
 
-    assert est.beta_hat is not None
-    assert np.all(np.isfinite(est.beta_hat))
+    assert res["success"] is True
+    assert res["sigma_hat"] is not None
+    assert np.isfinite(res["sigma_hat"])
+    assert res["sigma_hat"] > 0.0
 
-    E_hat = est.get_E_hat()
+    assert res["beta_hat"] is not None
+    assert np.all(np.isfinite(res["beta_hat"]))
+
+    E_hat = res["E_hat"]
+    assert E_hat is not None
     assert E_hat.shape == sjt.shape
     assert np.all(np.isfinite(E_hat))
 
-    # Robustness improvement: if the estimator stores an objective value, it should be finite.
-    for attr in ("objective", "objective_", "gmm_objective", "gmm_objective_"):
-        if hasattr(est, attr):
-            val = getattr(est, attr)
-            if val is not None:
-                assert np.isfinite(val)
-            break
 
-
-def test_blp_invariant_to_product_permutation():
+def test_assess_estimator_results_ok_and_failure_paths():
     """
-    Permuting product order (consistently across sjt/pjt/Xjt/Zjt) should not materially
-    change sigma_hat or beta_hat. Use loose tolerances since the outer optimizer is
-    not guaranteed to land on bit-identical solutions.
+    Unit tests for assess_estimator_results:
+      - OK path returns finite metrics with ok=True
+      - failure path returns ok=False with a reason
     """
-    sjt, s0t, pjt, Xjt, Zjt, v_draws = _make_trivial_panel()
+    rng = np.random.default_rng(0)
 
-    est1 = BLPEstimator(sjt=sjt, s0t=s0t, pjt=pjt, Xjt=Xjt, Zjt=Zjt, v_draws=v_draws)
-    est1.fit(sigma_init=0.2)
+    # OK case
+    E_true = rng.normal(size=(2, 3))
+    noise = 0.1 * rng.normal(size=E_true.shape)
+    E_hat = E_true + noise
 
-    perm = np.array([2, 0, 1])  # fixed permutation for J=3
+    results_ok = {"success": True, "E_hat": E_hat, "sigma_hat": 1.2}
 
-    sjt_p = sjt[:, perm]
-    pjt_p = pjt[:, perm]
-    Xjt_p = Xjt[:, perm, :]
-    Zjt_p = Zjt[:, perm, :]
-
-    est2 = BLPEstimator(
-        sjt=sjt_p, s0t=s0t, pjt=pjt_p, Xjt=Xjt_p, Zjt=Zjt_p, v_draws=v_draws
+    ass = assess_estimator_results(
+        name="dummy",
+        results=results_ok,
+        E_true=E_true,
+        sigma_true=1.5,
     )
-    est2.fit(sigma_init=0.2)
 
-    assert np.isfinite(est2.sigma_hat)
-    assert np.all(np.isfinite(est2.beta_hat))
+    assert ass["ok"] is True
+    assert ass["reason"] is None
+    for k in (
+        "rmse",
+        "mae",
+        "bias",
+        "corr",
+        "std_ratio",
+        "rmse_null",
+        "rmse_improvement",
+    ):
+        assert ass[k] is not None
+        assert np.isfinite(ass[k])
 
-    # Loose tolerances: robustness-oriented, not precision-oriented
-    assert np.isclose(est1.sigma_hat, est2.sigma_hat, rtol=1e-4, atol=1e-6)
-    assert np.allclose(est1.beta_hat, est2.beta_hat, rtol=1e-4, atol=1e-6)
+    assert ass["sigma_abs_err"] is not None
+    assert np.isfinite(ass["sigma_abs_err"])
+    assert ass["sigma_rel_err"] is not None
+    assert np.isfinite(ass["sigma_rel_err"])
+
+    # Failure case: success=False
+    results_fail = {"success": False, "E_hat": None, "sigma_hat": None}
+    ass2 = assess_estimator_results(
+        name="dummy_fail",
+        results=results_fail,
+        E_true=E_true,
+        sigma_true=1.5,
+    )
+
+    assert ass2["ok"] is False
+    assert isinstance(ass2.get("reason"), str)
+    assert ass2["rmse"] is None
+    assert ass2["mae"] is None

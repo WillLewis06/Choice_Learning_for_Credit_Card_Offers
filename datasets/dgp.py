@@ -102,13 +102,20 @@ def generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # Outside utility is normalized to 0, so its exp is 1.
     T, N, J = uijt.shape
 
-    # subtract max per (t,i) for numerical stability
-    m = np.max(uijt, axis=2, keepdims=True)  # (T, N, 1)
+    # subtract max over {outside, inside} per (t,i) for numerical stability
+    # outside utility is 0, so include it in the max via max(0, max_j uijt)
+    m_inside = np.max(uijt, axis=2, keepdims=True)  # (T, N, 1)
+    m = np.maximum(0.0, m_inside)  # (T, N, 1)
+
     exp_u = np.exp(uijt - m)  # (T, N, J)
-    denom = 1.0 + np.sum(exp_u, axis=2)  # (T, N)
+    exp_out = np.exp(-m[..., 0])  # (T, N)  since outside utility is 0
+
+    denom = exp_out + np.sum(exp_u, axis=2)  # (T, N)
+
     probs = exp_u / denom[..., None]  # (T, N, J)
+    out_prob = exp_out / denom  # (T, N)
 
     sjt = np.mean(probs, axis=1)  # (T, J)
-    s0t = 1.0 - np.sum(sjt, axis=1)  # (T,)
+    s0t = np.mean(out_prob, axis=1)  # (T,)
 
     return sjt, s0t

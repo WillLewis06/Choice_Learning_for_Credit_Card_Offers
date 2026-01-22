@@ -77,10 +77,12 @@ def simulate_shares(delta: Array, p: Array, sigma: float, v_draws: Array) -> Arr
     v = np.asarray(v_draws, dtype=float)
 
     U = delta[None, :] + (sigma * v)[:, None] * p[None, :]
-    U -= U.max(axis=1, keepdims=True)  # numerical stability
+
+    m = U.max(axis=1, keepdims=True)  # (R,1)
+    U = U - m  # stabilize inside utilities
 
     expU = np.exp(U)
-    denom = 1.0 + expU.sum(axis=1)
+    denom = np.exp(-m[:, 0]) + expU.sum(axis=1)  # outside term must be exp(0 - m)
 
     return (expU / denom[:, None]).mean(axis=0)
 
@@ -173,7 +175,7 @@ def invert_all_markets(
     max_iter: int = 10_000,
 ) -> Array:
     """
-    Invert all markets sequentially, with debug messages.
+    Invert all markets sequentially.
 
     Inputs:
       - sjt, pjt: arrays of shape (T, J)
@@ -210,7 +212,6 @@ def invert_all_markets(
             raise ValueError("delta_init contains NaN or inf.")
 
     for t in range(T):
-        print(f"[Berry inversion] Market {t+1}/{T}: starting (J={J})")
 
         delta_t, iters = invert_market(
             s_obs=sjt[t],
@@ -226,6 +227,5 @@ def invert_all_markets(
         )
 
         delta[t] = delta_t
-        print(f"[Berry inversion] Market {t+1}/{T}: converged in {iters} iterations")
 
     return delta
