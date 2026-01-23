@@ -82,7 +82,7 @@ class BasicLuChoiceModel:
         return uijt
 
 
-def generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Convert systematic utilities into market shares by averaging choice probabilities
     across consumers (no discrete sampling).
@@ -119,3 +119,37 @@ def generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     s0t = np.mean(out_prob, axis=1)  # (T,)
 
     return sjt, s0t
+
+
+def generate_market(
+    uijt: np.ndarray, N: int, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate expected shares and multinomial counts from simulated utilities.
+
+    Returns
+    -------
+    sjt : (T,J) expected shares
+    s0t : (T,)  expected outside share
+    qjt : (T,J) multinomial counts for inside goods
+    q0t : (T,)  multinomial counts for outside good
+    """
+    uijt = np.asarray(uijt, dtype=float)
+    if uijt.ndim != 3:
+        raise ValueError("uijt must have shape (T, N_sim, J).")
+
+    sjt, s0t = _generate_market_shares(uijt)
+
+    T, J = sjt.shape
+    qjt = np.zeros((T, J), dtype=int)
+    q0t = np.zeros(T, dtype=int)
+
+    rng = default_rng(seed)
+    for t in range(T):
+        probs = np.concatenate([[s0t[t]], sjt[t]])
+        probs = probs / probs.sum()
+        draw = rng.multinomial(int(N), probs)
+        q0t[t] = int(draw[0])
+        qjt[t, :] = draw[1:]
+
+    return sjt, s0t, qjt, q0t

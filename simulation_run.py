@@ -5,10 +5,11 @@ from market_shock_estimators.assess_estimator import (
     print_assessment,
 )
 
+from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
 from datasets.dgp import (
     generate_market_conditions,
     BasicLuChoiceModel,
-    generate_market_shares,
+    generate_market,
 )
 
 
@@ -77,7 +78,12 @@ def main():
         )
 
         uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
-        sjt, s0t = generate_market_shares(uijt)
+
+        sjt, s0t, qjt, q0t = generate_market(
+            uijt,
+            N=N,
+            seed=seed,
+        )
 
         # -----------------------------
         # Sanity checks (compact)
@@ -191,9 +197,40 @@ def main():
             sigma_true=sigma,
         )
 
+        # ------------------------------------------------------------
+        # Lu shrinkage estimation (posterior sampling)
+        # ------------------------------------------------------------
+        print("=== Running Lu shrinkage estimator ===")
+
+        shrink = LuShrinkageEstimator(
+            x_jt=Xjt,
+            q_jt=qjt,
+            q0_t=q0t,
+            draws=draws,
+            price_index=1,  # Xjt = [const, pjt, wjt] so price is index 1
+            # Hyperparameters: keep defaults for now; align later with Lu Section 4
+            max_iter=1500,
+            burn_in=500,
+            thin=5,
+            seed=seed,
+        )
+
+        shrink.fit()
+        res_shrink = shrink.get_results()
+
+        ass_shrink = assess_estimator_results(
+            name="Lu-shrinkage",
+            results=res_shrink,
+            E_true=Ejt,
+            sigma_true=sigma,
+        )
+
+        print("=== Lu shrinkage completed ===")
+
         print("=== Estimator assessment ===")
         print_assessment(ass_cost)
         print_assessment(ass_weak)
+        print_assessment(ass_shrink)
 
 
 if __name__ == "__main__":
