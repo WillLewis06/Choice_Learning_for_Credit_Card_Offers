@@ -5,6 +5,7 @@ from market_shock_estimators.assess_estimator import (
     print_assessment,
 )
 
+from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
 from datasets.dgp import (
     generate_market_conditions,
@@ -20,10 +21,14 @@ def main():
     beta_p = -1.0
     beta_w = 0.5
     sigma = 1.5
-    seed = 123
 
+    seed = 123
+    # Single root RNG for the whole run
     rng = np.random.default_rng(seed)
-    R = 200  # number of simulation draws for RC integration (minimal, can change later)
+    # Split RNG streams so DGP randomness does not depend on how many draws TMH/RW-MH use
+    rng_dgp = np.random.default_rng(rng.integers(0, 2**32 - 1))
+    rng_mcmc = np.random.default_rng(rng.integers(0, 2**32 - 1))
+    R = 200  # number of simulation draws for RC integration
     draws = rng.standard_normal(R)
 
     DGP_SPECS = {
@@ -68,22 +73,18 @@ def main():
         )
 
         wjt, E_bar_t, njt, Ejt, ujt, alpha = generate_market_conditions(
-            T=T, J=J, dgp_type=dgp_type, seed=seed
+            T=T, J=J, dgp_type=dgp_type, rng=rng_dgp
         )
 
         pjt = alpha + 0.3 * wjt + ujt
 
         model = BasicLuChoiceModel(
-            N=N, beta_p=beta_p, beta_w=beta_w, sigma=sigma, seed=seed
+            N=N, beta_p=beta_p, beta_w=beta_w, sigma=sigma, rng=rng_dgp
         )
 
         uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-        sjt, s0t, qjt, q0t = generate_market(
-            uijt,
-            N=N,
-            seed=seed,
-        )
+        sjt, s0t, qjt, q0t = generate_market(uijt, N=N, rng=rng_dgp)
 
         # -----------------------------
         # Sanity checks (compact)
@@ -202,21 +203,48 @@ def main():
         # ------------------------------------------------------------
         print("=== Running Lu shrinkage estimator ===")
 
+        Zjt = Xjt[:, :, [1]]  # price RC
+
+        K = Xjt.shape[2]
+        d = Zjt.shape[2]
+
+        beta_init = np.zeros(K)
+        r_init = np.zeros(d)
+        Ebar_init = np.zeros(T)
+        eta_init = np.zeros((T, J))
+        gamma_init = np.zeros((T, J), dtype=int)
+        phi_init = 0.1 * np.ones(T)
+
+        posterior = LuPosteriorTF(draws=draws)
+
         shrink = LuShrinkageEstimator(
-            x_jt=Xjt,
-            q_jt=qjt,
-            q0_t=q0t,
-            draws=draws,
-            price_index=1,  # Xjt = [const, pjt, wjt] so price is index 1
-            # Hyperparameters: keep defaults for now; align later with Lu Section 4
-            max_iter=1500,
-            burn_in=500,
-            thin=5,
-            seed=seed,
+            posterior=posterior,
+            x=Xjt,
+            Z=Zjt,
+            q=qjt,
+            q0=q0t,
+            beta_init=beta_init,
+            r_init=r_init,
+            Ebar_init=Ebar_init,
+            eta_init=eta_init,
+            gamma_init=gamma_init,
+            phi_init=phi_init,
+            rng=rng_mcmc,
         )
 
-        shrink.fit()
-        res_shrink = shrink.get_results()
+        max_iter = 1500
+        burn_in = 500
+        thin = 5
+
+        states = []
+
+        for it in range(max_iter):
+            print(f"[SIM] iter {it}")
+            shrink.step()
+            if it >= burn_in and (it - burn_in) % thin == 0:
+                states.append(shrink.state())
+
+        res_shrink = {"states": states}
 
         ass_shrink = assess_estimator_results(
             name="Lu-shrinkage",

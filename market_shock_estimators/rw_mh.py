@@ -59,8 +59,12 @@ def rw_mh_step(
     else:
         logp_curr = current_logp
 
-    # Draw proposal noise
-    if proposal_cov.ndim == 1:
+    # Draw proposal noise (uses passed-in Generator)
+    proposal_cov = np.asarray(proposal_cov)
+
+    if proposal_cov.ndim == 0:
+        eps = rng.normal(scale=np.sqrt(float(proposal_cov)), size=theta.shape)
+    elif proposal_cov.ndim == 1:
         eps = rng.normal(scale=np.sqrt(proposal_cov), size=theta.shape)
     else:
         eps = rng.multivariate_normal(
@@ -78,7 +82,9 @@ def rw_mh_step(
 
     # MH acceptance step (symmetric proposal)
     log_alpha = logp_prop - logp_curr
-    if np.log(rng.uniform()) < log_alpha:
+
+    if np.log(rng.random()) < log_alpha:
+
         return theta_prop, True, logp_prop
     else:
         return theta, False, logp_curr

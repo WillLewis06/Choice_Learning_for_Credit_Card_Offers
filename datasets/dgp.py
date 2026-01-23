@@ -1,49 +1,69 @@
 import numpy as np
-from numpy.random import default_rng
 
 
-def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
+def generate_market_conditions(T: int, J: int, dgp_type: int, rng: np.random.Generator):
     """
-    Generate market/product primitives for Lu–Shimizu Section 4.
+    Generate market/product primitives for Lu–Shimizu (2025), Section 4.1.
+
+    Notation mapping to the paper:
+      wjt    : exogenous characteristic w_jt ~ U(1,2)
+      E_bar_t: market intercept xi_bar*_t, fixed at -1
+      njt    : eta*_jt (market-product deviations)
+      Ejt    : xi*_jt = xi_bar*_t + eta*_jt
+      ujt    : cost shock u_jt ~ N(0, 0.7^2)
+      alpha  : alpha*_jt (endogeneity shifter in price equation)
+
+    DGP designs (paper):
+      DGP1: sparse eta, exogenous price (alpha=0)
+      DGP2: sparse eta, endogenous price (alpha depends on eta)
+      DGP3: non-sparse eta ~ N(0,(1/3)^2), exogenous price (alpha=0)
+      DGP4: non-sparse eta, endogenous price (alpha depends on eta threshold)
 
     Returns:
-      wjt   : (T,J) exogenous characteristic
-      E_bar_t : (T,) market-level shock baseline
-      njt   : (T,J) product deviations
-      Ejt   : (T,J) unobserved demand shocks
-      ujt   : (T,J) price shock (paper: u_jt)
-      alpha : (T,J) endogeneity shifter
+      wjt     : (T,J)
+      E_bar_t : (T,)
+      njt     : (T,J)
+      Ejt     : (T,J)
+      ujt     : (T,J)
+      alpha   : (T,J)
     """
-    rng = default_rng(seed)
 
     if dgp_type not in (1, 2, 3, 4):
         raise ValueError("dgp_type must be 1, 2, 3, or 4")
 
-    # Observed characteristic
+    # Exogenous product characteristic: wjt ~ U(1,2)
     wjt = rng.uniform(1.0, 2.0, size=(T, J))
 
-    # Unobserved demand shocks
-    E_bar_t = -1.0 * np.ones(T)
-    njt = np.zeros((T, J))
+    # Market-level intercept: xi_bar*_t fixed at -1 for all t
+    E_bar_t = -1.0 * np.ones(T, dtype=float)
 
-    if dgp_type in (1, 2):  # sparse
+    # Market-product deviations: eta*_jt
+    if dgp_type in (1, 2):  # sparse eta (deterministic pattern)
+        njt = np.zeros((T, J), dtype=float)
         n_active = int(0.4 * J)
         for t in range(T):
             for j in range(n_active):
-                njt[t, j] = 1.0 if j % 2 == 0 else -1.0
-    else:  # non-sparse
+                # "odd components set to 1 while even ones set to -1"
+                # With 0-based indexing: j=0 -> +1, j=1 -> -1, ...
+                njt[t, j] = 1.0 if (j % 2 == 0) else -1.0
+    else:  # non-sparse eta ~ N(0, (1/3)^2)
         njt = rng.normal(0.0, 1.0 / 3.0, size=(T, J))
 
+    # Unobserved demand shock: xi*_jt = xi_bar*_t + eta*_jt
     Ejt = E_bar_t[:, None] + njt
 
-    # Price equation components
+    # Cost shock in price equation: ujt ~ N(0, 0.7^2)
     ujt = rng.normal(0.0, 0.7, size=(T, J))
-    alpha = np.zeros((T, J))
 
-    if dgp_type == 2:  # sparse endogenous
+    # Endogeneity shifter alpha*_jt (depends on DGP)
+    alpha = np.zeros((T, J), dtype=float)
+
+    if dgp_type == 2:
+        # DGP2: alpha*_jt = 0.3 if eta=1, -0.3 if eta=-1, 0 otherwise
         alpha[njt == 1.0] = 0.3
         alpha[njt == -1.0] = -0.3
-    elif dgp_type == 4:  # non-sparse endogenous
+    elif dgp_type == 4:
+        # DGP4: alpha*_jt = 0.3 if eta>=1/3, -0.3 if eta<=-1/3, 0 otherwise
         thr = 1.0 / 3.0
         alpha[njt >= thr] = 0.3
         alpha[njt <= -thr] = -0.3
@@ -53,26 +73,37 @@ def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
 
 class BasicLuChoiceModel:
     """
-    Basic Lu–Shimizu simulation-side choice model (Section 4).
+    Simulation-side RC logit choice model used in Lu–Shimizu Section 4.1:
+
+      u_ijt = beta_p_i * p_jt + beta_w * w_jt + xi_jt + eps_ijt
+      beta_p_i ~ N(beta_p, sigma^2)
+
+    Here eps_ijt is implicit (logit choice probabilities).
     """
 
-    def __init__(self, N: int, beta_p: float, beta_w: float, sigma: float, seed: int):
-        rng = default_rng(seed)
-
+    def __init__(
+        self,
+        N: int,
+        beta_p: float,
+        beta_w: float,
+        sigma: float,
+        rng: np.random.Generator,
+    ):
         self.N = int(N)
         self.beta_w = float(beta_w)
-        self.beta_p_i = rng.normal(beta_p, sigma, size=self.N)
+        self.beta_p_i = rng.normal(float(beta_p), float(sigma), size=self.N)
 
     def utilities(
         self, pjt: np.ndarray, wjt: np.ndarray, Ejt: np.ndarray
     ) -> np.ndarray:
         """
+        Compute systematic utilities (excluding Gumbel eps):
+
         Returns:
-          uijt : (T,N,J) systematic utility
+          uijt : (T, N, J)
         """
         T, J = pjt.shape
-        uijt = np.zeros((T, self.N, J))
-
+        uijt = np.zeros((T, self.N, J), dtype=float)
         for t in range(T):
             uijt[t] = (
                 self.beta_p_i[:, None] * pjt[t][None, :]
@@ -84,31 +115,27 @@ class BasicLuChoiceModel:
 
 def _generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convert systematic utilities into market shares by averaging choice probabilities
-    across consumers (no discrete sampling).
+    Convert systematic utilities into expected shares by averaging logit choice
+    probabilities across simulated consumers.
 
     Inputs:
-      uijt : (T, N, J) systematic utility
+      uijt : (T, N, J)
 
     Returns:
-      sjt  : (T, J) inside good shares
-      s0t  : (T,) outside good shares
+      sjt  : (T, J)
+      s0t  : (T,)
     """
     if uijt.ndim != 3:
         raise ValueError("uijt must have shape (T, N, J)")
 
-    # Stable logit probabilities:
-    # For each (t,i), compute softmax over J goods with an outside option.
-    # Outside utility is normalized to 0, so its exp is 1.
     T, N, J = uijt.shape
 
-    # subtract max over {outside, inside} per (t,i) for numerical stability
-    # outside utility is 0, so include it in the max via max(0, max_j uijt)
+    # Stabilize softmax with outside option utility normalized to 0.
     m_inside = np.max(uijt, axis=2, keepdims=True)  # (T, N, 1)
-    m = np.maximum(0.0, m_inside)  # (T, N, 1)
+    m = np.maximum(0.0, m_inside)  # include outside option in max
 
     exp_u = np.exp(uijt - m)  # (T, N, J)
-    exp_out = np.exp(-m[..., 0])  # (T, N)  since outside utility is 0
+    exp_out = np.exp(-m[..., 0])  # (T, N)
 
     denom = exp_out + np.sum(exp_u, axis=2)  # (T, N)
 
@@ -122,17 +149,16 @@ def _generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def generate_market(
-    uijt: np.ndarray, N: int, seed: int = 0
+    uijt: np.ndarray, N: int, rng: np.random.Generator
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate expected shares and multinomial counts from simulated utilities.
 
-    Returns
-    -------
-    sjt : (T,J) expected shares
-    s0t : (T,)  expected outside share
-    qjt : (T,J) multinomial counts for inside goods
-    q0t : (T,)  multinomial counts for outside good
+    Returns:
+      sjt : (T,J) expected shares
+      s0t : (T,) expected outside share
+      qjt : (T,J) multinomial counts for inside goods
+      q0t : (T,) multinomial counts for outside good
     """
     uijt = np.asarray(uijt, dtype=float)
     if uijt.ndim != 3:
@@ -144,7 +170,6 @@ def generate_market(
     qjt = np.zeros((T, J), dtype=int)
     q0t = np.zeros(T, dtype=int)
 
-    rng = default_rng(seed)
     for t in range(T):
         probs = np.concatenate([[s0t[t]], sjt[t]])
         probs = probs / probs.sum()

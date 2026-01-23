@@ -1,22 +1,22 @@
+# tmh.py
 """
-tmh.py
-
 Tailored Metropolis–Hastings (TMH) aligned with Lu (2025), Section 4.
 
-Lu-style TMH differs from a state-dependent Newton/MALA proposal. It:
-1) Finds the conditional posterior mode for a parameter block via Newton steps.
-2) Forms a Laplace (Gaussian) approximation at the mode.
-3) Proposes from an independence Gaussian centered at the mode:
+Lu-style TMH:
+1) Find the conditional posterior mode for a parameter block via Newton steps.
+2) Form a Laplace (Gaussian) approximation at the mode.
+3) Propose from an independence Gaussian centered at the mode:
        theta' ~ N(theta_hat, kappa^2 * V_hat),
    where V_hat^{-1} = -∇^2 log p(theta | rest) evaluated at theta_hat.
 4) Accept/reject with an independence-MH ratio using the same proposal density.
 
-This module is algorithmic only. It does not know the model. It requires:
-- log_posterior(theta): float
-- grad_log_posterior(theta): (d,) array
-- hess_log_posterior(theta): (d,d) array, the Hessian of log posterior
+This module is algorithmic only. It does not know the model.
 
-Numerical differentiation is provided as a fallback but is not Lu-aligned.
+To be Lu-aligned and efficient, provide analytic derivatives:
+- grad_log_posterior(theta): (d,) array
+- hess_log_posterior(theta): (d,d) array
+
+Numerical differentiation exists as a fallback but is not Lu-aligned.
 """
 
 from __future__ import annotations
@@ -78,7 +78,6 @@ def compute_hessian(theta: np.ndarray, log_posterior, eps: float = 1e-4) -> np.n
         f_ip = log_posterior(theta + ei)
         f_im = log_posterior(theta - ei)
 
-        # diagonal second derivative
         H[i, i] = (f_ip - 2.0 * f0 + f_im) / (eps**2)
 
         for j in range(i + 1, d):
@@ -102,11 +101,7 @@ def compute_hessian(theta: np.ndarray, log_posterior, eps: float = 1e-4) -> np.n
 
 
 def _regularize_neg_hessian(neg_hess: np.ndarray, ridge: float) -> np.ndarray:
-    """
-    Regularize a negative Hessian matrix to ensure positive definiteness:
-        H_reg = H + ridge * I
-    where H is intended to be -∇² log p at some point.
-    """
+    """Return (neg_hess + ridge * I), where neg_hess is intended as -∇² log p."""
     H = np.asarray(neg_hess, dtype=float)
     if H.ndim != 2 or H.shape[0] != H.shape[1]:
         raise ValueError("neg_hess must be square.")
@@ -140,6 +135,46 @@ def _cov_inv_and_logdet(cov: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 # ----------------------------------------------------------------------
+# Derivative selection (analytic preferred; fallback optional)
+# ----------------------------------------------------------------------
+
+
+def _select_derivatives(
+    log_posterior,
+    grad_log_posterior,
+    hess_log_posterior,
+    *,
+    allow_fallback: bool,
+) -> tuple[callable, callable]:
+    """
+    Return (grad_fn, hess_fn). Prefer supplied derivatives.
+    If allow_fallback=True, fill missing pieces via numerical differentiation.
+    """
+    grad_fn = grad_log_posterior
+    hess_fn = hess_log_posterior
+
+    if grad_fn is None:
+        if not allow_fallback:
+            raise ValueError(
+                "grad_log_posterior is required when allow_fallback=False."
+            )
+
+        def grad_fn(th):
+            return compute_gradient(th, log_posterior, eps=1e-6)
+
+    if hess_fn is None:
+        if not allow_fallback:
+            raise ValueError(
+                "hess_log_posterior is required when allow_fallback=False."
+            )
+
+        def hess_fn(th):
+            return compute_hessian(th, log_posterior, eps=1e-4)
+
+    return grad_fn, hess_fn
+
+
+# ----------------------------------------------------------------------
 # Lu-style mode finding (Newton)
 # ----------------------------------------------------------------------
 
@@ -150,7 +185,7 @@ def newton_find_mode(
     grad_log_posterior,
     hess_log_posterior,
     *,
-    ridge: float = 1e-6,
+    ridge: float = 1e-2,
     max_iter: int = 25,
     tol: float = 1e-8,
     backtrack: bool = True,
@@ -162,25 +197,6 @@ def newton_find_mode(
         theta <- theta + step
     where step solves:
         (-∇² log p(theta) + ridge I) step = ∇ log p(theta)
-
-    Parameters
-    ----------
-    theta_init : (d,) array
-    log_posterior : callable(theta)->float
-    grad_log_posterior : callable(theta)->(d,)
-    hess_log_posterior : callable(theta)->(d,d)  (Hessian of log posterior)
-    ridge : float
-        Regularization added to the negative Hessian.
-    max_iter : int
-    tol : float
-        Stop when ||grad||_inf <= tol.
-    backtrack : bool
-        If True, do simple backtracking if log posterior decreases.
-
-    Returns
-    -------
-    theta_hat : (d,) array
-    logp_hat : float
     """
     theta = np.asarray(theta_init, dtype=float).copy()
     if theta.ndim != 1:
@@ -189,6 +205,7 @@ def newton_find_mode(
     logp = float(log_posterior(theta))
 
     for _ in range(int(max_iter)):
+        # print("[tmh] newton iteration {_}")
         g = np.asarray(grad_log_posterior(theta), dtype=float)
         if g.shape != theta.shape:
             raise ValueError("grad_log_posterior returned wrong shape.")
@@ -199,10 +216,7 @@ def newton_find_mode(
         if hess.shape != (theta.size, theta.size):
             raise ValueError("hess_log_posterior returned wrong shape.")
 
-        neg_hess = -hess
-        H_reg = _regularize_neg_hessian(neg_hess, ridge=ridge)
-
-        # Newton step: H_reg * step = g
+        H_reg = _regularize_neg_hessian(-hess, ridge=ridge)
         step = np.linalg.solve(H_reg, g)
 
         if not backtrack:
@@ -210,7 +224,6 @@ def newton_find_mode(
             logp = float(log_posterior(theta))
             continue
 
-        # Minimal backtracking to enforce ascent (stability, not a change in target)
         alpha = 1.0
         for _bt in range(12):
             cand = theta + alpha * step
@@ -221,7 +234,6 @@ def newton_find_mode(
                 break
             alpha *= 0.5
         else:
-            # If we cannot find an improving step, stop.
             break
 
     return theta, logp
@@ -243,32 +255,14 @@ def tmh_step(
     ridge: float = 1e-6,
     newton_max_iter: int = 25,
     newton_tol: float = 1e-8,
+    allow_fallback: bool = True,
 ) -> tuple[TMHState, bool]:
     """
     One Lu-style TMH update for a block.
 
-    1) Find mode theta_hat given current "rest" (via Newton).
-    2) Build Laplace proposal q = N(theta_hat, kappa^2 * V_hat),
-       where V_hat^{-1} = -∇² log p(theta_hat | rest).
-    3) Propose theta' ~ q and accept with independence MH.
-
-    Parameters
-    ----------
-    state : TMHState
-    log_posterior : callable(theta)->float
-    grad_log_posterior : callable(theta)->(d,), optional
-    hess_log_posterior : callable(theta)->(d,d), optional
-    rng : np.random.Generator, optional
-    kappa : float, optional
-        If None, uses Lu default: 2.38 / sqrt(d).
-    ridge : float
-        Regularization for -Hessian at mode (and in Newton steps).
-    newton_max_iter, newton_tol : Newton controls.
-
-    Returns
-    -------
-    new_state : TMHState
-    accepted : bool
+    If analytic derivatives are supplied they are used directly.
+    If allow_fallback=True, missing derivatives are filled using numerical
+    differentiation (not Lu-aligned, but useful for debugging).
     """
     theta = np.asarray(state.theta, dtype=float)
     if theta.ndim != 1:
@@ -278,26 +272,23 @@ def tmh_step(
     if rng is None:
         rng = np.random.default_rng()
 
-    # Lu default scaling
     if kappa is None:
         kappa = 2.38 / np.sqrt(d)
     kappa = float(kappa)
 
-    # Derivative providers: Lu expects analytic/structured derivatives.
-    if grad_log_posterior is None or hess_log_posterior is None:
-        # Fallback (not Lu-aligned)
-        def grad_log_posterior(th):
-            return compute_gradient(th, log_posterior, eps=1e-6)
-
-        def hess_log_posterior(th):
-            return compute_hessian(th, log_posterior, eps=1e-4)
+    grad_fn, hess_fn = _select_derivatives(
+        log_posterior,
+        grad_log_posterior,
+        hess_log_posterior,
+        allow_fallback=allow_fallback,
+    )
 
     # 1) Mode for current conditional posterior
     theta_hat, _ = newton_find_mode(
         theta,
         log_posterior,
-        grad_log_posterior,
-        hess_log_posterior,
+        grad_fn,
+        hess_fn,
         ridge=ridge,
         max_iter=newton_max_iter,
         tol=newton_tol,
@@ -305,22 +296,21 @@ def tmh_step(
     )
 
     # 2) Curvature at the mode (Laplace)
-    hess_hat = np.asarray(hess_log_posterior(theta_hat), dtype=float)
+    hess_hat = np.asarray(hess_fn(theta_hat), dtype=float)
     if hess_hat.shape != (d, d):
         raise ValueError("hess_log_posterior returned wrong shape at mode.")
-    neg_hess_hat = -hess_hat
-    H_reg = _regularize_neg_hessian(neg_hess_hat, ridge=ridge)
+    H_reg = _regularize_neg_hessian(-hess_hat, ridge=ridge)
     V_hat = np.linalg.inv(H_reg)
 
     cov = (kappa**2) * V_hat
-
     cov_inv, logdet_cov = _cov_inv_and_logdet(cov)
 
-    # Independence proposal from q(.)
+    # Independence proposal
     theta_prop = rng.multivariate_normal(theta_hat, cov)
     logp_prop = float(log_posterior(theta_prop))
 
     if not np.isfinite(logp_prop):
+        print("[TMH] reject: non-finite logp_prop")
         return state, False
 
     # 3) Independence MH acceptance
@@ -332,101 +322,5 @@ def tmh_step(
     if np.log(rng.uniform()) < log_alpha:
         return TMHState(theta=theta_prop, logp=logp_prop), True
 
+    print(f"[TMH] reject: log_alpha={log_alpha:.3e}")
     return state, False
-
-
-# ----------------------------------------------------------------------
-# Block wrapper for use in estimator code
-# ----------------------------------------------------------------------
-
-
-def tmh_update_block(
-    get_block,
-    set_block,
-    full_log_posterior,
-    rng: np.random.Generator,
-    *,
-    block_grad_log_posterior=None,
-    block_hess_log_posterior=None,
-    kappa: float | None = None,
-    ridge: float = 1e-6,
-    newton_max_iter: int = 25,
-    newton_tol: float = 1e-8,
-) -> bool:
-    """
-    Apply Lu-style TMH to a parameter block inside a larger parameter state.
-
-    Expected calling pattern:
-    - get_block() -> (theta_block, logp_current_full)
-    - set_block(theta_block_new) mutates the full parameter state
-
-    full_log_posterior() returns the full log posterior of the current full state.
-
-    To be Lu-aligned, provide:
-    - block_grad_log_posterior(theta_block): gradient of FULL log posterior wrt the block,
-      evaluated at a full state where the block equals theta_block.
-    - block_hess_log_posterior(theta_block): Hessian of FULL log posterior wrt the block.
-
-    If derivatives are not provided, numerical differentiation will be used (fallback).
-
-    Returns
-    -------
-    accepted : bool
-    """
-    theta_block, logp_current = get_block()
-    theta_block = np.asarray(theta_block, dtype=float)
-    if theta_block.ndim != 1:
-        raise ValueError("get_block must return a 1D theta_block.")
-    logp_current = float(logp_current)
-
-    # Block-level log posterior wrapper: evaluates full posterior at a temporary block value.
-    def block_logp(theta_block_new):
-        old = theta_block.copy()
-        set_block(theta_block_new)
-        val = float(full_log_posterior())
-        set_block(old)
-        return val
-
-    # Derivative wrappers (if provided, they must follow the same temporary-set pattern)
-    if block_grad_log_posterior is not None:
-
-        def block_grad(theta_block_new):
-            old = theta_block.copy()
-            set_block(theta_block_new)
-            g = np.asarray(block_grad_log_posterior(theta_block_new), dtype=float)
-            set_block(old)
-            return g
-
-    else:
-        block_grad = None
-
-    if block_hess_log_posterior is not None:
-
-        def block_hess(theta_block_new):
-            old = theta_block.copy()
-            set_block(theta_block_new)
-            H = np.asarray(block_hess_log_posterior(theta_block_new), dtype=float)
-            set_block(old)
-            return H
-
-    else:
-        block_hess = None
-
-    state = TMHState(theta=theta_block, logp=logp_current)
-
-    new_state, accepted = tmh_step(
-        state,
-        block_logp,
-        grad_log_posterior=block_grad,
-        hess_log_posterior=block_hess,
-        rng=rng,
-        kappa=kappa,
-        ridge=ridge,
-        newton_max_iter=newton_max_iter,
-        newton_tol=newton_tol,
-    )
-
-    if accepted:
-        set_block(new_state.theta)
-
-    return accepted
