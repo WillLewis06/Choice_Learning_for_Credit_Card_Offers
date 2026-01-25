@@ -1,90 +1,65 @@
-# rw_mh.py
-"""
-Random-Walk Metropolis–Hastings (RW-MH) kernel.
+# market_shock_estimators/rw_mh.py
 
-Minimal implementation intended for Section 4 of Lu (2025):
-- Gaussian random-walk proposal
-- Symmetric proposal (no proposal density correction)
-- Stateless single-step update
+from __future__ import annotations
 
-This is designed to be used for low-dimensional continuous parameters
-(e.g. r), with all conditioning handled outside this file.
-"""
-
-import numpy as np
+import tensorflow as tf
 
 
 def rw_mh_step(
-    theta,
+    *,
+    theta0,
     logp_fn,
-    proposal_cov,
+    step_size,
     rng,
-    current_logp=None,
-    reject_if_nan=True,
 ):
     """
-    Perform one Random-Walk Metropolis–Hastings step.
+    Perform one Random-Walk Metropolis–Hastings (RW-MH) step
+    for a single parameter block.
 
     Parameters
     ----------
-    theta : np.ndarray, shape (d,)
-        Current parameter vector.
+    theta0 : tf.Tensor, shape (d,) or scalar
+        Current state of the parameter block.
     logp_fn : callable
-        Function mapping theta -> log posterior (scalar).
-        This should be the full conditional for theta.
-    proposal_cov : np.ndarray
-        Proposal covariance. Either:
-        - shape (d,)  : interpreted as diagonal variances
-        - shape (d,d): full covariance matrix
-    rng : np.random.Generator
-        NumPy random number generator.
-    current_logp : float, optional
-        Cached log posterior at theta. If None, it is recomputed.
-    reject_if_nan : bool, default True
-        Reject proposals with NaN or infinite log posterior.
+        Function mapping theta -> scalar log posterior (tf.Tensor).
+    step_size : float or tf.Tensor
+        Scalar or vector step size for the Gaussian random walk.
+    rng : tf.random.Generator
+        TensorFlow RNG.
 
     Returns
     -------
-    theta_new : np.ndarray, shape (d,)
-        Updated parameter vector (accepted or original).
-    accepted : bool
+    theta_new : tf.Tensor
+        Updated parameter block.
+    accepted : tf.Tensor, scalar bool
         Whether the proposal was accepted.
-    logp_new : float
-        Log posterior at theta_new.
     """
-    theta = np.asarray(theta)
+    theta0 = tf.convert_to_tensor(theta0)
+    dtype = theta0.dtype
 
-    if current_logp is None:
-        logp_curr = logp_fn(theta)
-    else:
-        logp_curr = current_logp
+    step_size = tf.convert_to_tensor(step_size, dtype=dtype)
 
-    # Draw proposal noise (uses passed-in Generator)
-    proposal_cov = np.asarray(proposal_cov)
+    # ------------------------------------------------------------
+    # 1. Propose: theta' = theta + eps
+    #    eps ~ N(0, step_size^2 I)   (scalar or diagonal)
+    # ------------------------------------------------------------
+    eps = rng.normal(tf.shape(theta0), dtype=dtype)
+    theta_prop = theta0 + step_size * eps
 
-    if proposal_cov.ndim == 0:
-        eps = rng.normal(scale=np.sqrt(float(proposal_cov)), size=theta.shape)
-    elif proposal_cov.ndim == 1:
-        eps = rng.normal(scale=np.sqrt(proposal_cov), size=theta.shape)
-    else:
-        eps = rng.multivariate_normal(
-            mean=np.zeros_like(theta),
-            cov=proposal_cov,
-        )
-
-    theta_prop = theta + eps
+    # ------------------------------------------------------------
+    # 2. Log acceptance ratio (symmetric proposal)
+    # ------------------------------------------------------------
+    logp_curr = logp_fn(theta0)
     logp_prop = logp_fn(theta_prop)
 
-    # Handle invalid proposals
-    if reject_if_nan:
-        if not np.isfinite(logp_prop):
-            return theta, False, logp_curr
-
-    # MH acceptance step (symmetric proposal)
     log_alpha = logp_prop - logp_curr
 
-    if np.log(rng.random()) < log_alpha:
+    # ------------------------------------------------------------
+    # 3. Accept / reject
+    # ------------------------------------------------------------
+    u = rng.uniform([], dtype=dtype)
+    accepted = tf.math.log(u) < log_alpha
 
-        return theta_prop, True, logp_prop
-    else:
-        return theta, False, logp_curr
+    theta_new = tf.where(accepted, theta_prop, theta0)
+
+    return theta_new, accepted

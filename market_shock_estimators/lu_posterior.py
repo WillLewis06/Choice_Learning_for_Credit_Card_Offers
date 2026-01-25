@@ -1,28 +1,28 @@
 # market_shock_estimators/lu_posterior.py
 
-import numpy as np
+from __future__ import annotations
+
 import tensorflow as tf
 
 
 class LuPosteriorTF:
     """
-    Market-local posterior for Lu (2025) shrinkage estimator.
+    Market-local posterior components for Lu (2025) shrinkage estimator.
 
-    This class is:
-      - stateless (no sampler state)
-      - market-local (no t index anywhere)
-      - deterministic (no RNG)
+    Design principles:
+      - Pure TensorFlow (no NumPy)
+      - Stateless and deterministic
+      - No internal casting or tensorization
+      - No gradient/Hessian computation here
+      - Explicit separation of likelihood and priors
 
-    It exposes:
-      - market_logp(theta, ...)
-      - market_grad_hess(theta, ...)
-
-    where theta = [E_bar_t, eta_{1t}, ..., eta_{Jt}].
+    This class provides scalar log-density contributions only.
     """
 
     def __init__(
         self,
         *,
+        draws,
         beta_var=10.0,
         Ebar_var=10.0,
         r_var=0.5,
@@ -30,31 +30,31 @@ class LuPosteriorTF:
         T1_sq=1.0,
         a_phi=1.0,
         b_phi=1.0,
-        draws,
-        dtype=tf.float64,
         eps=1e-15,
+        dtype=tf.float64,
     ):
-        draws = np.asarray(draws, dtype=float)
-        if draws.ndim == 1:
-            draws = draws[:, None]
-        if draws.ndim != 2:
+        # Simulation draws for random coefficients
+        self.draws = tf.convert_to_tensor(draws, dtype=dtype)
+        if self.draws.ndim == 1:
+            self.draws = self.draws[:, None]
+        if self.draws.ndim != 2:
             raise ValueError("draws must have shape (R,d) or (R,)")
 
-        self.draws = tf.constant(draws, dtype=dtype)
-        self.R, self.d = self.draws.shape
+        self.R = tf.shape(self.draws)[0]
+        self.d = tf.shape(self.draws)[1]
 
         self.dtype = dtype
         self.eps = tf.constant(eps, dtype=dtype)
 
-        # Priors / hyperparameters
+        # Prior hyperparameters (all TF constants)
         self.beta_var = tf.constant(beta_var, dtype=dtype)
         self.Ebar_var = tf.constant(Ebar_var, dtype=dtype)
         self.r_var = tf.constant(r_var, dtype=dtype)
 
         self.T0_sq = tf.constant(T0_sq, dtype=dtype)
         self.T1_sq = tf.constant(T1_sq, dtype=dtype)
-        self.log_T0_sq = tf.constant(np.log(T0_sq), dtype=dtype)
-        self.log_T1_sq = tf.constant(np.log(T1_sq), dtype=dtype)
+        self.log_T0_sq = tf.math.log(self.T0_sq)
+        self.log_T1_sq = tf.math.log(self.T1_sq)
 
         self.a_phi = tf.constant(a_phi, dtype=dtype)
         self.b_phi = tf.constant(b_phi, dtype=dtype)
@@ -65,18 +65,21 @@ class LuPosteriorTF:
 
     def _choice_probs(self, Z, delta, r):
         """
-        Z:     (J,d)
-        delta: (J,)
-        r:     (d,)
+        Compute market choice probabilities.
 
-        returns:
-          s_j: (J,)
-          s0:  ()
+        Inputs:
+          Z     : (J,d)
+          delta : (J,)
+          r     : (d,)
+
+        Returns:
+          s_j : (J,)
+          s0  : scalar
         """
         sigma = tf.exp(r)  # (d,)
-        scaled = self.draws * sigma[None, :]  # (R,d)
+        scaled_draws = self.draws * sigma  # (R,d)
 
-        mu = tf.einsum("jd,rd->jr", Z, scaled)  # (J,R)
+        mu = tf.einsum("jd,rd->jr", Z, scaled_draws)  # (J,R)
         util = delta[:, None] + mu  # (J,R)
 
         m = tf.reduce_max(util, axis=0, keepdims=True)
@@ -91,75 +94,85 @@ class LuPosteriorTF:
         return s_j, s0
 
     # ------------------------------------------------------------------
-    # Market log posterior
+    # Log likelihood
     # ------------------------------------------------------------------
 
-    def market_logp(
+    def market_loglik(
         self,
         *,
-        theta,
+        Ebar,
+        eta,
         q,
         q0,
         x,
         Z,
         beta,
         r,
-        gamma,
     ):
         """
-        Market log posterior.
+        Market log likelihood contribution.
 
-        Inputs (market-local):
-          theta : (1+J,)  [E_bar, eta_1,...,eta_J]
-          q     : (J,)
-          q0    : ()
-          x     : (J,K)
-          Z     : (J,d)
-          beta  : (K,)
-          r     : (d,)
-          gamma : (J,) in {0,1}
+        Inputs:
+          Ebar : scalar
+          eta  : (J,)
+          q    : (J,)
+          q0   : scalar
+          x    : (J,K)
+          Z    : (J,d)
+          beta : (K,)
+          r    : (d,)
 
         Returns:
-          scalar log posterior contribution
+          scalar log likelihood
         """
-        # Tensorize + cast once
-        theta = tf.convert_to_tensor(theta, self.dtype)
-        q = tf.convert_to_tensor(q, self.dtype)
-        q0 = tf.convert_to_tensor(q0, self.dtype)
-        x = tf.convert_to_tensor(x, self.dtype)
-        Z = tf.convert_to_tensor(Z, self.dtype)
-        beta = tf.convert_to_tensor(beta, self.dtype)
-        r = tf.convert_to_tensor(r, self.dtype)
-        gamma = tf.cast(gamma, self.dtype)
-
-        Ebar = theta[0]
-        eta = theta[1:]
-
         delta = tf.linalg.matvec(x, beta) + Ebar + eta
         s_j, s0 = self._choice_probs(Z, delta, r)
 
-        ll = tf.reduce_sum(q * tf.math.log(s_j + self.eps)) + q0 * tf.math.log(
-            s0 + self.eps
-        )
+        ll = tf.reduce_sum(q * tf.math.log(s_j + self.eps))
+        ll += q0 * tf.math.log(s0 + self.eps)
+
+        return ll
+
+    # ------------------------------------------------------------------
+    # Log priors
+    # ------------------------------------------------------------------
+
+    def logprior_Ebar(self, Ebar):
+        """
+        Gaussian prior for Ebar.
+        """
+        return -0.5 * (Ebar * Ebar) / self.Ebar_var
+
+    def logprior_eta(self, eta, gamma):
+        """
+        Spike-and-slab prior for eta | gamma.
+
+        Inputs:
+          eta   : (J,)
+          gamma : (J,) in {0,1}
+
+        Returns:
+          scalar log prior
+        """
+        gamma = tf.cast(gamma, self.dtype)
 
         var = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq
         logvar = gamma * self.log_T1_sq + (1.0 - gamma) * self.log_T0_sq
 
-        lp = ll
-        lp += -0.5 * (Ebar * Ebar) / self.Ebar_var
-        lp += -0.5 * tf.reduce_sum((eta * eta) / var)
+        lp = -0.5 * tf.reduce_sum((eta * eta) / var)
         lp += -0.5 * tf.reduce_sum(logvar)
 
         return lp
 
     # ------------------------------------------------------------------
-    # Gradient + Hessian (single entry point)
+    # Convenience: full market log posterior
     # ------------------------------------------------------------------
 
-    def market_grad_hess(
+    def market_logp(
         self,
         *,
-        theta,
+        Ebar,
+        eta,
         q,
         q0,
         x,
@@ -169,35 +182,21 @@ class LuPosteriorTF:
         gamma,
     ):
         """
-        Gradient and Hessian of market_logp w.r.t theta.
+        Full market log posterior contribution.
 
-        Returns:
-          grad : (1+J,)
-          hess : (1+J,1+J)
+        This is a thin wrapper combining likelihood and priors.
         """
-
-        # print("[lu_posterior] market_grad_hess start")
-        theta = tf.convert_to_tensor(theta, self.dtype)
-
-        with tf.GradientTape(persistent=True) as outer:
-            outer.watch(theta)
-            with tf.GradientTape() as inner:
-                inner.watch(theta)
-                lp = self.market_logp(
-                    theta=theta,
-                    q=q,
-                    q0=q0,
-                    x=x,
-                    Z=Z,
-                    beta=beta,
-                    r=r,
-                    gamma=gamma,
-                )
-            grad = inner.gradient(lp, theta)
-
-        # print("[lu_posterior] gradient computed")
-        hess = outer.jacobian(grad, theta)
-        # print("[lu_posterior] hessian computed")
-        del outer
-
-        return lp, grad, hess
+        return (
+            self.market_loglik(
+                Ebar=Ebar,
+                eta=eta,
+                q=q,
+                q0=q0,
+                x=x,
+                Z=Z,
+                beta=beta,
+                r=r,
+            )
+            + self.logprior_Ebar(Ebar)
+            + self.logprior_eta(eta, gamma)
+        )

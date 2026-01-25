@@ -229,7 +229,7 @@ def main():
             eta_init=eta_init,
             gamma_init=gamma_init,
             phi_init=phi_init,
-            rng=rng_mcmc,
+            seed=seed,
         )
 
         max_iter = 1500
