@@ -1,264 +1,157 @@
+from __future__ import annotations
+
 import numpy as np
-from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
+
+from datasets.dgp import (
+    BasicLuChoiceModel,
+    generate_market,
+    generate_market_conditions,
+)
 from market_shock_estimators.assess_estimator import (
     assess_estimator_results,
     print_assessment,
 )
 
-from market_shock_estimators.lu_posterior import LuPosteriorTF
+from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
+
 from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
-from datasets.dgp import (
-    generate_market_conditions,
-    BasicLuChoiceModel,
-    generate_market,
-)
 
 
-def main():
-    T = 25
-    J = 15
-    N = 1000
-    beta_p = -1.0
-    beta_w = 0.5
-    sigma = 1.5
-
+def main() -> None:
+    # -----------------------------
+    # Lu (Section 4) simulation spec
+    # -----------------------------
+    T, J, N = 25, 15, 1000
+    beta_p_true, beta_w_true, sigma_true = -1.0, 0.5, 1.5
     seed = 123
-    # Single root RNG for the whole run
-    rng = np.random.default_rng(seed)
-    # Split RNG streams so DGP randomness does not depend on how many draws TMH/RW-MH use
-    rng_dgp = np.random.default_rng(rng.integers(0, 2**32 - 1))
-    rng_mcmc = np.random.default_rng(rng.integers(0, 2**32 - 1))
-    R = 200  # number of simulation draws for RC integration
-    draws = rng.standard_normal(R)
 
-    DGP_SPECS = {
-        1: {
-            "name": "Lu DGP1",
-            "sparsity": "sparse",
-            "endogeneity": "off",
-            "shock_dist": "discrete - sparse",
-        },
-        2: {
-            "name": "Lu DGP2",
-            "sparsity": "sparse",
-            "endogeneity": "on",
-            "shock_dist": "discrete - sparse",
-        },
-        3: {
-            "name": "Lu DGP3",
-            "sparsity": "dense",
-            "endogeneity": "off",
-            "shock_dist": "normal",
-        },
-        4: {
-            "name": "Lu DGP4",
-            "sparsity": "dense",
-            "endogeneity": "on",
-            "shock_dist": "normal",
-        },
-    }
+    # Monte Carlo integration draws (estimators own RNG; orchestration passes only counts)
+    n_draws = 200
+
+    # BLP fit config
+    blp_sigma_init = 1.0
+    blp_sigma_min = 1e-3
+    blp_sigma_max = 5.0
+    blp_grid_step = 25
+
+    # Shrinkage run config
+    mcmc_max_iter = 1500
+    mcmc_burn_in = 500
+    mcmc_thin = 5
 
     for dgp_type in (1, 2, 3, 4):
+        print(f"=== DGP {dgp_type} ===")
 
-        spec = DGP_SPECS[dgp_type]
-        print(f"=== Running DGP {dgp_type} ({spec['name']}) simulation ===")
-        print(
-            "[SIM]"
-            f"T={T}, J={J}, N={N} | "
-            f"sparsity={spec['sparsity']} | "
-            f"endogeneity={spec['endogeneity']} | "
-            f"shock_dist={spec['shock_dist']} | "
-            f"RC_draws={R} | "
-            f"seed={seed}"
+        # -----------------------------
+        # DGP (Lu Section 4.1)
+        # -----------------------------
+        wjt, _, _, Ejt, ujt, alpha = generate_market_conditions(
+            T=T, J=J, dgp_type=dgp_type, seed=seed
         )
 
-        wjt, E_bar_t, njt, Ejt, ujt, alpha = generate_market_conditions(
-            T=T, J=J, dgp_type=dgp_type, rng=rng_dgp
-        )
-
+        # Pricing rule used in this codebase: p = alpha + 0.3 w + u
         pjt = alpha + 0.3 * wjt + ujt
 
         model = BasicLuChoiceModel(
-            N=N, beta_p=beta_p, beta_w=beta_w, sigma=sigma, rng=rng_dgp
+            N=N,
+            beta_p=beta_p_true,
+            beta_w=beta_w_true,
+            sigma=sigma_true,
+            seed=seed,
         )
+        print(f"=== Linear model built ===")
 
         uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-        sjt, s0t, qjt, q0t = generate_market(uijt, N=N, rng=rng_dgp)
-
+        sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=seed)
+        print(f"=== Market generated ===")
         # -----------------------------
-        # Sanity checks (compact)
+        # BLP (strong / weak IV)
+        # Orchestration builds IV matrices; estimator owns RC integration draws internally.
+        # Demand regressors (Lu-aligned): X = [p, w] (no constant).
         # -----------------------------
-        sum_inside = sjt.sum(axis=1)
-        share_id_err = np.max(np.abs(sum_inside + s0t - 1.0))
 
-        print(
-            "[SIM] Data summary | "
-            f"p:[{pjt.min():.3f},{pjt.max():.3f}] "
-            f"w:[{wjt.min():.3f},{wjt.max():.3f}] | "
-            f"s:[{sjt.min():.4f},{sjt.max():.4f}] "
-            f"s0:[{s0t.min():.4f},{s0t.max():.4f}] | "
-            f"sum_s:[{sum_inside.min():.4f},{sum_inside.max():.4f}] | "
-            f"max|s+s0-1|={share_id_err:.2e}"
-        )
-
-        # ------------------------------------------------------------
-        # BLP estimation: recover E_hat_jt
-        # ------------------------------------------------------------
-
-        print("=== Running BLP estimators ===")
-
-        # Construct regressors X_jt
-        # delta_jt = beta_p * p_jt + beta_w * w_jt + E_jt
-        # Include constant if desired
-        Xjt = np.stack(
-            [
-                np.ones_like(pjt),  # constant
-                pjt,
-                wjt,
-            ],
-            axis=2,  # shape (T, J, K)
-        )
-
-        # grid search parameters
-        sigma_min = 1e-3
-        sigma_max = 5.0
-        grid_step = 25
-
-        # ------------------------------------------------------------
-        # Strong IV BLP (cost instruments)
-        # ------------------------------------------------------------
-
-        print("=== BLP with strong (cost-based) instruments ===")
-
-        Zjt_strong = build_strong_IVs(
-            wjt=wjt,
-            ujt=ujt,
-        )
-
-        blp_cost = BLPEstimator(
+        Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
+        blp_strong = BLPEstimator(
             sjt=sjt,
             s0t=s0t,
             pjt=pjt,
-            Xjt=Xjt,
+            wjt=wjt,
             Zjt=Zjt_strong,
-            v_draws=draws,
+            n_draws=n_draws,
+            seed=seed,
         )
-
-        blp_cost.fit(
-            sigma_init=1.0,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            grid_step=grid_step,
+        print(f"=== Strong IVs and Estimator built ===")
+        blp_strong.fit(
+            sigma_init=blp_sigma_init,
+            sigma_min=blp_sigma_min,
+            sigma_max=blp_sigma_max,
+            grid_step=blp_grid_step,
         )
-        res_cost = blp_cost.get_results()
-
-        print("=== Strong-IV BLP completed ===")
-
-        # ------------------------------------------------------------
-        # Weak IV BLP (standard BLP instruments)
-        # ------------------------------------------------------------
-
-        print("=== BLP with weak (non-cost) instruments ===")
+        res_strong = blp_strong.get_results()
+        print(f"=== Strong Estimator fitted ===")
 
         Zjt_weak = build_weak_IVs(wjt=wjt)
-
         blp_weak = BLPEstimator(
             sjt=sjt,
             s0t=s0t,
             pjt=pjt,
-            Xjt=Xjt,
+            wjt=wjt,
             Zjt=Zjt_weak,
-            v_draws=draws,
-        )
-
-        blp_weak.fit(
-            sigma_init=1.0,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            grid_step=grid_step,
-        )
-        res_weak = blp_weak.get_results()
-
-        print("=== Weak-IV BLP completed ===")
-
-        # ------------------------------------------------------------
-        # Estimator assessment (works for BLP now, shrinkage later)
-        # ------------------------------------------------------------
-        ass_cost = assess_estimator_results(
-            name="BLP-strong",
-            results=res_cost,
-            E_true=Ejt,
-            sigma_true=sigma,
-        )
-        ass_weak = assess_estimator_results(
-            name="BLP-weak",
-            results=res_weak,
-            E_true=Ejt,
-            sigma_true=sigma,
-        )
-
-        # ------------------------------------------------------------
-        # Lu shrinkage estimation (posterior sampling)
-        # ------------------------------------------------------------
-        print("=== Running Lu shrinkage estimator ===")
-
-        Zjt = Xjt[:, :, [1]]  # price RC
-
-        K = Xjt.shape[2]
-        d = Zjt.shape[2]
-
-        beta_init = np.zeros(K)
-        r_init = np.zeros(d)
-        Ebar_init = np.zeros(T)
-        eta_init = np.zeros((T, J))
-        gamma_init = np.zeros((T, J), dtype=int)
-        phi_init = 0.1 * np.ones(T)
-
-        posterior = LuPosteriorTF(draws=draws)
-
-        shrink = LuShrinkageEstimator(
-            posterior=posterior,
-            x=Xjt,
-            Z=Zjt,
-            q=qjt,
-            q0=q0t,
-            beta_init=beta_init,
-            r_init=r_init,
-            Ebar_init=Ebar_init,
-            eta_init=eta_init,
-            gamma_init=gamma_init,
-            phi_init=phi_init,
+            n_draws=n_draws,
             seed=seed,
         )
-
-        max_iter = 1500
-        burn_in = 500
-        thin = 5
-
-        states = []
-
-        for it in range(max_iter):
-            print(f"[SIM] iter {it}")
-            shrink.step()
-            if it >= burn_in and (it - burn_in) % thin == 0:
-                states.append(shrink.state())
-
-        res_shrink = {"states": states}
-
-        ass_shrink = assess_estimator_results(
-            name="Lu-shrinkage",
-            results=res_shrink,
-            E_true=Ejt,
-            sigma_true=sigma,
+        print(f"=== Weak IVs and Estimator built ===")
+        blp_weak.fit(
+            sigma_init=blp_sigma_init,
+            sigma_min=blp_sigma_min,
+            sigma_max=blp_sigma_max,
+            grid_step=blp_grid_step,
         )
+        res_weak = blp_weak.get_results()
+        print(f"=== Weak Estimator fitted ===")
 
-        print("=== Lu shrinkage completed ===")
+        # -----------------------------
+        # Lu shrinkage (posterior sampling)
+        # Assumes estimator constructs Z=p[...,None], initializes state, owns TF RNG, and runs MCMC internally.
+        # -----------------------------
+        shrink = LuShrinkageEstimator(
+            pjt=pjt,
+            wjt=wjt,
+            qjt=qjt,
+            q0t=q0t,
+            n_draws=n_draws,
+            seed=seed,
+        )
+        print(f"=== Shrinkage Estimator built ===")
 
-        print("=== Estimator assessment ===")
-        print_assessment(ass_cost)
-        print_assessment(ass_weak)
-        print_assessment(ass_shrink)
+        shrink.fit(
+            n_iter=1500,
+            burn_in=500,
+            thin=5,
+        )
+        res_shrink = shrink.get_results()
+        print(f"=== Shrinkage Estimator fitted ===")
+
+        # -----------------------------
+        # Assessment / printing
+        # Assumes assessment does not require a caller-provided name (it can be carried by results).
+        # -----------------------------
+        print_assessment(
+            assess_estimator_results(
+                results=res_strong, E_true=Ejt, sigma_true=sigma_true
+            )
+        )
+        print_assessment(
+            assess_estimator_results(
+                results=res_weak, E_true=Ejt, sigma_true=sigma_true
+            )
+        )
+        print_assessment(
+            assess_estimator_results(
+                results=res_shrink, E_true=Ejt, sigma_true=sigma_true
+            )
+        )
 
 
 if __name__ == "__main__":

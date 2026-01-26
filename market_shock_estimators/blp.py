@@ -33,14 +33,19 @@ class BLPEstimator:
     """
     Minimal BLP-style estimator for Lu(25) simulations.
 
+    Demand side (Lu-aligned regressors):
+        delta_jt = beta_p * pjt + beta_w * wjt + xi_jt
+    i.e., Xjt is constructed internally as [pjt, wjt] with no constant.
+
     Pipeline:
       - For each candidate sigma, invert demand to recover delta (Berry contraction).
       - Estimate beta via IV: delta = X beta + xi.
       - Form moments g = mean(Z * xi) and minimize g' W g.
 
     Weighting:
-      - One-step GMM with first-step 2SLS-style weighting W = (Z'Z)^{+}
-        (Moore–Penrose pseudoinverse for robustness).
+      - Two-step GMM:
+          Step 1: W1 = (Z'Z)^{+}
+          Step 2: W2 = Omega_hat^{+}
 
     Robustness additions (numerical, not econometric):
       - Bounds sigma to (0, sigma_max].
@@ -53,29 +58,37 @@ class BLPEstimator:
         sjt,
         s0t,
         pjt,
-        Xjt,
+        wjt,
         Zjt,
-        v_draws,
+        n_draws,
+        seed,
         *,
         tol=1e-8,
         share_tol=1e-10,
         max_iter=10_000,
         sigma_max=5.0,
         fail_penalty=1e12,
-        damping=1,
+        damping=1.0,
     ):
-
         self.sjt = np.asarray(sjt, dtype=float)
         self.s0t = np.asarray(s0t, dtype=float)
         self.pjt = np.asarray(pjt, dtype=float)
-        self.Xjt = np.asarray(Xjt, dtype=float)
+        self.wjt = np.asarray(wjt, dtype=float)
         self.Zjt = np.asarray(Zjt, dtype=float)
 
-        self.v_draws = np.asarray(v_draws, dtype=float)
+        self.n_draws = int(n_draws)
+        self.seed = int(seed)
 
-        self.tol = tol
-        self.share_tol = share_tol
-        self.max_iter = max_iter
+        # Lu-aligned demand regressors: X = [p, w] (no constant)
+        self.Xjt = np.stack([self.pjt, self.wjt], axis=2)
+
+        # RC integration draws belong to the estimator (not orchestration)
+        rng = np.random.default_rng(self.seed)
+        self.v_draws = rng.standard_normal(self.n_draws).astype(float)
+
+        self.tol = float(tol)
+        self.share_tol = float(share_tol)
+        self.max_iter = int(max_iter)
 
         self.sigma_max = float(sigma_max)
         self.fail_penalty = float(fail_penalty)
@@ -86,8 +99,6 @@ class BLPEstimator:
         self.sigma_hat = None
         self.beta_hat = None
         self.E_hat = None
-
-        # fit completed bool
         self.success = False
 
         self._check_inputs()
@@ -97,17 +108,6 @@ class BLPEstimator:
     # ------------------------------------------------------------------
 
     def _check_inputs(self):
-        """
-        Strict panel-level input validation.
-
-        Ensures:
-          - Correct array dimensions and mutually consistent shapes
-          - Finite values (no NaN/inf)
-          - Shares strictly in (0,1)
-          - Per-market share identity: s0t + sum_j sjt == 1 (within tolerance)
-          - v_draws is 1D and non-empty
-          - basic numeric parameter validity (damping, sigma_max, etc.)
-        """
         # -------------------------
         # Dimensionality checks
         # -------------------------
@@ -115,6 +115,8 @@ class BLPEstimator:
             raise ValueError(f"sjt must be 2D (T,J). Got ndim={self.sjt.ndim}.")
         if self.pjt.ndim != 2:
             raise ValueError(f"pjt must be 2D (T,J). Got ndim={self.pjt.ndim}.")
+        if self.wjt.ndim != 2:
+            raise ValueError(f"wjt must be 2D (T,J). Got ndim={self.wjt.ndim}.")
         if self.s0t.ndim != 1:
             raise ValueError(f"s0t must be 1D (T,). Got ndim={self.s0t.ndim}.")
         if self.Xjt.ndim != 3:
@@ -131,18 +133,20 @@ class BLPEstimator:
         # -------------------------
         if self.pjt.shape != (T, J):
             raise ValueError(f"pjt must have shape {(T, J)}. Got {self.pjt.shape}.")
+        if self.wjt.shape != (T, J):
+            raise ValueError(f"wjt must have shape {(T, J)}. Got {self.wjt.shape}.")
         if self.s0t.shape != (T,):
             raise ValueError(f"s0t must have shape {(T,)}. Got {self.s0t.shape}.")
-        if self.Xjt.shape[0] != T or self.Xjt.shape[1] != J:
+        if self.Xjt.shape != (T, J, 2):
             raise ValueError(
-                f"Xjt must have shape (T,J,Kx) with T={T}, J={J}. Got {self.Xjt.shape}."
+                f"Xjt must have shape (T,J,2) for [p,w]. Got {self.Xjt.shape}."
             )
         if self.Zjt.shape[0] != T or self.Zjt.shape[1] != J:
             raise ValueError(
                 f"Zjt must have shape (T,J,Kz) with T={T}, J={J}. Got {self.Zjt.shape}."
             )
         if self.v_draws.size < 1:
-            raise ValueError("v_draws must be non-empty.")
+            raise ValueError("n_draws must be >= 1 (v_draws non-empty).")
 
         # -------------------------
         # Finite-value checks
@@ -151,6 +155,7 @@ class BLPEstimator:
             ("sjt", self.sjt),
             ("s0t", self.s0t),
             ("pjt", self.pjt),
+            ("wjt", self.wjt),
             ("Xjt", self.Xjt),
             ("Zjt", self.Zjt),
             ("v_draws", self.v_draws),
@@ -170,7 +175,6 @@ class BLPEstimator:
         if np.any(self.s0t >= 1.0):
             raise ValueError("s0t must be strictly less than 1.")
 
-        # Share identity check: s0t + sum_j sjt == 1
         share_id_tol = 1e-8
         share_err = np.max(np.abs(self.s0t + self.sjt.sum(axis=1) - 1.0))
         if not np.isfinite(share_err) or share_err > share_id_tol:
@@ -181,6 +185,10 @@ class BLPEstimator:
         # -------------------------
         # Parameter sanity checks
         # -------------------------
+        if not isinstance(self.n_draws, (int, np.integer)) or int(self.n_draws) < 1:
+            raise ValueError("n_draws must be a positive integer.")
+        if not isinstance(self.seed, (int, np.integer)):
+            raise ValueError("seed must be an integer.")
         if not np.isfinite(self.sigma_max) or self.sigma_max <= 0.0:
             raise ValueError("sigma_max must be a finite positive scalar.")
         if not np.isfinite(self.fail_penalty) or self.fail_penalty <= 0.0:
@@ -201,7 +209,6 @@ class BLPEstimator:
 
         Uses warm start and damping if available.
         """
-
         delta = invert_all_markets(
             sjt=self.sjt,
             s0t=self.s0t,
@@ -214,20 +221,17 @@ class BLPEstimator:
             share_tol=self.share_tol,
             max_iter=self.max_iter,
         )
-
-        # Update warm start only on success
         self._delta_warm_start = delta
-
         return delta
 
     def _estimate_beta(self, delta):
         """
         IV regression:
-            delta_jt = X_jt beta + E_jt
+            delta_jt = X_jt beta + xi_jt
+        where X_jt = [pjt, wjt] (constructed internally).
         """
-
         delta_vec = delta.reshape(-1, 1)  # (n_obs, 1)
-        X = self.Xjt.reshape(delta_vec.shape[0], -1)  # (n_obs, Kx)
+        X = self.Xjt.reshape(delta_vec.shape[0], -1)  # (n_obs, 2)
         Z = self.Zjt.reshape(delta_vec.shape[0], -1)  # (n_obs, Kz)
 
         ZTZ_inv = np.linalg.pinv(Z.T @ Z)
@@ -236,23 +240,19 @@ class BLPEstimator:
         XPZX = X.T @ Pz @ X
         XPZy = X.T @ Pz @ delta_vec
 
-        beta_hat = np.linalg.pinv(XPZX) @ XPZy  # (Kx,1)
-
+        beta_hat = np.linalg.pinv(XPZX) @ XPZy  # (2,1)
         return beta_hat
 
     def _compute_E_hat(self, delta, beta_hat):
         """
-        Compute recovered demand shocks:
-            E_hat_jt = delta_jt - X_jt beta_hat
+        Recovered demand shocks:
+            xi_hat_jt = delta_jt - X_jt beta_hat
         """
-
         delta_vec = delta.reshape(-1, 1)
         X = self.Xjt.reshape(delta_vec.shape[0], -1)
 
         E_vec = delta_vec - X @ beta_hat
-        E_hat = E_vec.reshape(self.sjt.shape)
-
-        return E_hat
+        return E_vec.reshape(self.sjt.shape)
 
     def _moments_and_omega(self, E_hat):
         """
@@ -260,23 +260,21 @@ class BLPEstimator:
           - per-observation moments m_i = z_i * xi_i
           - sample mean g_bar = mean_i m_i
           - moment covariance Omega_hat = (m'm)/n
-
-        Here xi_i is the recovered demand shock at (t,j).
         """
         E_vec = E_hat.reshape(-1, 1)  # (n, 1)
-        Z = self.Zjt.reshape(E_vec.shape[0], -1)  # (n, K)
+        Z = self.Zjt.reshape(E_vec.shape[0], -1)  # (n, Kz)
 
-        m = Z * E_vec  # (n, K)
-        g_bar = m.mean(axis=0)  # (K,)
-        Omega_hat = (m.T @ m) / float(m.shape[0])  # (K, K)
+        m = Z * E_vec  # (n, Kz)
+        g_bar = m.mean(axis=0)  # (Kz,)
+
+        m_centered = m - g_bar  # broadcast (n, Kz) - (Kz,)
+        Omega_hat = (m_centered.T @ m_centered) / float(m.shape[0])  # (Kz, Kz)
 
         return g_bar, Omega_hat
 
     def _gmm_objective(self, sigma, W):
         """
-        GMM objective:
-            Q(sigma) = g_bar(sigma)' W g_bar(sigma)
-
+        Q(sigma) = g_bar(sigma)' W g_bar(sigma),
         where g_bar(sigma) = mean_i [ z_i * xi_i(sigma) ].
         """
         delta = self._invert_demand(sigma)
@@ -284,16 +282,10 @@ class BLPEstimator:
         E_hat = self._compute_E_hat(delta, beta_hat)
 
         g_bar, _ = self._moments_and_omega(E_hat)
-
-        Q = float(g_bar @ W @ g_bar)
-        return Q
+        return float(g_bar @ W @ g_bar)
 
     def _safe_gmm_objective(self, sigma, W):
-        """
-        Safe wrapper around _gmm_objective(sigma, W).
-        """
         sigma = float(sigma)
-
         if not np.isfinite(sigma) or sigma <= 0.0 or sigma > self.sigma_max:
             return self.fail_penalty
 
@@ -313,14 +305,13 @@ class BLPEstimator:
 
     def fit(self, sigma_init, sigma_min=1e-3, sigma_max=1.0, grid_step=25):
         """
-        Two-step GMM with a single grid search (first-step only).
+        Two-step GMM:
 
         Step 1:
-          - Use W1 = (Z'Z)^+ (your current default) and find sigma via grid+NM.
+          - W1 = (Z'Z)^+ and sigma via grid + Nelder–Mead.
 
         Step 2:
-          - Compute Omega_hat at sigma_hat_step1, set W2 = Omega_hat^+,
-            re-optimize sigma via NM (no second grid).
+          - Omega_hat at sigma_hat_1, W2 = Omega_hat^+, re-optimize sigma via NM.
 
         Stores:
           - self.sigma_hat, self.beta_hat, self.E_hat
@@ -330,35 +321,25 @@ class BLPEstimator:
         sigma_max = float(sigma_max)
         grid_step = int(grid_step)
 
-        # Cap the grid range by the estimator hard bound
         sigma_max_grid = min(sigma_max, self.sigma_max)
 
-        # Precompute first-step weighting
         Z = self.Zjt.reshape(-1, self.Zjt.shape[2])
         W1 = np.linalg.pinv(Z.T @ Z)
 
-        # -----------------------------
-        # Grid search (first-step only)
-        # -----------------------------
+        # Grid search (step 1)
         sigmas = np.logspace(np.log10(sigma_min), np.log10(sigma_max_grid), grid_step)
-
         best = {"Q": np.inf, "sigma": None}
-
         for s in sigmas:
             q = self._safe_gmm_objective(float(s), W1)
             if np.isfinite(q) and (q < best["Q"]) and (q < self.fail_penalty):
                 best["Q"] = float(q)
                 best["sigma"] = float(s)
 
-        if best["sigma"] is not None:
-            sigma_start = best["sigma"]
-        else:
-            # fallback if every grid point failed
+        sigma_start = best["sigma"]
+        if sigma_start is None:
             sigma_start = min(max(sigma_init, sigma_min), sigma_max_grid)
 
-        # -----------------------------
-        # Step 1: Nelder–Mead with W1
-        # -----------------------------
+        # Step 1: Nelder–Mead on log-sigma
         best1 = {"Q": np.inf, "sigma": None}
 
         def obj1(theta_vec):
@@ -370,9 +351,7 @@ class BLPEstimator:
             return float(q)
 
         res1 = minimize(
-            fun=obj1,
-            x0=np.array([np.log(sigma_start)]),
-            method="Nelder-Mead",
+            fun=obj1, x0=np.array([np.log(sigma_start)]), method="Nelder-Mead"
         )
 
         sigma_hat_1 = best1["sigma"]
@@ -380,9 +359,7 @@ class BLPEstimator:
             sigma_hat_1 = float(np.exp(res1.x[0]))
         sigma_hat_1 = float(min(max(sigma_hat_1, sigma_min), self.sigma_max))
 
-        # -----------------------------
-        # Build W2 from Omega_hat at sigma_hat_1
-        # -----------------------------
+        # Build W2
         delta_1 = self._invert_demand(sigma_hat_1)
         beta_1 = self._estimate_beta(delta_1)
         E_1 = self._compute_E_hat(delta_1, beta_1)
@@ -390,9 +367,7 @@ class BLPEstimator:
         _, Omega_hat = self._moments_and_omega(E_1)
         W2 = np.linalg.pinv(Omega_hat)
 
-        # -----------------------------
-        # Step 2: Nelder–Mead with W2 (no grid)
-        # -----------------------------
+        # Step 2: Nelder–Mead on log-sigma
         best2 = {"Q": np.inf, "sigma": None}
 
         def obj2(theta_vec):
@@ -404,9 +379,7 @@ class BLPEstimator:
             return float(q)
 
         res2 = minimize(
-            fun=obj2,
-            x0=np.array([np.log(sigma_hat_1)]),
-            method="Nelder-Mead",
+            fun=obj2, x0=np.array([np.log(sigma_hat_1)]), method="Nelder-Mead"
         )
 
         sigma_hat_2 = best2["sigma"]
@@ -414,26 +387,22 @@ class BLPEstimator:
             sigma_hat_2 = float(np.exp(res2.x[0]))
         sigma_hat_2 = float(min(max(sigma_hat_2, sigma_min), self.sigma_max))
 
-        # -----------------------------
         # Final recomputation at sigma_hat_2
-        # -----------------------------
         self.sigma_hat = sigma_hat_2
 
         delta_hat = self._invert_demand(self.sigma_hat)
         self.beta_hat = self._estimate_beta(delta_hat)
         self.E_hat = self._compute_E_hat(delta_hat, self.beta_hat)
 
-        print(f"[BLP] Fit complete")
+        print("[BLP] Fit complete")
         self.success = True
 
     def get_results(self):
         """
-        Return estimator outputs in a single, consistent bundle.
-
         Keys:
           - "success":   bool
           - "sigma_hat": scalar float or None
-          - "beta_hat":  (Kx, 1) array or None
+          - "beta_hat":  (2, 1) array or None   (beta_p, beta_w)
           - "E_hat":     (T, J) array or None
         """
         return {

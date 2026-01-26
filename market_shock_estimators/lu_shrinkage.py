@@ -1,293 +1,539 @@
 # market_shock_estimators/lu_shrinkage.py
 #
-# Updated to:
-#   - use LuPosteriorTF API (Ebar, eta passed explicitly)
-#   - call external kernels: tmh_step (tmh.py) and rw_mh_step (rw_mh.py)
-#   - remove inlined TMH and RW-MH implementations
+# Clean Lu (2025) shrinkage sampler (Option A: point-mass spike-and-slab):
+#   - Estimator-style API: fit() + get_results() (no step()).
+#   - Log densities delegated to LuPosteriorTF.
+#   - MH mechanics via tmh_step (Laplace independence MH) and rw_mh_step.
 #
-# Source baseline was the prior lu_shrinkage.py you provided. :contentReference[oaicite:0]{index=0}
+# Blocking (minimal, Lu-aligned):
+#   - Global: (beta_p, beta_w) via TMH; r via RW-MH.
+#   - Market t: E_bar_t via RW-MH;
+#               (gamma_t, eta_t) via MH toggles + TMH on active eta;
+#               phi_t via Gibbs.
 
+#
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import numpy as np
 import tensorflow as tf
 
-from market_shock_estimators.tmh import tmh_step
+from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.rw_mh import rw_mh_step
+from market_shock_estimators.tmh import tmh_step
+
+
+@dataclass(frozen=True)
+class ShrinkageMCMCConfig:
+    n_iter: int = 1500
+    burn_in: int = 500
+    thin: int = 5
+
+    # RW-MH step sizes (scalars)
+    r_step: float = 0.05
+    E_bar_step: float = 0.05
+
+    # TMH numeric parameters
+    ridge: float = 1e-6
+    max_lbfgs_iters: int = 100
 
 
 class LuShrinkageEstimator:
     """
-    Shrinkage estimator sampler (Lu Section 4 simulation target).
+    Lu (2025) shrinkage estimator MCMC sampler (Section 4 simulation target).
 
-    Blocking (Lu Section 4):
-      - TMH (Laplace independence MH) for beta and eta_t
-      - RW-MH for r and Ebar_t
-      - Gibbs for gamma_t, phi_t
+    Public API:
+      - fit(...)
+      - get_results()
 
-    Implementation:
-      - TMH delegated to tmh_step (LBFGS mode-finding)
-      - RW-MH delegated to rw_mh_step
-      - Posterior delegated to LuPosteriorTF.market_logp(Ebar=..., eta=..., ...)
+    State variables (paper-aligned):
+      Global:
+        beta_p, beta_w, r
+      Market-level:
+        E_bar_t, eta[t,j]
+      Sparsity/hyper:
+        gamma[t,j] in {0,1}, phi[t] in (0,1)
+
+    Data:
+      pjt, wjt, qjt, q0t
     """
 
     def __init__(
         self,
         *,
-        posterior,
-        x,
-        Z,
-        q,
-        q0,
-        beta_init,
-        r_init,
-        Ebar_init,
-        eta_init,
-        gamma_init,
-        phi_init,
-        r_step=0.05,
-        Ebar_step=0.05,
-        ridge=1e-6,
-        max_lbfgs_iters=100,
-        seed=0,
+        pjt: np.ndarray,
+        wjt: np.ndarray,
+        qjt: np.ndarray,
+        q0t: np.ndarray,
+        n_draws: int,
+        seed: int,
+        # Posterior hyperparameters (defaults match LuPosteriorTF defaults unless overridden)
+        posterior_kwargs: dict | None = None,
         dtype=tf.float64,
     ):
-        self.posterior = posterior
         self.dtype = dtype
+        self.success: bool = False
+        self._results: dict | None = None
 
+        # -----------------------------
         # Data
-        self.x = tf.convert_to_tensor(x, dtype=dtype)
-        self.Z = tf.convert_to_tensor(Z, dtype=dtype)
-        self.q = tf.convert_to_tensor(q, dtype=dtype)
-        self.q0 = tf.convert_to_tensor(q0, dtype=dtype)
+        # -----------------------------
+        self.pjt = tf.convert_to_tensor(pjt, dtype=dtype)  # (T,J)
+        self.wjt = tf.convert_to_tensor(wjt, dtype=dtype)  # (T,J)
+        self.qjt = tf.convert_to_tensor(qjt, dtype=dtype)  # (T,J)
+        self.q0t = tf.convert_to_tensor(q0t, dtype=dtype)  # (T,)
 
-        self.T = int(self.x.shape[0])
-        self.J = int(self.x.shape[1])
+        if self.pjt.shape.rank != 2:
+            raise ValueError("pjt must be rank-2 with shape (T,J).")
+        if self.wjt.shape != self.pjt.shape:
+            raise ValueError("wjt must have same shape as pjt.")
+        if self.qjt.shape != self.pjt.shape:
+            raise ValueError("qjt must have same shape as pjt.")
+        if self.q0t.shape.rank != 1 or int(self.q0t.shape[0]) != int(self.pjt.shape[0]):
+            raise ValueError("q0t must be shape (T,) matching pjt first dimension.")
 
-        # State
-        self.beta = tf.Variable(beta_init, dtype=dtype, trainable=False)
-        self.r = tf.Variable(r_init, dtype=dtype, trainable=False)
-        self.Ebar = tf.Variable(Ebar_init, dtype=dtype, trainable=False)  # (T,)
-        self.eta = tf.Variable(eta_init, dtype=dtype, trainable=False)  # (T,J)
-        self.gamma = tf.Variable(gamma_init, dtype=tf.int32, trainable=False)  # (T,J)
+        self.T = int(self.pjt.shape[0])
+        self.J = int(self.pjt.shape[1])
 
-        phi_init = tf.convert_to_tensor(phi_init, dtype=dtype)
-        phi_init = tf.reshape(phi_init, [self.T])  # force (T,)
-        self.phi = tf.Variable(phi_init, dtype=dtype, trainable=False)  # (T,)
+        # -----------------------------
+        # Posterior object (owns fixed v_draws for RC integration)
+        # -----------------------------
+        posterior_kwargs = {} if posterior_kwargs is None else dict(posterior_kwargs)
+        self.posterior = LuPosteriorTF(
+            n_draws=int(n_draws),
+            seed=int(seed),
+            dtype=dtype,
+            **posterior_kwargs,
+        )
 
-        # Kernel params
-        self.r_step = tf.convert_to_tensor(r_step, dtype=dtype)
-        self.Ebar_step = tf.convert_to_tensor(Ebar_step, dtype=dtype)
-        self.ridge = tf.convert_to_tensor(ridge, dtype=dtype)
-        self.max_lbfgs_iters = int(max_lbfgs_iters)
-
-        # RNG
+        # -----------------------------
+        # RNG (for proposals + Gibbs)
+        # -----------------------------
         self.rng = tf.random.Generator.from_seed(int(seed))
 
-        # Acceptance counters
-        self.acc_beta = tf.Variable(0, dtype=tf.int64, trainable=False)
-        self.acc_r = tf.Variable(0, dtype=tf.int64, trainable=False)
-        self.acc_eta = tf.Variable(tf.zeros([self.T], dtype=tf.int64), trainable=False)
-        self.acc_Ebar = tf.Variable(tf.zeros([self.T], dtype=tf.int64), trainable=False)
+        # -----------------------------
+        # Initialize state (minimal, deterministic)
+        # -----------------------------
+        self.beta_p = tf.Variable(0.0, dtype=dtype, trainable=False)
+        self.beta_w = tf.Variable(0.0, dtype=dtype, trainable=False)
+        self.r = tf.Variable(0.0, dtype=dtype, trainable=False)  # r = log(sigma)
 
-    # ================================================================
-    # Main step
-    # ================================================================
+        self.E_bar = tf.Variable(
+            tf.fill([self.T], tf.cast(self.posterior.E_bar_mean, dtype)),
+            trainable=False,
+        )  # (T,)
 
-    def step(self):
-        beta_old = tf.identity(self.beta)
-        r_old = tf.identity(self.r)
-        eta_old = tf.identity(self.eta)
+        self.eta = tf.Variable(
+            tf.zeros([self.T, self.J], dtype=dtype), trainable=False
+        )  # (T,J)
 
-        # 1) beta — TMH
-        beta_new, acc = self._tmh_beta()
-        self.beta.assign(beta_new)
-        self.acc_beta.assign_add(tf.cast(acc, tf.int64))
-
-        # 2) r — RW-MH
-        r_new, acc = rw_mh_step(
-            theta0=self.r,
-            logp_fn=self._r_logp,
-            step_size=self.r_step,
-            rng=self.rng,
+        # Start sparse: gamma=0, phi=Beta(a_phi,b_phi) prior mean, eta=0
+        self.gamma = tf.Variable(
+            tf.zeros([self.T, self.J], dtype=tf.int32), trainable=False
         )
-        self.r.assign(r_new)
-        self.acc_r.assign_add(tf.cast(acc, tf.int64))
-
-        # 3) Market-by-market
-        for t in range(self.T):
-            # Ebar_t — RW-MH
-            Ebar_new, acc = self._rw_mh_Ebar(t)
-            _set_1d_at(self.Ebar, t, Ebar_new)
-            _add_1d_at(self.acc_Ebar, t, tf.cast(acc, tf.int64))
-
-            # eta_t — TMH
-            eta_new, acc = self._tmh_eta(t)
-            _set_row_at(self.eta, t, eta_new)
-            _add_1d_at(self.acc_eta, t, tf.cast(acc, tf.int64))
-
-        # 4) gamma, phi — Gibbs
-        for t in range(self.T):
-            self._gibbs_gamma_phi_market(t)
-
-        _print_iteration_diagnostics_tf(
-            beta_old, r_old, eta_old, self.beta, self.r, self.eta
+        phi0 = tf.cast(self.posterior.a_phi, dtype) / (
+            tf.cast(self.posterior.a_phi + self.posterior.b_phi, dtype)
         )
+        self.phi = tf.Variable(tf.fill([self.T], phi0), trainable=False)
 
-    # ================================================================
-    # Log posteriors
-    # ================================================================
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _market_logp(self, t, Ebar_t, eta_t, beta=None, r=None):
+    def fit(
+        self,
+        *,
+        n_iter: int = 1500,
+        burn_in: int = 500,
+        thin: int = 5,
+        r_step: float = 0.05,
+        E_bar_step: float = 0.05,
+        ridge: float = 1e-6,
+        max_lbfgs_iters: int = 100,
+        verbose: bool = False,
+    ) -> None:
         """
-        Market log posterior contribution (likelihood + priors on Ebar and eta).
-
-        Uses LuPosteriorTF.market_logp(Ebar=..., eta=..., ...).
+        Run MCMC and store posterior-mean summaries internally.
         """
-        beta_use = self.beta if beta is None else beta
-        r_use = self.r if r is None else r
+        if n_iter <= 0:
+            raise ValueError("n_iter must be positive.")
+        if burn_in < 0 or burn_in >= n_iter:
+            raise ValueError("burn_in must satisfy 0 <= burn_in < n_iter.")
+        if thin <= 0:
+            raise ValueError("thin must be positive.")
 
-        return self.posterior.market_logp(
-            Ebar=Ebar_t,
-            eta=eta_t,
-            q=self.q[t],
-            q0=self.q0[t],
-            x=self.x[t],
-            Z=self.Z[t],
-            beta=beta_use,
-            r=r_use,
-            gamma=self.gamma[t],
+        cfg = ShrinkageMCMCConfig(
+            n_iter=int(n_iter),
+            burn_in=int(burn_in),
+            thin=int(thin),
+            r_step=float(r_step),
+            E_bar_step=float(E_bar_step),
+            ridge=float(ridge),
+            max_lbfgs_iters=int(max_lbfgs_iters),
         )
 
-    def _beta_logp(self, beta):
-        lp = tf.constant(0.0, self.dtype)
-        for t in range(self.T):
-            lp += self._market_logp(t, self.Ebar[t], self.eta[t], beta=beta)
-        # Global prior on beta (kept outside market_logp)
-        return lp - 0.5 * tf.reduce_sum(beta * beta) / self.posterior.beta_var
+        # -----------------------------
+        # Accumulators for posterior means
+        # -----------------------------
+        saved = 0
+        sum_beta = tf.zeros([2], dtype=self.dtype)
+        sum_sigma = tf.constant(0.0, dtype=self.dtype)
+        sum_E_bar = tf.zeros([self.T], dtype=self.dtype)
+        sum_eta = tf.zeros([self.T, self.J], dtype=self.dtype)
+        sum_phi = tf.zeros([self.T], dtype=self.dtype)
+        sum_gamma = tf.zeros([self.T, self.J], dtype=self.dtype)
 
-    def _r_logp(self, r):
-        lp = tf.constant(0.0, self.dtype)
-        for t in range(self.T):
-            lp += self._market_logp(t, self.Ebar[t], self.eta[t], r=r)
-        # Global prior on r (kept outside market_logp)
-        return lp - 0.5 * tf.reduce_sum(r * r) / self.posterior.r_var
+        # -----------------------------
+        # MCMC loop
+        # -----------------------------
+        for it in range(cfg.n_iter):
+            # 1) Global: beta = (beta_p, beta_w) via TMH (2-vector)
+            beta0 = tf.stack([self.beta_p, self.beta_w], axis=0)
 
-    # ================================================================
-    # RW-MH wrappers
-    # ================================================================
+            def logp_beta(theta_vec):
+                beta_p = theta_vec[0]
+                beta_w = theta_vec[1]
+                ll = tf.constant(0.0, dtype=self.dtype)
+                for t in range(self.T):
+                    ll += self.posterior.market_loglik(
+                        qjt_t=self.qjt[t],
+                        q0t_t=self.q0t[t],
+                        pjt_t=self.pjt[t],
+                        wjt_t=self.wjt[t],
+                        beta_p=beta_p,
+                        beta_w=beta_w,
+                        r=self.r,
+                        E_bar_t=self.E_bar[t],
+                        eta_t=self.eta[t] * tf.cast(self.gamma[t], self.dtype),
+                    )
+                return ll + self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
 
-    def _rw_mh_Ebar(self, t):
-        def logp_Ebar(val):
-            return self._market_logp(t, val, self.eta[t])
+            beta_new, _ = tmh_step(
+                theta0=beta0,
+                logp_fn=logp_beta,
+                ridge=tf.cast(cfg.ridge, self.dtype),
+                max_lbfgs_iters=cfg.max_lbfgs_iters,
+                rng=self.rng,
+            )
+            self.beta_p.assign(beta_new[0])
+            self.beta_w.assign(beta_new[1])
 
-        return rw_mh_step(
-            theta0=self.Ebar[t],
-            logp_fn=logp_Ebar,
-            step_size=self.Ebar_step,
-            rng=self.rng,
-        )
+            # 2) Global: r via RW-MH (scalar)
+            def logp_r(r_val):
+                ll = tf.constant(0.0, dtype=self.dtype)
+                for t in range(self.T):
+                    ll += self.posterior.market_loglik(
+                        qjt_t=self.qjt[t],
+                        q0t_t=self.q0t[t],
+                        pjt_t=self.pjt[t],
+                        wjt_t=self.wjt[t],
+                        beta_p=self.beta_p,
+                        beta_w=self.beta_w,
+                        r=r_val,
+                        E_bar_t=self.E_bar[t],
+                        eta_t=self.eta[t] * tf.cast(self.gamma[t], self.dtype),
+                    )
+                return ll + self.posterior.logprior_r(r=r_val)
 
-    # ================================================================
-    # TMH wrappers
-    # ================================================================
+            r_new, _ = rw_mh_step(
+                theta0=self.r,
+                logp_fn=logp_r,
+                step_size=tf.cast(cfg.r_step, self.dtype),
+                rng=self.rng,
+            )
+            self.r.assign(r_new)
 
-    def _tmh_beta(self):
-        return tmh_step(
-            theta0=self.beta,
-            logp_fn=self._beta_logp,
-            ridge=self.ridge,
-            max_lbfgs_iters=self.max_lbfgs_iters,
-            rng=self.rng,
-        )
+            # 3) Market-by-market blocks (Option A)
+            for t in range(self.T):
+                # 3a) E_bar_t via RW-MH (scalar)
+                def logp_E_bar_t(E_bar_t_val):
+                    return self.posterior.market_logpost(
+                        qjt_t=self.qjt[t],
+                        q0t_t=self.q0t[t],
+                        pjt_t=self.pjt[t],
+                        wjt_t=self.wjt[t],
+                        beta_p=self.beta_p,
+                        beta_w=self.beta_w,
+                        r=self.r,
+                        E_bar_t=E_bar_t_val,
+                        eta_t=self.eta[t],
+                        gamma_t=self.gamma[t],
+                        phi_t=self.phi[t],
+                    )
 
-    def _tmh_eta(self, t):
-        def logp_eta(eta_t):
-            return self._market_logp(t, self.Ebar[t], eta_t)
+                E_bar_new, _ = rw_mh_step(
+                    theta0=self.E_bar[t],
+                    logp_fn=logp_E_bar_t,
+                    step_size=tf.cast(cfg.E_bar_step, self.dtype),
+                    rng=self.rng,
+                )
+                self.E_bar.assign(
+                    tf.tensor_scatter_nd_update(
+                        self.E_bar, [[t]], [tf.cast(E_bar_new, self.dtype)]
+                    )
+                )
 
-        return tmh_step(
-            theta0=self.eta[t],
-            logp_fn=logp_eta,
-            ridge=self.ridge,
-            max_lbfgs_iters=self.max_lbfgs_iters,
-            rng=self.rng,
-        )
+                # 3b) gamma_t via MH toggles (birth/death), updates eta_t accordingly
+                self._mh_toggle_gamma_market(t)
 
-    # ================================================================
-    # Gibbs: gamma, phi
-    # ================================================================
+                # 3c) eta_t via TMH on active coordinates only
+                gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
+                active_idx = tf.where(tf.equal(gamma_t, 1))[:, 0]  # (K,)
+                K = tf.shape(active_idx)[0]
 
-    def _gibbs_gamma_phi_market(self, t):
-        eta_t = self.eta[t]
-        phi_t = self.phi[t]
+                if int(K.numpy()) > 0:
+                    eta_t_current = tf.cast(self.eta[t], self.dtype)
+                    eta_active0 = tf.gather(eta_t_current, active_idx)  # (K,)
 
-        T1 = self.posterior.T1_sq
-        T0 = self.posterior.T0_sq
+                    def logp_eta_active(eta_active_val):
+                        eta_full = tf.zeros([self.J], dtype=self.dtype)
+                        eta_full = tf.tensor_scatter_nd_update(
+                            eta_full,
+                            active_idx[:, None],
+                            tf.cast(eta_active_val, self.dtype),
+                        )
+                        return self.posterior.market_logpost(
+                            qjt_t=self.qjt[t],
+                            q0t_t=self.q0t[t],
+                            pjt_t=self.pjt[t],
+                            wjt_t=self.wjt[t],
+                            beta_p=self.beta_p,
+                            beta_w=self.beta_w,
+                            r=self.r,
+                            E_bar_t=self.E_bar[t],
+                            eta_t=eta_full,
+                            gamma_t=self.gamma[t],
+                            phi_t=self.phi[t],
+                        )
 
-        p1 = phi_t * tf.exp(-0.5 * eta_t * eta_t / T1) / tf.sqrt(T1)
-        p0 = (1.0 - phi_t) * tf.exp(-0.5 * eta_t * eta_t / T0) / tf.sqrt(T0)
-        prob = p1 / (p1 + p0)
+                    eta_active_new, _ = tmh_step(
+                        theta0=eta_active0,
+                        logp_fn=logp_eta_active,
+                        ridge=tf.cast(cfg.ridge, self.dtype),
+                        max_lbfgs_iters=cfg.max_lbfgs_iters,
+                        rng=self.rng,
+                    )
 
-        u = self.rng.uniform([self.J], dtype=self.dtype)
-        gamma_t = tf.cast(u < prob, tf.int32)
+                    eta_full_new = tf.zeros([self.J], dtype=self.dtype)
+                    eta_full_new = tf.tensor_scatter_nd_update(
+                        eta_full_new,
+                        active_idx[:, None],
+                        tf.cast(eta_active_new, self.dtype),
+                    )
+                    self.eta.assign(
+                        tf.tensor_scatter_nd_update(self.eta, [[t]], [eta_full_new])
+                    )
+                else:
+                    self.eta.assign(
+                        tf.tensor_scatter_nd_update(
+                            self.eta, [[t]], [tf.zeros([self.J], dtype=self.dtype)]
+                        )
+                    )
 
-        # TF2-safe write: gamma[t, :] = gamma_t
-        _set_row_at(self.gamma, t, gamma_t)
+                # 3d) phi_t via Gibbs (conjugate)
+                self._gibbs_phi_market(t)
 
-        a = self.posterior.a_phi + tf.reduce_sum(tf.cast(gamma_t, self.dtype))
-        b = (
-            self.posterior.b_phi
-            + tf.cast(self.J, self.dtype)
-            - tf.reduce_sum(tf.cast(gamma_t, self.dtype))
-        )
+                # 3e) Optional invariant check (reuse verbose flag)
+                if verbose:
+                    inactive = 1.0 - tf.cast(self.gamma[t], self.dtype)
+                    viol = tf.reduce_max(tf.abs(self.eta[t]) * inactive)
+                    if bool((viol > tf.cast(1e-10, self.dtype)).numpy()):
+                        raise ValueError(
+                            f"Option A invariant violated at market t={t}: "
+                            f"max |eta_j| for gamma_j=0 is {float(viol.numpy())}"
+                        )
 
-        phi_new = _sample_beta_tf(self.rng, a, b, dtype=self.dtype)
+            # 4) Save draw
+            if it >= cfg.burn_in and ((it - cfg.burn_in) % cfg.thin == 0):
+                saved += 1
+                sum_beta += tf.stack([self.beta_p, self.beta_w], axis=0)
+                sum_sigma += tf.exp(self.r)
 
-        # TF2-safe write: phi[t] = phi_new
-        _set_1d_at(self.phi, t, phi_new)
+                sum_E_bar += tf.identity(self.E_bar)
+                sum_eta += tf.identity(self.eta)
 
-    # ================================================================
-    # State export
-    # ================================================================
+                sum_phi += tf.identity(self.phi)
+                sum_gamma += tf.cast(self.gamma, self.dtype)
 
-    def state(self):
-        return {
-            "beta": self.beta.numpy(),
-            "r": self.r.numpy(),
-            "Ebar": self.Ebar.numpy(),
-            "eta": self.eta.numpy(),
-            "gamma": self.gamma.numpy(),
-            "phi": self.phi.numpy(),
+            if verbose and (it % 100 == 0):
+                # Lightweight diagnostics only
+                sigma_now = float(tf.exp(self.r).numpy())
+                inc_rate = float(
+                    tf.reduce_mean(tf.cast(self.gamma, self.dtype)).numpy()
+                )
+                print(
+                    f"[LuShrinkage] it={it} sigma={sigma_now:.3f} mean(gamma)={inc_rate:.3f}"
+                )
+
+        if saved == 0:
+            raise RuntimeError("No posterior draws were saved (check burn_in/thin).")
+
+        # -----------------------------
+        # Posterior means + result bundle
+        # -----------------------------
+        saved_f = tf.cast(saved, self.dtype)
+
+        beta_mean = (sum_beta / saved_f).numpy()
+        sigma_mean = float((sum_sigma / saved_f).numpy())
+
+        E_bar_mean = (sum_E_bar / saved_f).numpy()
+        eta_mean = (sum_eta / saved_f).numpy()
+        E_mean = E_bar_mean[:, None] + eta_mean
+
+        phi_mean = (sum_phi / saved_f).numpy()
+        gamma_mean = (sum_gamma / saved_f).numpy()
+
+        self._results = {
+            "success": True,
+            # paper-aligned names
+            "beta_p_hat": float(beta_mean[0]),
+            "beta_w_hat": float(beta_mean[1]),
+            "sigma_hat": sigma_mean,
+            # primary target for assessment
+            "E_hat": E_mean,
+            # optional diagnostics
+            "E_bar_hat": E_bar_mean,
+            "eta_hat": eta_mean,
+            "phi_hat": phi_mean,
+            "gamma_hat": gamma_mean,
+            "n_saved": int(saved),
+            "mcmc": {
+                "n_iter": cfg.n_iter,
+                "burn_in": cfg.burn_in,
+                "thin": cfg.thin,
+            },
         }
+        self.success = True
 
+    def get_results(self) -> dict:
+        """
+        Return estimator outputs in a single bundle.
 
-def _set_1d_at(var: tf.Variable, t: int, value: tf.Tensor) -> None:
-    """var[t] = value (TF2-safe)."""
-    value = tf.cast(value, var.dtype)
-    updated = tf.tensor_scatter_nd_update(var, indices=[[t]], updates=[value])
-    var.assign(updated)
+        Keys (minimum consistent with assess_estimator_results usage elsewhere):
+          - "success":   bool
+          - "sigma_hat": scalar float
+          - "E_hat":     (T, J) array
+          - "beta_p_hat", "beta_w_hat": scalars
 
+        Also returns posterior means of latent components and sparsity stats.
+        """
+        if self._results is None:
+            return {"success": False}
+        return dict(self._results)
 
-def _add_1d_at(var: tf.Variable, t: int, delta: tf.Tensor) -> None:
-    """var[t] += delta (TF2-safe)."""
-    delta = tf.cast(delta, var.dtype)
-    updated = tf.tensor_scatter_nd_add(var, indices=[[t]], updates=[delta])
-    var.assign(updated)
+    # ------------------------------------------------------------------
+    # Gibbs updates (market t)
+    # ------------------------------------------------------------------
 
+    def _mh_toggle_gamma_market(self, t: int) -> None:
+        """
+        Option A (point-mass spike): MH toggles for (gamma_{jt}, eta_{jt}).
 
-def _set_row_at(var: tf.Variable, t: int, row: tf.Tensor) -> None:
-    """var[t, :] = row (TF2-safe)."""
-    row = tf.cast(row, var.dtype)
-    updated = tf.tensor_scatter_nd_update(var, indices=[[t]], updates=[row])
-    var.assign(updated)
+        For each j:
+          - birth:  gamma 0->1 and draw eta_j ~ N(0, sigma_eta_sq)
+          - death:  gamma 1->0 and set eta_j = 0
 
+        Accept/reject using market_logpost difference + proposal correction.
+        """
+        gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
+        eta_t = tf.cast(self.eta[t], self.dtype)  # (J,)
+        phi_t = tf.cast(self.phi[t], self.dtype)  # scalar
 
-def _print_iteration_diagnostics_tf(beta_old, r_old, eta_old, beta, r, eta):
-    print(
-        "[LuShrinkage] "
-        f"||Δβ||={tf.linalg.norm(beta - beta_old).numpy():.3e} "
-        f"|Δr|={tf.linalg.norm(r - r_old).numpy():.3e} "
-        f"mean||Δη||={tf.reduce_mean(tf.linalg.norm(eta - eta_old, axis=1)).numpy():.3e}"
-    )
+        for j in range(self.J):
+            g_old = int(gamma_t[j].numpy())
+
+            gamma_old = gamma_t
+            eta_old = eta_t * tf.cast(gamma_old, self.dtype)  # enforce invariant
+
+            if g_old == 0:
+                # birth: propose gamma=1 and eta_j ~ slab prior
+                var = tf.cast(self.posterior.sigma_eta_sq, self.dtype)
+                sd = tf.sqrt(var)
+                eta_j_prop = sd * self.rng.normal([], dtype=self.dtype)
+
+                gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [1])
+                eta_new = tf.tensor_scatter_nd_update(eta_old, [[j]], [eta_j_prop])
+            else:
+                # death: propose gamma=0 and eta_j = 0
+                gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [0])
+                eta_new = tf.tensor_scatter_nd_update(
+                    eta_old, [[j]], [tf.cast(0.0, self.dtype)]
+                )
+
+            eta_new = eta_new * tf.cast(gamma_new, self.dtype)  # enforce invariant
+
+            lp_old = self.posterior.market_logpost(
+                qjt_t=self.qjt[t],
+                q0t_t=self.q0t[t],
+                pjt_t=self.pjt[t],
+                wjt_t=self.wjt[t],
+                beta_p=self.beta_p,
+                beta_w=self.beta_w,
+                r=self.r,
+                E_bar_t=self.E_bar[t],
+                eta_t=eta_old,
+                gamma_t=gamma_old,
+                phi_t=phi_t,
+            )
+            lp_new = self.posterior.market_logpost(
+                qjt_t=self.qjt[t],
+                q0t_t=self.q0t[t],
+                pjt_t=self.pjt[t],
+                wjt_t=self.wjt[t],
+                beta_p=self.beta_p,
+                beta_w=self.beta_w,
+                r=self.r,
+                E_bar_t=self.E_bar[t],
+                eta_t=eta_new,
+                gamma_t=gamma_new,
+                phi_t=phi_t,
+            )
+
+            # Proposal correction for reversible birth/death:
+            var = tf.cast(self.posterior.sigma_eta_sq, self.dtype)
+            if g_old == 0:
+                # forward draws eta_j_prop; reverse is deterministic
+                log_q_forward = (
+                    -0.5 * tf.math.log(self.posterior.two_pi * var)
+                    - 0.5 * tf.square(eta_j_prop) / var
+                )
+                log_q_reverse = tf.cast(0.0, self.dtype)
+            else:
+                # forward deterministic; reverse would draw eta_j from slab at old value
+                eta_j_old = tf.cast(eta_old[j], self.dtype)
+                log_q_forward = tf.cast(0.0, self.dtype)
+                log_q_reverse = (
+                    -0.5 * tf.math.log(self.posterior.two_pi * var)
+                    - 0.5 * tf.square(eta_j_old) / var
+                )
+
+            log_alpha = (lp_new - lp_old) + (log_q_reverse - log_q_forward)
+            u = self.rng.uniform([], dtype=self.dtype)
+            if bool((tf.math.log(u) < log_alpha).numpy()):
+                gamma_t = tf.cast(gamma_new, tf.int32)
+                eta_t = eta_new
+
+        # persist (already masked)
+        self.gamma.assign(tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_t]))
+        self.eta.assign(tf.tensor_scatter_nd_update(self.eta, [[t]], [eta_t]))
+
+    def _gibbs_phi_market(self, t: int) -> None:
+        """
+        Gibbs update: phi_t | gamma_t ~ Beta(a + sum gamma, b + J - sum gamma).
+        """
+        gamma_t = tf.cast(self.gamma[t], self.dtype)
+        a_post = tf.cast(self.posterior.a_phi, self.dtype) + tf.reduce_sum(gamma_t)
+        b_post = (
+            tf.cast(self.posterior.b_phi, self.dtype)
+            + tf.cast(self.J, self.dtype)
+            - tf.reduce_sum(gamma_t)
+        )
+
+        phi_new = _sample_beta_tf(self.rng, a_post, b_post, dtype=self.dtype)
+        self.phi.assign(
+            tf.tensor_scatter_nd_update(self.phi, [[t]], [tf.cast(phi_new, self.dtype)])
+        )
 
 
 def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor, dtype):
@@ -299,12 +545,10 @@ def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor, dtype)
     a = tf.convert_to_tensor(a, dtype=dtype)
     b = tf.convert_to_tensor(b, dtype=dtype)
 
-    # Derive two independent stateless seeds from the generator
-    seeds = rng.make_seeds(2)  # shape (2, 2), dtype int32
+    seeds = rng.make_seeds(2)  # (2,2) int32
     seed_x = seeds[0]
     seed_y = seeds[1]
 
-    # tf.random.stateless_gamma uses alpha (shape) and beta (rate)
     x = tf.random.stateless_gamma(
         shape=[],
         seed=seed_x,
@@ -319,5 +563,4 @@ def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor, dtype)
         beta=tf.cast(1.0, dtype),
         dtype=dtype,
     )
-
     return x / (x + y)
