@@ -9,22 +9,22 @@ class LuPosteriorTF:
     factorization and MCMC blocking.
 
     Model (Section 3/4, simulation uses price-only random coefficient):
-      delta_jt = beta_p * pjt + beta_w * wjt + E_bar_t + eta_jt
+      delta_jt = beta_p * pjt + beta_w * wjt + E_bar_t + n_jt
       beta_{p,i} = beta_p + exp(r) * v_i,  v_i ~ N(0,1)
 
       gamma_jt | phi_t ~ Bernoulli(phi_t)
       phi_t ~ Beta(a_phi, b_phi)
 
       Option A (point-mass spike-and-slab):
-        eta_jt | gamma_jt=1 ~ N(0, sigma_eta^2)
-        eta_jt | gamma_jt=0 = 0
+        n_jt | gamma_jt=1 ~ N(0, sigma_n_sq)
+        n_jt | gamma_jt=0 = 0
 
 
     Likelihood uses multinomial counts qjt, q0t:
       log p(q_t | s_t) = q0t*log s0t + sum_j qjt*log sjt + const
     (we drop the combinatorial constant).
 
-    All methods return scalar log-density contributions
+    All methods return scalar log-density contributions.
     """
 
     def __init__(
@@ -43,8 +43,8 @@ class LuPosteriorTF:
         # Prior on E_bar_t (normal): center at Lu Section 4 DGP mean (-1)
         E_bar_mean: float = -1.0,
         E_bar_var: float = 10.0,
-        # Slab variance for eta | gamma=1 (Option A: gamma=0 implies eta=0 exactly)
-        sigma_eta_sq: float = 1.0,
+        # Slab variance for n | gamma=1 (Option A: gamma=0 implies n=0 exactly)
+        sigma_n_sq: float = 1.0,
         # Beta prior for phi_t
         a_phi: float = 1.0,
         b_phi: float = 1.0,
@@ -74,9 +74,8 @@ class LuPosteriorTF:
         self.E_bar_mean = tf.constant(E_bar_mean, dtype=dtype)
         self.E_bar_var = tf.constant(E_bar_var, dtype=dtype)
 
-        self.sigma_eta_sq = tf.constant(sigma_eta_sq, dtype=dtype)
-
-        self.log_sigma_eta_sq = tf.math.log(self.sigma_eta_sq)
+        self.sigma_n_sq = tf.constant(sigma_n_sq, dtype=dtype)
+        self.log_sigma_n_sq = tf.math.log(self.sigma_n_sq)
 
         self.a_phi = tf.constant(a_phi, dtype=dtype)
         self.b_phi = tf.constant(b_phi, dtype=dtype)
@@ -95,19 +94,19 @@ class LuPosteriorTF:
         beta_p,
         beta_w,
         E_bar_t,
-        eta_t,
+        njt_t,
     ):
         """
-        delta_t (J,) = beta_p * pjt_t + beta_w * wjt_t + E_bar_t + eta_t
+        delta_t (J,) = beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
         """
         pjt_t = tf.convert_to_tensor(pjt_t, dtype=self.dtype)
         wjt_t = tf.convert_to_tensor(wjt_t, dtype=self.dtype)
-        eta_t = tf.convert_to_tensor(eta_t, dtype=self.dtype)
+        njt_t = tf.convert_to_tensor(njt_t, dtype=self.dtype)
         beta_p = tf.cast(beta_p, self.dtype)
         beta_w = tf.cast(beta_w, self.dtype)
         E_bar_t = tf.cast(E_bar_t, self.dtype)
 
-        return beta_p * pjt_t + beta_w * wjt_t + E_bar_t + eta_t
+        return beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
 
     def _choice_probs_t(self, *, pjt_t, delta_t, r):
         """
@@ -127,7 +126,6 @@ class LuPosteriorTF:
         r = tf.cast(r, self.dtype)
 
         sigma = tf.exp(r)  # scalar
-        # mu_{j,i} = p_j * (sigma * v_i)
         scaled_v = sigma * self.v_draws  # (R,)
         mu = pjt_t[:, None] * scaled_v[None, :]  # (J,R)
         util = delta_t[:, None] + mu  # (J,R)
@@ -164,7 +162,7 @@ class LuPosteriorTF:
         beta_w,
         r,
         E_bar_t,
-        eta_t,
+        njt_t,
     ):
         """
         Per-market log likelihood contribution (up to multinomial constant):
@@ -179,11 +177,10 @@ class LuPosteriorTF:
             beta_p=beta_p,
             beta_w=beta_w,
             E_bar_t=E_bar_t,
-            eta_t=eta_t,
+            njt_t=njt_t,
         )
         sjt_t, s0t = self._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
 
-        # Numerical protection for logs
         sjt_t = tf.clip_by_value(sjt_t, self.eps, 1.0)
         s0t = tf.clip_by_value(s0t, self.eps, 1.0)
 
@@ -202,7 +199,7 @@ class LuPosteriorTF:
         beta_w,
         r,
         E_bar,
-        eta,
+        njt,
     ):
         """
         Sum of market log-likelihoods over t.
@@ -212,7 +209,7 @@ class LuPosteriorTF:
         pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
         wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
         E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
-        eta = tf.convert_to_tensor(eta, dtype=self.dtype)  # (T,J)
+        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
 
         T = tf.shape(pjt)[0]
 
@@ -226,7 +223,7 @@ class LuPosteriorTF:
                 beta_w=beta_w,
                 r=r,
                 E_bar_t=E_bar[t],
-                eta_t=eta[t],
+                njt_t=njt[t],
             )
 
         ll_t = tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
@@ -240,7 +237,6 @@ class LuPosteriorTF:
         """
         log p(beta_p) + log p(beta_w), independent normals (up to constants).
         """
-
         beta_p = tf.cast(beta_p, self.dtype)
         beta_w = tf.cast(beta_w, self.dtype)
 
@@ -275,30 +271,29 @@ class LuPosteriorTF:
             self.two_pi * self.E_bar_var
         ) - 0.5 * tf.reduce_sum(tf.square(E_bar - self.E_bar_mean) / self.E_bar_var)
 
-    def logprior_eta(self, *, eta, gamma):
+    def logprior_n(self, *, njt, gamma):
         """
         Option A (point-mass spike-and-slab):
 
-          eta_j | gamma_j=1 ~ N(0, sigma_eta_sq)
-          eta_j | gamma_j=0 = 0
+          njt_j | gamma_j=1 ~ N(0, sigma_n_sq)
+          njt_j | gamma_j=0 = 0
 
-        Returns -inf if any inactive coordinate has eta != 0 (within tolerance).
+        Returns -inf if any inactive coordinate has njt != 0 (within tolerance).
         Otherwise returns the slab Normal log density for active coordinates only.
         """
-        eta = tf.convert_to_tensor(eta, dtype=self.dtype)
+        njt = tf.convert_to_tensor(njt, dtype=self.dtype)
         gamma = tf.cast(gamma, self.dtype)
 
-        # Inactive coords must be exactly zero (up to numerical tolerance)
         tol = tf.cast(1e-12, self.dtype)
         inactive = 1.0 - gamma
-        violates = tf.reduce_any(tf.abs(eta) * inactive > tol)
+        violates = tf.reduce_any(tf.abs(njt) * inactive > tol)
 
         def lp_valid():
-            var = self.sigma_eta_sq
+            var = self.sigma_n_sq
             n_active = tf.reduce_sum(gamma)
             return -0.5 * n_active * tf.math.log(
                 self.two_pi * var
-            ) - 0.5 * tf.reduce_sum(gamma * tf.square(eta) / var)
+            ) - 0.5 * tf.reduce_sum(gamma * tf.square(njt) / var)
 
         return tf.cond(
             violates,
@@ -316,12 +311,8 @@ class LuPosteriorTF:
         gamma = tf.cast(gamma, self.dtype)
         phi = tf.cast(phi, self.dtype)
 
-        # Clip phi away from 0/1 for log
         phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)
 
-        # Support broadcasting:
-        # - if gamma is (J,) and phi is scalar: fine
-        # - if gamma is (T,J) and phi is (T,), we want phi[:,None]
         if gamma.shape.rank == 2 and phi.shape.rank == 1:
             phi = phi[:, None]
 
@@ -339,7 +330,6 @@ class LuPosteriorTF:
         a = self.a_phi
         b = self.b_phi
 
-        # log Beta density: (a-1)log phi + (b-1)log(1-phi) - log B(a,b)
         logB = tf.math.lgamma(a) + tf.math.lgamma(b) - tf.math.lgamma(a + b)
         lp = (a - 1.0) * tf.math.log(phi) + (b - 1.0) * tf.math.log(1.0 - phi) - logB
         return tf.reduce_sum(lp)
@@ -348,10 +338,10 @@ class LuPosteriorTF:
     # Posterior composition (matches Lu factorization / blocking)
     # ------------------------------------------------------------------
 
-    def market_logprior(self, *, E_bar_t, eta_t, gamma_t, phi_t):
+    def market_logprior(self, *, E_bar_t, njt_t, gamma_t, phi_t):
         """
         Market-local prior contribution:
-          log p(E_bar_t) + log p(eta_t | gamma_t) + log p(gamma_t | phi_t) + log pi(phi_t)
+          log p(E_bar_t) + log p(njt_t | gamma_t) + log p(gamma_t | phi_t) + log pi(phi_t)
         """
         E_bar_t = tf.cast(E_bar_t, self.dtype)
         phi_t = tf.cast(phi_t, self.dtype)
@@ -360,7 +350,7 @@ class LuPosteriorTF:
                 -0.5 * tf.math.log(self.two_pi * self.E_bar_var)
                 - 0.5 * tf.square(E_bar_t - self.E_bar_mean) / self.E_bar_var
             )
-            + self.logprior_eta(eta=eta_t, gamma=gamma_t)
+            + self.logprior_n(njt=njt_t, gamma=gamma_t)
             + self.logprior_gamma(gamma=gamma_t, phi=phi_t)
             + self.logprior_phi(phi=tf.reshape(phi_t, (1,)))
         )
@@ -376,7 +366,7 @@ class LuPosteriorTF:
         beta_w,
         r,
         E_bar_t,
-        eta_t,
+        njt_t,
         gamma_t,
         phi_t,
     ):
@@ -384,10 +374,7 @@ class LuPosteriorTF:
         Market-local log posterior contribution:
           log p(q_t | ...) + market_logprior(...)
         """
-
-        # Robustness: likelihood should only “see” active shocks.
-        # Prior remains strict (logprior_eta returns -inf if inactive eta != 0).
-        eta_eff = tf.cast(gamma_t, self.dtype) * tf.cast(eta_t, self.dtype)
+        njt_eff = tf.cast(gamma_t, self.dtype) * tf.cast(njt_t, self.dtype)
 
         return self.market_loglik(
             qjt_t=qjt_t,
@@ -398,9 +385,9 @@ class LuPosteriorTF:
             beta_w=beta_w,
             r=r,
             E_bar_t=E_bar_t,
-            eta_t=eta_eff,
+            njt_t=njt_eff,
         ) + self.market_logprior(
-            E_bar_t=E_bar_t, eta_t=eta_t, gamma_t=gamma_t, phi_t=phi_t
+            E_bar_t=E_bar_t, njt_t=njt_t, gamma_t=gamma_t, phi_t=phi_t
         )
 
     def global_logprior(self, *, beta_p, beta_w, r):
@@ -421,7 +408,7 @@ class LuPosteriorTF:
         beta_w,
         r,
         E_bar,
-        eta,
+        njt,
         gamma,
         phi,
     ):
@@ -434,7 +421,7 @@ class LuPosteriorTF:
         pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
         wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
         E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
-        eta = tf.convert_to_tensor(eta, dtype=self.dtype)  # (T,J)
+        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
         gamma = tf.cast(gamma, self.dtype)  # (T,J)
         phi = tf.cast(phi, self.dtype)  # (T,)
 
@@ -450,7 +437,7 @@ class LuPosteriorTF:
                 beta_w=beta_w,
                 r=r,
                 E_bar_t=E_bar[t],
-                eta_t=eta[t],
+                njt_t=njt[t],
                 gamma_t=gamma[t],
                 phi_t=phi[t],
             )

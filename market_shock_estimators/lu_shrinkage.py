@@ -8,7 +8,7 @@
 # Blocking (minimal, Lu-aligned):
 #   - Global: (beta_p, beta_w) via TMH; r via RW-MH.
 #   - Market t: E_bar_t via RW-MH;
-#               (gamma_t, eta_t) via MH toggles + TMH on active eta;
+#               (gamma_t, njt_t) via MH toggles + TMH on active njt;
 #               phi_t via Gibbs.
 
 #
@@ -51,7 +51,7 @@ class LuShrinkageEstimator:
       Global:
         beta_p, beta_w, r
       Market-level:
-        E_bar_t, eta[t,j]
+        E_bar_t, njt[t,j]
       Sparsity/hyper:
         gamma[t,j] in {0,1}, phi[t] in (0,1)
 
@@ -124,11 +124,11 @@ class LuShrinkageEstimator:
             trainable=False,
         )  # (T,)
 
-        self.eta = tf.Variable(
+        self.njt = tf.Variable(
             tf.zeros([self.T, self.J], dtype=dtype), trainable=False
         )  # (T,J)
 
-        # Start sparse: gamma=0, phi=Beta(a_phi,b_phi) prior mean, eta=0
+        # Start sparse: gamma=0, phi=Beta(a_phi,b_phi) prior mean, njt=0
         self.gamma = tf.Variable(
             tf.zeros([self.T, self.J], dtype=tf.int32), trainable=False
         )
@@ -180,7 +180,7 @@ class LuShrinkageEstimator:
         sum_beta = tf.zeros([2], dtype=self.dtype)
         sum_sigma = tf.constant(0.0, dtype=self.dtype)
         sum_E_bar = tf.zeros([self.T], dtype=self.dtype)
-        sum_eta = tf.zeros([self.T, self.J], dtype=self.dtype)
+        sum_njt = tf.zeros([self.T, self.J], dtype=self.dtype)
         sum_phi = tf.zeros([self.T], dtype=self.dtype)
         sum_gamma = tf.zeros([self.T, self.J], dtype=self.dtype)
 
@@ -205,7 +205,7 @@ class LuShrinkageEstimator:
                         beta_w=beta_w,
                         r=self.r,
                         E_bar_t=self.E_bar[t],
-                        eta_t=self.eta[t] * tf.cast(self.gamma[t], self.dtype),
+                        njt_t=self.njt[t] * tf.cast(self.gamma[t], self.dtype),
                     )
                 return ll + self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
 
@@ -232,7 +232,7 @@ class LuShrinkageEstimator:
                         beta_w=self.beta_w,
                         r=r_val,
                         E_bar_t=self.E_bar[t],
-                        eta_t=self.eta[t] * tf.cast(self.gamma[t], self.dtype),
+                        njt_t=self.njt[t] * tf.cast(self.gamma[t], self.dtype),
                     )
                 return ll + self.posterior.logprior_r(r=r_val)
 
@@ -257,7 +257,7 @@ class LuShrinkageEstimator:
                         beta_w=self.beta_w,
                         r=self.r,
                         E_bar_t=E_bar_t_val,
-                        eta_t=self.eta[t],
+                        njt_t=self.njt[t],
                         gamma_t=self.gamma[t],
                         phi_t=self.phi[t],
                     )
@@ -274,24 +274,24 @@ class LuShrinkageEstimator:
                     )
                 )
 
-                # 3b) gamma_t via MH toggles (birth/death), updates eta_t accordingly
+                # 3b) gamma_t via MH toggles (birth/death), updates njt_t accordingly
                 self._mh_toggle_gamma_market(t)
 
-                # 3c) eta_t via TMH on active coordinates only
+                # 3c) njt_t via TMH on active coordinates only
                 gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
                 active_idx = tf.where(tf.equal(gamma_t, 1))[:, 0]  # (K,)
                 K = tf.shape(active_idx)[0]
 
                 if int(K.numpy()) > 0:
-                    eta_t_current = tf.cast(self.eta[t], self.dtype)
-                    eta_active0 = tf.gather(eta_t_current, active_idx)  # (K,)
+                    njt_t_current = tf.cast(self.njt[t], self.dtype)
+                    njt_active0 = tf.gather(njt_t_current, active_idx)  # (K,)
 
-                    def logp_eta_active(eta_active_val):
-                        eta_full = tf.zeros([self.J], dtype=self.dtype)
-                        eta_full = tf.tensor_scatter_nd_update(
-                            eta_full,
+                    def logp_njt_active(njt_active_val):
+                        njt_full = tf.zeros([self.J], dtype=self.dtype)
+                        njt_full = tf.tensor_scatter_nd_update(
+                            njt_full,
                             active_idx[:, None],
-                            tf.cast(eta_active_val, self.dtype),
+                            tf.cast(njt_active_val, self.dtype),
                         )
                         return self.posterior.market_logpost(
                             qjt_t=self.qjt[t],
@@ -302,32 +302,32 @@ class LuShrinkageEstimator:
                             beta_w=self.beta_w,
                             r=self.r,
                             E_bar_t=self.E_bar[t],
-                            eta_t=eta_full,
+                            njt_t=njt_full,
                             gamma_t=self.gamma[t],
                             phi_t=self.phi[t],
                         )
 
-                    eta_active_new, _ = tmh_step(
-                        theta0=eta_active0,
-                        logp_fn=logp_eta_active,
+                    njt_active_new, _ = tmh_step(
+                        theta0=njt_active0,
+                        logp_fn=logp_njt_active,
                         ridge=tf.cast(cfg.ridge, self.dtype),
                         max_lbfgs_iters=cfg.max_lbfgs_iters,
                         rng=self.rng,
                     )
 
-                    eta_full_new = tf.zeros([self.J], dtype=self.dtype)
-                    eta_full_new = tf.tensor_scatter_nd_update(
-                        eta_full_new,
+                    njt_full_new = tf.zeros([self.J], dtype=self.dtype)
+                    njt_full_new = tf.tensor_scatter_nd_update(
+                        njt_full_new,
                         active_idx[:, None],
-                        tf.cast(eta_active_new, self.dtype),
+                        tf.cast(njt_active_new, self.dtype),
                     )
-                    self.eta.assign(
-                        tf.tensor_scatter_nd_update(self.eta, [[t]], [eta_full_new])
+                    self.njt.assign(
+                        tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_full_new])
                     )
                 else:
-                    self.eta.assign(
+                    self.njt.assign(
                         tf.tensor_scatter_nd_update(
-                            self.eta, [[t]], [tf.zeros([self.J], dtype=self.dtype)]
+                            self.njt, [[t]], [tf.zeros([self.J], dtype=self.dtype)]
                         )
                     )
 
@@ -337,11 +337,11 @@ class LuShrinkageEstimator:
                 # 3e) Optional invariant check (reuse verbose flag)
                 if verbose:
                     inactive = 1.0 - tf.cast(self.gamma[t], self.dtype)
-                    viol = tf.reduce_max(tf.abs(self.eta[t]) * inactive)
+                    viol = tf.reduce_max(tf.abs(self.njt[t]) * inactive)
                     if bool((viol > tf.cast(1e-10, self.dtype)).numpy()):
                         raise ValueError(
                             f"Option A invariant violated at market t={t}: "
-                            f"max |eta_j| for gamma_j=0 is {float(viol.numpy())}"
+                            f"max |njt_j| for gamma_j=0 is {float(viol.numpy())}"
                         )
 
             # 4) Save draw
@@ -351,7 +351,7 @@ class LuShrinkageEstimator:
                 sum_sigma += tf.exp(self.r)
 
                 sum_E_bar += tf.identity(self.E_bar)
-                sum_eta += tf.identity(self.eta)
+                sum_njt += tf.identity(self.njt)
 
                 sum_phi += tf.identity(self.phi)
                 sum_gamma += tf.cast(self.gamma, self.dtype)
@@ -378,8 +378,8 @@ class LuShrinkageEstimator:
         sigma_mean = float((sum_sigma / saved_f).numpy())
 
         E_bar_mean = (sum_E_bar / saved_f).numpy()
-        eta_mean = (sum_eta / saved_f).numpy()
-        E_mean = E_bar_mean[:, None] + eta_mean
+        njt_mean = (sum_njt / saved_f).numpy()
+        E_mean = E_bar_mean[:, None] + njt_mean
 
         phi_mean = (sum_phi / saved_f).numpy()
         gamma_mean = (sum_gamma / saved_f).numpy()
@@ -394,7 +394,7 @@ class LuShrinkageEstimator:
             "E_hat": E_mean,
             # optional diagnostics
             "E_bar_hat": E_bar_mean,
-            "eta_hat": eta_mean,
+            "njt_hat": njt_mean,
             "phi_hat": phi_mean,
             "gamma_hat": gamma_mean,
             "n_saved": int(saved),
@@ -428,40 +428,40 @@ class LuShrinkageEstimator:
 
     def _mh_toggle_gamma_market(self, t: int) -> None:
         """
-        Option A (point-mass spike): MH toggles for (gamma_{jt}, eta_{jt}).
+        Option A (point-mass spike): MH toggles for (gamma_{jt}, njt_{jt}).
 
         For each j:
-          - birth:  gamma 0->1 and draw eta_j ~ N(0, sigma_eta_sq)
-          - death:  gamma 1->0 and set eta_j = 0
+          - birth:  gamma 0->1 and draw njt_j ~ N(0, sigma_n_sq)
+          - death:  gamma 1->0 and set njt_j = 0
 
         Accept/reject using market_logpost difference + proposal correction.
         """
         gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
-        eta_t = tf.cast(self.eta[t], self.dtype)  # (J,)
+        njt_t = tf.cast(self.njt[t], self.dtype)  # (J,)
         phi_t = tf.cast(self.phi[t], self.dtype)  # scalar
 
         for j in range(self.J):
             g_old = int(gamma_t[j].numpy())
 
             gamma_old = gamma_t
-            eta_old = eta_t * tf.cast(gamma_old, self.dtype)  # enforce invariant
+            njt_old = njt_t * tf.cast(gamma_old, self.dtype)  # enforce invariant
 
             if g_old == 0:
-                # birth: propose gamma=1 and eta_j ~ slab prior
-                var = tf.cast(self.posterior.sigma_eta_sq, self.dtype)
+                # birth: propose gamma=1 and njt_j ~ slab prior
+                var = tf.cast(self.posterior.sigma_n_sq, self.dtype)
                 sd = tf.sqrt(var)
-                eta_j_prop = sd * self.rng.normal([], dtype=self.dtype)
+                njt_j_prop = sd * self.rng.normal([], dtype=self.dtype)
 
                 gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [1])
-                eta_new = tf.tensor_scatter_nd_update(eta_old, [[j]], [eta_j_prop])
+                njt_new = tf.tensor_scatter_nd_update(njt_old, [[j]], [njt_j_prop])
             else:
-                # death: propose gamma=0 and eta_j = 0
+                # death: propose gamma=0 and njt_j = 0
                 gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [0])
-                eta_new = tf.tensor_scatter_nd_update(
-                    eta_old, [[j]], [tf.cast(0.0, self.dtype)]
+                njt_new = tf.tensor_scatter_nd_update(
+                    njt_old, [[j]], [tf.cast(0.0, self.dtype)]
                 )
 
-            eta_new = eta_new * tf.cast(gamma_new, self.dtype)  # enforce invariant
+            njt_new = njt_new * tf.cast(gamma_new, self.dtype)  # enforce invariant
 
             lp_old = self.posterior.market_logpost(
                 qjt_t=self.qjt[t],
@@ -472,7 +472,7 @@ class LuShrinkageEstimator:
                 beta_w=self.beta_w,
                 r=self.r,
                 E_bar_t=self.E_bar[t],
-                eta_t=eta_old,
+                njt_t=njt_old,
                 gamma_t=gamma_old,
                 phi_t=phi_t,
             )
@@ -485,38 +485,38 @@ class LuShrinkageEstimator:
                 beta_w=self.beta_w,
                 r=self.r,
                 E_bar_t=self.E_bar[t],
-                eta_t=eta_new,
+                njt_t=njt_new,
                 gamma_t=gamma_new,
                 phi_t=phi_t,
             )
 
             # Proposal correction for reversible birth/death:
-            var = tf.cast(self.posterior.sigma_eta_sq, self.dtype)
+            var = tf.cast(self.posterior.sigma_n_sq, self.dtype)
             if g_old == 0:
-                # forward draws eta_j_prop; reverse is deterministic
+                # forward draws njt_j_prop; reverse is deterministic
                 log_q_forward = (
                     -0.5 * tf.math.log(self.posterior.two_pi * var)
-                    - 0.5 * tf.square(eta_j_prop) / var
+                    - 0.5 * tf.square(njt_j_prop) / var
                 )
                 log_q_reverse = tf.cast(0.0, self.dtype)
             else:
-                # forward deterministic; reverse would draw eta_j from slab at old value
-                eta_j_old = tf.cast(eta_old[j], self.dtype)
+                # forward deterministic; reverse would draw njt_j from slab at old value
+                njt_j_old = tf.cast(njt_old[j], self.dtype)
                 log_q_forward = tf.cast(0.0, self.dtype)
                 log_q_reverse = (
                     -0.5 * tf.math.log(self.posterior.two_pi * var)
-                    - 0.5 * tf.square(eta_j_old) / var
+                    - 0.5 * tf.square(njt_j_old) / var
                 )
 
             log_alpha = (lp_new - lp_old) + (log_q_reverse - log_q_forward)
             u = self.rng.uniform([], dtype=self.dtype)
             if bool((tf.math.log(u) < log_alpha).numpy()):
                 gamma_t = tf.cast(gamma_new, tf.int32)
-                eta_t = eta_new
+                njt_t = njt_new
 
         # persist (already masked)
         self.gamma.assign(tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_t]))
-        self.eta.assign(tf.tensor_scatter_nd_update(self.eta, [[t]], [eta_t]))
+        self.njt.assign(tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_t]))
 
     def _gibbs_phi_market(self, t: int) -> None:
         """
