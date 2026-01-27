@@ -179,18 +179,51 @@ class LuShrinkageEstimator:
         Owns the full MCMC loop, mutating sampler state (tf.Variables) and
         accumulating posterior draw sums.
         """
+        # Make scalar hyperparams tensors (stable dtypes; reduces retracing risk when
+        # passed into tf.function-compiled market updates).
+        r_step_t = tf.convert_to_tensor(r_step, dtype=tf.float64)
+        E_bar_step_t = tf.convert_to_tensor(E_bar_step, dtype=tf.float64)
+        ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
 
         for it in range(n_iter):
-            self._update_beta_block(ridge=ridge, max_lbfgs_iters=max_lbfgs_iters)
-            self._update_r_block(r_step=r_step)
+            self._update_beta_block(ridge=float(ridge), max_lbfgs_iters=max_lbfgs_iters)
+            self._update_r_block(r_step=r_step_t)
 
             for t in range(self.T):
-                self._update_market_block(
-                    t=t,
-                    E_bar_step=E_bar_step,
-                    ridge=ridge,
+                # Slice market-specific data/state in Python using t (int).
+                qjt_t = self.qjt[t]
+                q0t_t = self.q0t[t]
+                pjt_t = self.pjt[t]
+                wjt_t = self.wjt[t]
+
+                E_bar_t = self.E_bar[t]
+                njt_t = self.njt[t]
+                gamma_t = self.gamma[t]
+                phi_t = self.phi[t]
+
+                E_bar_new, njt_new, gamma_new, phi_new = self._update_market_block(
+                    qjt_t=qjt_t,
+                    q0t_t=q0t_t,
+                    pjt_t=pjt_t,
+                    wjt_t=wjt_t,
+                    E_bar_t=E_bar_t,
+                    njt_t=njt_t,
+                    gamma_t=gamma_t,
+                    phi_t=phi_t,
+                    E_bar_step=E_bar_step_t,
+                    ridge=ridge_t,
                     max_lbfgs_iters=max_lbfgs_iters,
                 )
+
+                # Write back into full state (scatter update) using t (int).
+                self.E_bar.assign(
+                    tf.tensor_scatter_nd_update(self.E_bar, [[t]], [E_bar_new])
+                )
+                self.njt.assign(tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_new]))
+                self.gamma.assign(
+                    tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_new])
+                )
+                self.phi.assign(tf.tensor_scatter_nd_update(self.phi, [[t]], [phi_new]))
 
             diag.step(self, it)
 
@@ -262,7 +295,7 @@ class LuShrinkageEstimator:
         self.beta_p.assign(beta_new[0])
         self.beta_w.assign(beta_new[1])
 
-    def _update_r_block(self, r_step: float) -> None:
+    def _update_r_block(self, r_step: tf.Tensor) -> None:
         def logp_r(r_val: tf.Tensor) -> tf.Tensor:
             ll = tf.constant(0.0, dtype=tf.float64)
             for t in range(self.T):
@@ -284,88 +317,161 @@ class LuShrinkageEstimator:
         )
         self.r.assign(r_new)
 
+    # ------------------------------------------------------------------
+    # Market block (functional per-market update; compiled)
+    # ------------------------------------------------------------------
+
+    @tf.function
     def _update_market_block(
         self,
-        t: int,
-        E_bar_step: float,
-        ridge: float,
+        *,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+        gamma_t: tf.Tensor,
+        phi_t: tf.Tensor,
+        E_bar_step: tf.Tensor,
+        ridge: tf.Tensor,
         max_lbfgs_iters: int,
-    ) -> None:
-        self._update_E_bar_t(t=t, E_bar_step=E_bar_step)
-        self._update_njt_tmh_full(t=t, ridge=ridge, max_lbfgs_iters=max_lbfgs_iters)
-        self._update_gamma_t_given_n_phi(t=t)
-        self._update_phi_t(t=t)
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        E_bar_t_new = self._update_E_bar_t(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            E_bar_t=E_bar_t,
+            njt_t=njt_t,
+            gamma_t=gamma_t,
+            phi_t=phi_t,
+            E_bar_step=E_bar_step,
+        )
 
-    def _update_E_bar_t(self, t: int, E_bar_step: float) -> None:
+        njt_t_new = self._update_njt_tmh_full(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            E_bar_t=E_bar_t_new,
+            njt_t=njt_t,
+            gamma_t=gamma_t,
+            phi_t=phi_t,
+            ridge=ridge,
+            max_lbfgs_iters=max_lbfgs_iters,
+        )
+
+        gamma_t_new = self._update_gamma_t_given_n_phi(
+            njt_t=njt_t_new,
+            phi_t=phi_t,
+        )
+
+        phi_t_new = self._update_phi_t(
+            gamma_t=gamma_t_new,
+        )
+
+        return E_bar_t_new, njt_t_new, gamma_t_new, phi_t_new
+
+    def _update_E_bar_t(
+        self,
+        *,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+        gamma_t: tf.Tensor,
+        phi_t: tf.Tensor,
+        E_bar_step: tf.Tensor,
+    ) -> tf.Tensor:
         def logp_E_bar_t(E_bar_t_val: tf.Tensor) -> tf.Tensor:
             return self.posterior.market_logpost(
-                qjt_t=self.qjt[t],
-                q0t_t=self.q0t[t],
-                pjt_t=self.pjt[t],
-                wjt_t=self.wjt[t],
+                qjt_t=qjt_t,
+                q0t_t=q0t_t,
+                pjt_t=pjt_t,
+                wjt_t=wjt_t,
                 beta_p=self.beta_p,
                 beta_w=self.beta_w,
                 r=self.r,
                 E_bar_t=E_bar_t_val,
-                njt_t=self.njt[t],
-                gamma_t=self.gamma[t],
-                phi_t=self.phi[t],
+                njt_t=njt_t,
+                gamma_t=gamma_t,
+                phi_t=phi_t,
             )
 
         E_bar_new, _ = rw_mh_step(
-            theta0=self.E_bar[t],
+            theta0=E_bar_t,
             logp_fn=logp_E_bar_t,
             step_size=E_bar_step,
             rng=self.rng,
         )
-        self.E_bar.assign(tf.tensor_scatter_nd_update(self.E_bar, [[t]], [E_bar_new]))
+        return E_bar_new
 
-    def _update_njt_tmh_full(self, t: int, ridge: float, max_lbfgs_iters: int) -> None:
-        njt0 = self.njt[t]
-
+    def _update_njt_tmh_full(
+        self,
+        *,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+        gamma_t: tf.Tensor,
+        phi_t: tf.Tensor,
+        ridge: tf.Tensor,
+        max_lbfgs_iters: int,
+    ) -> tf.Tensor:
         def logp_njt_full(njt_t_val: tf.Tensor) -> tf.Tensor:
             return self.posterior.market_logpost(
-                qjt_t=self.qjt[t],
-                q0t_t=self.q0t[t],
-                pjt_t=self.pjt[t],
-                wjt_t=self.wjt[t],
+                qjt_t=qjt_t,
+                q0t_t=q0t_t,
+                pjt_t=pjt_t,
+                wjt_t=wjt_t,
                 beta_p=self.beta_p,
                 beta_w=self.beta_w,
                 r=self.r,
-                E_bar_t=self.E_bar[t],
+                E_bar_t=E_bar_t,
                 njt_t=njt_t_val,
-                gamma_t=self.gamma[t],
-                phi_t=self.phi[t],
+                gamma_t=gamma_t,
+                phi_t=phi_t,
             )
 
         njt_new, _ = tmh_step(
-            theta0=njt0,
+            theta0=njt_t,
             logp_fn=logp_njt_full,
             ridge=tf.cast(ridge, tf.float64),
             max_lbfgs_iters=max_lbfgs_iters,
             rng=self.rng,
         )
-        self.njt.assign(tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_new]))
+        return njt_new
 
-    def _update_gamma_t_given_n_phi(self, t: int) -> None:
-        gamma_t_new = sample_gamma_given_n_phi_market(
-            njt_t=self.njt[t],
-            phi_t=self.phi[t],
+    def _update_gamma_t_given_n_phi(
+        self,
+        *,
+        njt_t: tf.Tensor,
+        phi_t: tf.Tensor,
+    ) -> tf.Tensor:
+        return sample_gamma_given_n_phi_market(
+            njt_t=njt_t,
+            phi_t=phi_t,
             T0_sq=self.posterior.T0_sq,
             T1_sq=self.posterior.T1_sq,
             log_T0_sq=self.posterior.log_T0_sq,
             log_T1_sq=self.posterior.log_T1_sq,
             rng=self.rng,
         )
-        self.gamma.assign(tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_t_new]))
 
-    def _update_phi_t(self, t: int) -> None:
-        phi_t_new = gibbs_phi_market(
-            gamma_t=self.gamma[t],
+    def _update_phi_t(
+        self,
+        *,
+        gamma_t: tf.Tensor,
+    ) -> tf.Tensor:
+        return gibbs_phi_market(
+            gamma_t=gamma_t,
             a_phi=self.posterior.a_phi,
             b_phi=self.posterior.b_phi,
             J=self.J,
             rng=self.rng,
         )
-
-        self.phi.assign(tf.tensor_scatter_nd_update(self.phi, [[t]], [phi_t_new]))

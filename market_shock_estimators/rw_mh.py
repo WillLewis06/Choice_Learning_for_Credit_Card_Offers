@@ -1,5 +1,3 @@
-# market_shock_estimators/rw_mh.py
-
 from __future__ import annotations
 
 import tensorflow as tf
@@ -48,9 +46,10 @@ def rw_mh_step(
 
     # ------------------------------------------------------------
     # 2. Log acceptance ratio (symmetric proposal)
+    #    Ensure dtype consistency for tf.function compatibility.
     # ------------------------------------------------------------
-    logp_curr = logp_fn(theta0)
-    logp_prop = logp_fn(theta_prop)
+    logp_curr = tf.cast(logp_fn(theta0), dtype)
+    logp_prop = tf.cast(logp_fn(theta_prop), dtype)
 
     log_alpha = logp_prop - logp_curr
 

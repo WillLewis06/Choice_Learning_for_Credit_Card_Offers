@@ -3,43 +3,61 @@ from __future__ import annotations
 import tensorflow as tf
 
 
-def init_progress_state(shrink: LuShrinkageEstimator) -> dict:
+def init_progress_state(shrink: "LuShrinkageEstimator") -> dict:
     """
     Initialize a lightweight snapshot of the current state.
     Scalars + cheap aggregates only.
+
+    TF-compatible: returns tensors (no .numpy(), no Python floats).
     """
     return {
-        "beta_p": float(shrink.beta_p.numpy()),
-        "beta_w": float(shrink.beta_w.numpy()),
-        "r": float(shrink.r.numpy()),
-        "E_bar_norm": float(tf.norm(shrink.E_bar).numpy()),
-        "njt_norm": float(tf.norm(shrink.njt).numpy()),
-        "gamma_mean": float(tf.reduce_mean(tf.cast(shrink.gamma, tf.float64)).numpy()),
-        "phi_mean": float(tf.reduce_mean(shrink.phi).numpy()),
+        "beta_p": tf.identity(shrink.beta_p),
+        "beta_w": tf.identity(shrink.beta_w),
+        "r": tf.identity(shrink.r),
+        "E_bar_norm": tf.norm(shrink.E_bar),
+        "njt_norm": tf.norm(shrink.njt),
+        "gamma_mean": tf.reduce_mean(tf.cast(shrink.gamma, tf.float64)),
+        "phi_mean": tf.reduce_mean(shrink.phi),
     }
 
 
-def report_iteration_progress(shrink: LuShrinkageEstimator, it: int) -> dict:
+def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> dict:
     """
     Print current state values (scalars + cheap aggregates) at end of iteration.
     Returns updated snapshot for next iteration.
+
+    TF-compatible: uses tf.print and returns tensors (no .numpy(), no Python floats).
     """
-    beta_p = float(shrink.beta_p.numpy())
-    beta_w = float(shrink.beta_w.numpy())
-    r_val = float(shrink.r.numpy())
-    sigma = float(tf.exp(shrink.r).numpy())
+    it_t = tf.convert_to_tensor(it)
 
-    E_bar_norm = float(tf.norm(shrink.E_bar).numpy())
-    njt_norm = float(tf.norm(shrink.njt).numpy())
+    beta_p = tf.identity(shrink.beta_p)
+    beta_w = tf.identity(shrink.beta_w)
+    r_val = tf.identity(shrink.r)
+    sigma = tf.exp(shrink.r)
 
-    gamma_mean = float(tf.reduce_mean(tf.cast(shrink.gamma, tf.float64)).numpy())
-    phi_mean = float(tf.reduce_mean(shrink.phi).numpy())
+    E_bar_norm = tf.norm(shrink.E_bar)
+    njt_norm = tf.norm(shrink.njt)
 
-    print(
-        f"[LuShrinkage] it={it} | "
-        f"beta_p={beta_p:.4f}, beta_w={beta_w:.4f}, sigma={sigma:.4f} | "
-        f"E_bar_norm={E_bar_norm:.4e}, njt_norm={njt_norm:.4e} | "
-        f"mean(gamma)={gamma_mean:.4f}, mean(phi)={phi_mean:.4f}"
+    gamma_mean = tf.reduce_mean(tf.cast(shrink.gamma, tf.float64))
+    phi_mean = tf.reduce_mean(shrink.phi)
+
+    tf.print(
+        "[LuShrinkage] it=",
+        it_t,
+        " | beta_p=",
+        beta_p,
+        ", beta_w=",
+        beta_w,
+        ", sigma=",
+        sigma,
+        " | E_bar_norm=",
+        E_bar_norm,
+        ", njt_norm=",
+        njt_norm,
+        " | mean(gamma)=",
+        gamma_mean,
+        ", mean(phi)=",
+        phi_mean,
     )
 
     return {
@@ -56,12 +74,11 @@ def report_iteration_progress(shrink: LuShrinkageEstimator, it: int) -> dict:
 class LuShrinkageDiagnostics:
     """
     Owns:
-      - progress printing state (prev snapshot)
       - running-sum accumulation for posterior-mean summaries
+      - per-iteration progress printing
 
     Intended call pattern from LuShrinkageEstimator:
       diag = LuShrinkageDiagnostics(T, J)
-      diag.start(self)
       for it in range(n_iter):
           ... update blocks ...
           diag.step(self, it)
@@ -72,28 +89,39 @@ class LuShrinkageDiagnostics:
         self.T = int(T)
         self.J = int(J)
 
-        self.saved: int = 0
-        self.sum_beta = tf.zeros([2], dtype=tf.float64)
-        self.sum_sigma = tf.constant(0.0, dtype=tf.float64)
-        self.sum_E_bar = tf.zeros([self.T], dtype=tf.float64)
-        self.sum_njt = tf.zeros([self.T, self.J], dtype=tf.float64)
-        self.sum_phi = tf.zeros([self.T], dtype=tf.float64)
-        self.sum_gamma = tf.zeros([self.T, self.J], dtype=tf.float64)
+        # TF-friendly mutable state.
+        self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
+        self.sum_beta = tf.Variable(tf.zeros([2], dtype=tf.float64), trainable=False)
+        self.sum_sigma = tf.Variable(
+            tf.constant(0.0, dtype=tf.float64), trainable=False
+        )
+        self.sum_E_bar = tf.Variable(
+            tf.zeros([self.T], dtype=tf.float64), trainable=False
+        )
+        self.sum_njt = tf.Variable(
+            tf.zeros([self.T, self.J], dtype=tf.float64), trainable=False
+        )
+        self.sum_phi = tf.Variable(
+            tf.zeros([self.T], dtype=tf.float64), trainable=False
+        )
+        self.sum_gamma = tf.Variable(
+            tf.zeros([self.T, self.J], dtype=tf.float64), trainable=False
+        )
 
-    def _accumulate_draw(self, shrink: LuShrinkageEstimator) -> None:
+    def _accumulate_draw(self, shrink: "LuShrinkageEstimator") -> None:
         """
         Accumulate the current state into running sums.
         No burn-in/thinning logic; every iteration is retained.
         """
-        self.saved += 1
-        self.sum_beta += tf.stack([shrink.beta_p, shrink.beta_w], axis=0)
-        self.sum_sigma += tf.exp(shrink.r)
-        self.sum_E_bar += shrink.E_bar
-        self.sum_njt += shrink.njt
-        self.sum_phi += shrink.phi
-        self.sum_gamma += tf.cast(shrink.gamma, tf.float64)
+        self.saved.assign_add(1)
+        self.sum_beta.assign_add(tf.stack([shrink.beta_p, shrink.beta_w], axis=0))
+        self.sum_sigma.assign_add(tf.exp(shrink.r))
+        self.sum_E_bar.assign_add(shrink.E_bar)
+        self.sum_njt.assign_add(shrink.njt)
+        self.sum_phi.assign_add(shrink.phi)
+        self.sum_gamma.assign_add(tf.cast(shrink.gamma, tf.float64))
 
-    def step(self, shrink: LuShrinkageEstimator, it: int) -> None:
+    def step(self, shrink: "LuShrinkageEstimator", it) -> None:
         """
         Called once per iteration:
           - accumulate current draw into running sums
@@ -104,16 +132,25 @@ class LuShrinkageDiagnostics:
 
     def get_sums(
         self,
-    ) -> tuple[int, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    ) -> tuple[
+        tf.Tensor,
+        tf.Tensor,
+        tf.Tensor,
+        tf.Tensor,
+        tf.Tensor,
+        tf.Tensor,
+        tf.Tensor,
+    ]:
         """
         Return the raw running sums for the estimator to finalize results.
+        TF-compatible: returns tensors (no Python int conversion).
         """
         return (
-            int(self.saved),
-            self.sum_beta,
-            self.sum_sigma,
-            self.sum_E_bar,
-            self.sum_njt,
-            self.sum_phi,
-            self.sum_gamma,
+            self.saved.read_value(),
+            self.sum_beta.read_value(),
+            self.sum_sigma.read_value(),
+            self.sum_E_bar.read_value(),
+            self.sum_njt.read_value(),
+            self.sum_phi.read_value(),
+            self.sum_gamma.read_value(),
         )
