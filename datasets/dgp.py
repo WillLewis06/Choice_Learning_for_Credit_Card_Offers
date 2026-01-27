@@ -72,7 +72,7 @@ def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
         alpha[njt >= thr] = 0.3
         alpha[njt <= -thr] = -0.3
 
-    return wjt, E_bar_t, njt, Ejt, ujt, alpha
+    return wjt, Ejt, ujt, alpha
 
 
 class BasicLuChoiceModel:

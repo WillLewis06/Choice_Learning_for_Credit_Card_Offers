@@ -30,10 +30,19 @@ def main() -> None:
         25  # We start the blp estimator optimisation with a coarse grid search
     )
 
-    # Shrinkage run config
-    mcmc_max_iter = 50
-    mcmc_burn_in = 10
-    mcmc_thin = 5
+    # -----------------------------
+    # Lu shrinkage (MCMC) hyperparameters
+    # -----------------------------
+
+    shrink_n_iter = 15
+    shrink_burn_in = 5
+    shrink_thin = 5
+    # RW–MH step sizes
+    shrink_r_step = 0.05
+    shrink_E_bar_step = 0.05
+    # TMH numerical parameters
+    shrink_ridge = 1e-6
+    shrink_max_lbfgs_iters = 100
 
     for dgp_type in (1, 2, 3, 4):
         print(f"=== DGP {dgp_type} ===")
@@ -41,7 +50,7 @@ def main() -> None:
         # -----------------------------
         # DGP (Lu Section 4.1)
         # -----------------------------
-        wjt, _, _, Ejt, ujt, alpha = generate_market_conditions(
+        wjt, Ejt, ujt, alpha = generate_market_conditions(
             T=T, J=J, dgp_type=dgp_type, seed=seed
         )
 
@@ -120,11 +129,14 @@ def main() -> None:
             seed=seed,
         )
         print(f"=== Shrinkage Estimator built ===")
-
         shrink.fit(
-            n_iter=mcmc_max_iter,
-            burn_in=mcmc_burn_in,
-            thin=mcmc_thin,
+            n_iter=shrink_n_iter,
+            burn_in=shrink_burn_in,
+            thin=shrink_thin,
+            r_step=shrink_r_step,
+            E_bar_step=shrink_E_bar_step,
+            ridge=shrink_ridge,
+            max_lbfgs_iters=shrink_max_lbfgs_iters,
         )
         res_shrink = shrink.get_results()
         print(f"=== Shrinkage Estimator fitted ===")
