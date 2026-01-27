@@ -2,8 +2,6 @@ import numpy as np
 
 
 def assess_estimator_results(
-    *,
-    name: str,
     results: dict,
     E_true: np.ndarray,
     sigma_true: float | None = None,
@@ -22,7 +20,7 @@ def assess_estimator_results(
       - Null baseline RMSE (E_hat = 0) and improvement
       - Optional sigma absolute/relative error when sigma_true is provided
     """
-    out = {"name": name}
+    out = {}
 
     success = bool(results.get("success", False))
     E_hat = results.get("E_hat", None)
@@ -141,7 +139,7 @@ def assess_estimator_results(
 
 def print_assessment(a: dict):
     if not a.get("ok", False):
-        print(f"[SIM] {a['name']} | FAILED | {a.get('reason')}")
+        print(f"[SIM] Estimator FAILED | {a.get('reason')}")
         return
 
     sigma_part = ""
@@ -153,7 +151,6 @@ def print_assessment(a: dict):
         )
 
     print(
-        f"[SIM] {a['name']} | "
         f"rmse={a['rmse']:.4f} mae={a['mae']:.4f} "
         f"bias={a['bias']:.4f} corr={a['corr']:.4f} "
         f"std_ratio={a['std_ratio']:.4f} "

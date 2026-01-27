@@ -10,7 +10,6 @@
 #   - Market t: E_bar_t via RW-MH;
 #               (gamma_t, njt_t) via MH toggles + TMH on active njt;
 #               phi_t via Gibbs.
-
 #
 from __future__ import annotations
 
@@ -68,7 +67,6 @@ class LuShrinkageEstimator:
         q0t: np.ndarray,
         n_draws: int,
         seed: int,
-        # Posterior hyperparameters (defaults match LuPosteriorTF defaults unless overridden)
         posterior_kwargs: dict | None = None,
         dtype=tf.float64,
     ):
@@ -97,7 +95,7 @@ class LuShrinkageEstimator:
         self.J = int(self.pjt.shape[1])
 
         # -----------------------------
-        # Posterior object (owns fixed v_draws for RC integration)
+        # Posterior object
         # -----------------------------
         posterior_kwargs = {} if posterior_kwargs is None else dict(posterior_kwargs)
         self.posterior = LuPosteriorTF(
@@ -108,34 +106,86 @@ class LuShrinkageEstimator:
         )
 
         # -----------------------------
-        # RNG (for proposals + Gibbs)
+        # RNG
         # -----------------------------
         self.rng = tf.random.Generator.from_seed(int(seed))
 
         # -----------------------------
-        # Initialize state (minimal, deterministic)
+        # Initialize state
         # -----------------------------
         self.beta_p = tf.Variable(0.0, dtype=dtype, trainable=False)
         self.beta_w = tf.Variable(0.0, dtype=dtype, trainable=False)
-        self.r = tf.Variable(0.0, dtype=dtype, trainable=False)  # r = log(sigma)
+        self.r = tf.Variable(0.0, dtype=dtype, trainable=False)  # log(sigma)
 
         self.E_bar = tf.Variable(
             tf.fill([self.T], tf.cast(self.posterior.E_bar_mean, dtype)),
             trainable=False,
-        )  # (T,)
+        )
 
-        self.njt = tf.Variable(
-            tf.zeros([self.T, self.J], dtype=dtype), trainable=False
-        )  # (T,J)
+        self.njt = tf.Variable(tf.zeros([self.T, self.J], dtype=dtype), trainable=False)
 
-        # Start sparse: gamma=0, phi=Beta(a_phi,b_phi) prior mean, njt=0
         self.gamma = tf.Variable(
             tf.zeros([self.T, self.J], dtype=tf.int32), trainable=False
         )
+
         phi0 = tf.cast(self.posterior.a_phi, dtype) / (
             tf.cast(self.posterior.a_phi + self.posterior.b_phi, dtype)
         )
         self.phi = tf.Variable(tf.fill([self.T], phi0), trainable=False)
+
+    # ------------------------------------------------------------------
+    # Progress diagnostics (NEW)
+    # ------------------------------------------------------------------
+
+    def _init_progress_state(self) -> dict:
+        """
+        Initialize a lightweight snapshot of the current state.
+        Scalars + cheap aggregates only.
+        """
+        return {
+            "beta_p": float(self.beta_p.numpy()),
+            "beta_w": float(self.beta_w.numpy()),
+            "r": float(self.r.numpy()),
+            "E_bar_norm": float(tf.norm(self.E_bar).numpy()),
+            "njt_norm": float(tf.norm(self.njt).numpy()),
+            "gamma_mean": float(
+                tf.reduce_mean(tf.cast(self.gamma, self.dtype)).numpy()
+            ),
+            "phi_mean": float(tf.reduce_mean(self.phi).numpy()),
+        }
+
+    def _report_iteration_progress(self, it: int, prev: dict) -> dict:
+        """
+        Print current state values (scalars + cheap aggregates) at end of iteration.
+        Returns updated snapshot for next iteration.
+        """
+        beta_p = float(self.beta_p.numpy())
+        beta_w = float(self.beta_w.numpy())
+        r_val = float(self.r.numpy())
+        sigma = float(tf.exp(self.r).numpy())
+
+        E_bar_norm = float(tf.norm(self.E_bar).numpy())
+        njt_norm = float(tf.norm(self.njt).numpy())
+
+        gamma_mean = float(tf.reduce_mean(tf.cast(self.gamma, self.dtype)).numpy())
+        phi_mean = float(tf.reduce_mean(self.phi).numpy())
+
+        print(
+            f"[LuShrinkage] it={it} | "
+            f"beta_p={beta_p:.4f}, beta_w={beta_w:.4f}, sigma={sigma:.4f} | "
+            f"E_bar_norm={E_bar_norm:.4e}, njt_norm={njt_norm:.4e} | "
+            f"mean(gamma)={gamma_mean:.4f}, mean(phi)={phi_mean:.4f}"
+        )
+
+        return {
+            "beta_p": beta_p,
+            "beta_w": beta_w,
+            "r": r_val,
+            "E_bar_norm": E_bar_norm,
+            "njt_norm": njt_norm,
+            "gamma_mean": gamma_mean,
+            "phi_mean": phi_mean,
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -173,9 +223,6 @@ class LuShrinkageEstimator:
             max_lbfgs_iters=int(max_lbfgs_iters),
         )
 
-        # -----------------------------
-        # Accumulators for posterior means
-        # -----------------------------
         saved = 0
         sum_beta = tf.zeros([2], dtype=self.dtype)
         sum_sigma = tf.constant(0.0, dtype=self.dtype)
@@ -184,11 +231,13 @@ class LuShrinkageEstimator:
         sum_phi = tf.zeros([self.T], dtype=self.dtype)
         sum_gamma = tf.zeros([self.T, self.J], dtype=self.dtype)
 
+        prev_state = self._init_progress_state()
+
         # -----------------------------
         # MCMC loop
         # -----------------------------
         for it in range(cfg.n_iter):
-            # 1) Global: beta = (beta_p, beta_w) via TMH (2-vector)
+            # 1) Global beta
             beta0 = tf.stack([self.beta_p, self.beta_w], axis=0)
 
             def logp_beta(theta_vec):
@@ -219,7 +268,7 @@ class LuShrinkageEstimator:
             self.beta_p.assign(beta_new[0])
             self.beta_w.assign(beta_new[1])
 
-            # 2) Global: r via RW-MH (scalar)
+            # 2) Global r
             def logp_r(r_val):
                 ll = tf.constant(0.0, dtype=self.dtype)
                 for t in range(self.T):
@@ -244,9 +293,9 @@ class LuShrinkageEstimator:
             )
             self.r.assign(r_new)
 
-            # 3) Market-by-market blocks (Option A)
+            # 3) Market blocks
             for t in range(self.T):
-                # 3a) E_bar_t via RW-MH (scalar)
+
                 def logp_E_bar_t(E_bar_t_val):
                     return self.posterior.market_logpost(
                         qjt_t=self.qjt[t],
@@ -274,17 +323,15 @@ class LuShrinkageEstimator:
                     )
                 )
 
-                # 3b) gamma_t via MH toggles (birth/death), updates njt_t accordingly
                 self._mh_toggle_gamma_market(t)
 
-                # 3c) njt_t via TMH on active coordinates only
-                gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
-                active_idx = tf.where(tf.equal(gamma_t, 1))[:, 0]  # (K,)
+                gamma_t = tf.cast(self.gamma[t], tf.int32)
+                active_idx = tf.where(tf.equal(gamma_t, 1))[:, 0]
                 K = tf.shape(active_idx)[0]
 
                 if int(K.numpy()) > 0:
                     njt_t_current = tf.cast(self.njt[t], self.dtype)
-                    njt_active0 = tf.gather(njt_t_current, active_idx)  # (K,)
+                    njt_active0 = tf.gather(njt_t_current, active_idx)
 
                     def logp_njt_active(njt_active_val):
                         njt_full = tf.zeros([self.J], dtype=self.dtype)
@@ -331,68 +378,40 @@ class LuShrinkageEstimator:
                         )
                     )
 
-                # 3d) phi_t via Gibbs (conjugate)
                 self._gibbs_phi_market(t)
-
-                # 3e) Optional invariant check (reuse verbose flag)
-                if verbose:
-                    inactive = 1.0 - tf.cast(self.gamma[t], self.dtype)
-                    viol = tf.reduce_max(tf.abs(self.njt[t]) * inactive)
-                    if bool((viol > tf.cast(1e-10, self.dtype)).numpy()):
-                        raise ValueError(
-                            f"Option A invariant violated at market t={t}: "
-                            f"max |njt_j| for gamma_j=0 is {float(viol.numpy())}"
-                        )
 
             # 4) Save draw
             if it >= cfg.burn_in and ((it - cfg.burn_in) % cfg.thin == 0):
                 saved += 1
                 sum_beta += tf.stack([self.beta_p, self.beta_w], axis=0)
                 sum_sigma += tf.exp(self.r)
-
                 sum_E_bar += tf.identity(self.E_bar)
                 sum_njt += tf.identity(self.njt)
-
                 sum_phi += tf.identity(self.phi)
                 sum_gamma += tf.cast(self.gamma, self.dtype)
 
-            if verbose and (it % 100 == 0):
-                # Lightweight diagnostics only
-                sigma_now = float(tf.exp(self.r).numpy())
-                inc_rate = float(
-                    tf.reduce_mean(tf.cast(self.gamma, self.dtype)).numpy()
-                )
-                print(
-                    f"[LuShrinkage] it={it} sigma={sigma_now:.3f} mean(gamma)={inc_rate:.3f}"
-                )
+            # ---- Progress report (NEW)
+            prev_state = self._report_iteration_progress(it, prev_state)
 
         if saved == 0:
             raise RuntimeError("No posterior draws were saved (check burn_in/thin).")
 
-        # -----------------------------
-        # Posterior means + result bundle
-        # -----------------------------
         saved_f = tf.cast(saved, self.dtype)
 
         beta_mean = (sum_beta / saved_f).numpy()
         sigma_mean = float((sum_sigma / saved_f).numpy())
-
         E_bar_mean = (sum_E_bar / saved_f).numpy()
         njt_mean = (sum_njt / saved_f).numpy()
         E_mean = E_bar_mean[:, None] + njt_mean
-
         phi_mean = (sum_phi / saved_f).numpy()
         gamma_mean = (sum_gamma / saved_f).numpy()
 
         self._results = {
             "success": True,
-            # paper-aligned names
             "beta_p_hat": float(beta_mean[0]),
             "beta_w_hat": float(beta_mean[1]),
             "sigma_hat": sigma_mean,
-            # primary target for assessment
             "E_hat": E_mean,
-            # optional diagnostics
             "E_bar_hat": E_bar_mean,
             "njt_hat": njt_mean,
             "phi_hat": phi_mean,
@@ -407,61 +426,37 @@ class LuShrinkageEstimator:
         self.success = True
 
     def get_results(self) -> dict:
-        """
-        Return estimator outputs in a single bundle.
-
-        Keys (minimum consistent with assess_estimator_results usage elsewhere):
-          - "success":   bool
-          - "sigma_hat": scalar float
-          - "E_hat":     (T, J) array
-          - "beta_p_hat", "beta_w_hat": scalars
-
-        Also returns posterior means of latent components and sparsity stats.
-        """
         if self._results is None:
             return {"success": False}
         return dict(self._results)
 
     # ------------------------------------------------------------------
-    # Gibbs updates (market t)
+    # Gibbs / MH helpers
     # ------------------------------------------------------------------
 
     def _mh_toggle_gamma_market(self, t: int) -> None:
-        """
-        Option A (point-mass spike): MH toggles for (gamma_{jt}, njt_{jt}).
-
-        For each j:
-          - birth:  gamma 0->1 and draw njt_j ~ N(0, sigma_n_sq)
-          - death:  gamma 1->0 and set njt_j = 0
-
-        Accept/reject using market_logpost difference + proposal correction.
-        """
-        gamma_t = tf.cast(self.gamma[t], tf.int32)  # (J,)
-        njt_t = tf.cast(self.njt[t], self.dtype)  # (J,)
-        phi_t = tf.cast(self.phi[t], self.dtype)  # scalar
+        gamma_t = tf.cast(self.gamma[t], tf.int32)
+        njt_t = tf.cast(self.njt[t], self.dtype)
+        phi_t = tf.cast(self.phi[t], self.dtype)
 
         for j in range(self.J):
             g_old = int(gamma_t[j].numpy())
-
             gamma_old = gamma_t
-            njt_old = njt_t * tf.cast(gamma_old, self.dtype)  # enforce invariant
+            njt_old = njt_t * tf.cast(gamma_old, self.dtype)
 
             if g_old == 0:
-                # birth: propose gamma=1 and njt_j ~ slab prior
                 var = tf.cast(self.posterior.sigma_n_sq, self.dtype)
                 sd = tf.sqrt(var)
                 njt_j_prop = sd * self.rng.normal([], dtype=self.dtype)
-
                 gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [1])
                 njt_new = tf.tensor_scatter_nd_update(njt_old, [[j]], [njt_j_prop])
             else:
-                # death: propose gamma=0 and njt_j = 0
                 gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [0])
                 njt_new = tf.tensor_scatter_nd_update(
                     njt_old, [[j]], [tf.cast(0.0, self.dtype)]
                 )
 
-            njt_new = njt_new * tf.cast(gamma_new, self.dtype)  # enforce invariant
+            njt_new = njt_new * tf.cast(gamma_new, self.dtype)
 
             lp_old = self.posterior.market_logpost(
                 qjt_t=self.qjt[t],
@@ -490,17 +485,14 @@ class LuShrinkageEstimator:
                 phi_t=phi_t,
             )
 
-            # Proposal correction for reversible birth/death:
             var = tf.cast(self.posterior.sigma_n_sq, self.dtype)
             if g_old == 0:
-                # forward draws njt_j_prop; reverse is deterministic
                 log_q_forward = (
                     -0.5 * tf.math.log(self.posterior.two_pi * var)
                     - 0.5 * tf.square(njt_j_prop) / var
                 )
                 log_q_reverse = tf.cast(0.0, self.dtype)
             else:
-                # forward deterministic; reverse would draw njt_j from slab at old value
                 njt_j_old = tf.cast(njt_old[j], self.dtype)
                 log_q_forward = tf.cast(0.0, self.dtype)
                 log_q_reverse = (
@@ -514,14 +506,10 @@ class LuShrinkageEstimator:
                 gamma_t = tf.cast(gamma_new, tf.int32)
                 njt_t = njt_new
 
-        # persist (already masked)
         self.gamma.assign(tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_t]))
         self.njt.assign(tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_t]))
 
     def _gibbs_phi_market(self, t: int) -> None:
-        """
-        Gibbs update: phi_t | gamma_t ~ Beta(a + sum gamma, b + J - sum gamma).
-        """
         gamma_t = tf.cast(self.gamma[t], self.dtype)
         a_post = tf.cast(self.posterior.a_phi, self.dtype) + tf.reduce_sum(gamma_t)
         b_post = (
@@ -537,15 +525,10 @@ class LuShrinkageEstimator:
 
 
 def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor, dtype):
-    """
-    Sample Beta(a,b) using Gamma draws:
-        X ~ Gamma(a, 1), Y ~ Gamma(b, 1), return X / (X + Y).
-    Uses stateless Gamma draws seeded from the provided tf.random.Generator.
-    """
     a = tf.convert_to_tensor(a, dtype=dtype)
     b = tf.convert_to_tensor(b, dtype=dtype)
 
-    seeds = rng.make_seeds(2)  # (2,2) int32
+    seeds = rng.make_seeds(2)
     seed_x = seeds[0]
     seed_y = seeds[1]
 

@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from datasets.dgp import (
-    BasicLuChoiceModel,
-    generate_market,
-    generate_market_conditions,
-)
+from datasets.dgp import BasicLuChoiceModel, generate_market, generate_market_conditions
 from market_shock_estimators.assess_estimator import (
     assess_estimator_results,
     print_assessment,
 )
-
 from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
-
 from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
 
 
@@ -26,17 +20,19 @@ def main() -> None:
     seed = 123
 
     # Monte Carlo integration draws (estimators own RNG; orchestration passes only counts)
-    n_draws = 200
+    n_draws = 20
 
     # BLP fit config
     blp_sigma_init = 1.0
     blp_sigma_min = 1e-3
     blp_sigma_max = 5.0
-    blp_grid_step = 25
+    blp_grid_step = (
+        25  # We start the blp estimator optimisation with a coarse grid search
+    )
 
     # Shrinkage run config
-    mcmc_max_iter = 1500
-    mcmc_burn_in = 500
+    mcmc_max_iter = 50
+    mcmc_burn_in = 10
     mcmc_thin = 5
 
     for dgp_type in (1, 2, 3, 4):
@@ -126,32 +122,28 @@ def main() -> None:
         print(f"=== Shrinkage Estimator built ===")
 
         shrink.fit(
-            n_iter=1500,
-            burn_in=500,
-            thin=5,
+            n_iter=mcmc_max_iter,
+            burn_in=mcmc_burn_in,
+            thin=mcmc_thin,
         )
         res_shrink = shrink.get_results()
         print(f"=== Shrinkage Estimator fitted ===")
 
         # -----------------------------
-        # Assessment / printing
-        # Assumes assessment does not require a caller-provided name (it can be carried by results).
+        # Assessment
         # -----------------------------
-        print_assessment(
-            assess_estimator_results(
-                results=res_strong, E_true=Ejt, sigma_true=sigma_true
-            )
+        strong_BLPEst_assessment = assess_estimator_results(
+            results=res_strong, E_true=Ejt, sigma_true=sigma_true
         )
-        print_assessment(
-            assess_estimator_results(
-                results=res_weak, E_true=Ejt, sigma_true=sigma_true
-            )
+        print_assessment(strong_BLPEst_assessment)
+        weak_BLPEst_assessment = assess_estimator_results(
+            results=res_weak, E_true=Ejt, sigma_true=sigma_true
         )
-        print_assessment(
-            assess_estimator_results(
-                results=res_shrink, E_true=Ejt, sigma_true=sigma_true
-            )
+        print_assessment(weak_BLPEst_assessment)
+        shrink_est_assessment = assess_estimator_results(
+            results=res_shrink, E_true=Ejt, sigma_true=sigma_true
         )
+        print_assessment(shrink_est_assessment)
 
 
 if __name__ == "__main__":
