@@ -18,10 +18,7 @@ import numpy as np
 import tensorflow as tf
 
 from market_shock_estimators.lu_posterior import LuPosteriorTF
-from market_shock_estimators.lu_shrinkage_diagnostics import (
-    init_progress_state,
-    report_iteration_progress,
-)
+from market_shock_estimators.lu_shrinkage_diagnostics import LuShrinkageDiagnostics
 from market_shock_estimators.lu_shrinkage_kernels import (
     gibbs_phi_market,
     sample_gamma_given_n_phi_market,
@@ -134,20 +131,19 @@ class LuShrinkageEstimator:
         if n_iter <= 0:
             raise ValueError("n_iter must be positive.")
 
-        (
-            saved,
-            sum_beta,
-            sum_sigma,
-            sum_E_bar,
-            sum_njt,
-            sum_phi,
-            sum_gamma,
-        ) = self._run_mcmc_loop(
+        diag = LuShrinkageDiagnostics(T=self.T, J=self.J)
+
+        self._run_mcmc_loop(
             n_iter=n_iter,
             r_step=r_step,
             E_bar_step=E_bar_step,
             ridge=ridge,
             max_lbfgs_iters=max_lbfgs_iters,
+            diag=diag,
+        )
+
+        saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
+            diag.get_sums()
         )
 
         self._finalize_results(
@@ -177,33 +173,12 @@ class LuShrinkageEstimator:
         E_bar_step: float,
         ridge: float,
         max_lbfgs_iters: int,
-    ) -> tuple[
-        int,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-    ]:
+        diag: LuShrinkageDiagnostics,
+    ) -> None:
         """
         Owns the full MCMC loop, mutating sampler state (tf.Variables) and
         accumulating posterior draw sums.
-
-        Returns:
-          saved: number of retained draws
-          sum_beta: (2,)
-          sum_sigma: scalar
-          sum_E_bar: (T,)
-          sum_njt: (T,J)
-          sum_phi: (T,)
-          sum_gamma: (T,J)
         """
-        saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
-            self._init_running_sums()
-        )
-
-        prev_state = init_progress_state(self)
 
         for it in range(n_iter):
             self._update_beta_block(ridge=ridge, max_lbfgs_iters=max_lbfgs_iters)
@@ -217,58 +192,7 @@ class LuShrinkageEstimator:
                     max_lbfgs_iters=max_lbfgs_iters,
                 )
 
-            saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
-                self._maybe_save_draw(
-                    it=it,
-                    saved=saved,
-                    sum_beta=sum_beta,
-                    sum_sigma=sum_sigma,
-                    sum_E_bar=sum_E_bar,
-                    sum_njt=sum_njt,
-                    sum_phi=sum_phi,
-                    sum_gamma=sum_gamma,
-                )
-            )
-
-            prev_state = report_iteration_progress(self, it, prev_state)
-
-        if saved == 0:
-            raise RuntimeError("No posterior draws were saved.")
-
-        return saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma
-
-    def _init_running_sums(
-        self,
-    ) -> tuple[int, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        saved = 0
-        sum_beta = tf.zeros([2], dtype=tf.float64)
-        sum_sigma = tf.constant(0.0, dtype=tf.float64)
-        sum_E_bar = tf.zeros([self.T], dtype=tf.float64)
-        sum_njt = tf.zeros([self.T, self.J], dtype=tf.float64)
-        sum_phi = tf.zeros([self.T], dtype=tf.float64)
-        sum_gamma = tf.zeros([self.T, self.J], dtype=tf.float64)
-        return saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma
-
-    def _maybe_save_draw(
-        self,
-        it: int,
-        saved: int,
-        sum_beta: tf.Tensor,
-        sum_sigma: tf.Tensor,
-        sum_E_bar: tf.Tensor,
-        sum_njt: tf.Tensor,
-        sum_phi: tf.Tensor,
-        sum_gamma: tf.Tensor,
-    ) -> tuple[int, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-
-        saved += 1
-        sum_beta += tf.stack([self.beta_p, self.beta_w], axis=0)
-        sum_sigma += tf.exp(self.r)
-        sum_E_bar += tf.identity(self.E_bar)
-        sum_njt += tf.identity(self.njt)
-        sum_phi += tf.identity(self.phi)
-        sum_gamma += tf.cast(self.gamma, tf.float64)
-        return saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma
+            diag.step(self, it)
 
     def _finalize_results(
         self,
@@ -397,7 +321,7 @@ class LuShrinkageEstimator:
         self.E_bar.assign(tf.tensor_scatter_nd_update(self.E_bar, [[t]], [E_bar_new]))
 
     def _update_njt_tmh_full(self, t: int, ridge: float, max_lbfgs_iters: int) -> None:
-        njt0 = tf.identity(self.njt[t])
+        njt0 = self.njt[t]
 
         def logp_njt_full(njt_t_val: tf.Tensor) -> tf.Tensor:
             return self.posterior.market_logpost(
@@ -443,8 +367,5 @@ class LuShrinkageEstimator:
             J=self.J,
             rng=self.rng,
         )
-        self.phi.assign(
-            tf.tensor_scatter_nd_update(
-                self.phi, [[t]], [tf.cast(phi_t_new, tf.float64)]
-            )
-        )
+
+        self.phi.assign(tf.tensor_scatter_nd_update(self.phi, [[t]], [phi_t_new]))
