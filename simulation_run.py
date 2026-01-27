@@ -35,8 +35,6 @@ def main() -> None:
     # -----------------------------
 
     shrink_n_iter = 15
-    shrink_burn_in = 5
-    shrink_thin = 5
     # RW–MH step sizes
     shrink_r_step = 0.05
     shrink_E_bar_step = 0.05
@@ -131,8 +129,6 @@ def main() -> None:
         print(f"=== Shrinkage Estimator built ===")
         shrink.fit(
             n_iter=shrink_n_iter,
-            burn_in=shrink_burn_in,
-            thin=shrink_thin,
             r_step=shrink_r_step,
             E_bar_step=shrink_E_bar_step,
             ridge=shrink_ridge,

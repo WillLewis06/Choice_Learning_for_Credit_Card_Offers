@@ -15,10 +15,9 @@ class LuPosteriorTF:
       gamma_jt | phi_t ~ Bernoulli(phi_t)
       phi_t ~ Beta(a_phi, b_phi)
 
-      Option A (point-mass spike-and-slab):
-        n_jt | gamma_jt=1 ~ N(0, sigma_n_sq)
-        n_jt | gamma_jt=0 = 0
-
+      Spike-and-slab (mixture of two normals, NOT point-mass):
+        n_jt | gamma_jt=1 ~ N(0, T1_sq)
+        n_jt | gamma_jt=0 ~ N(0, T0_sq)   with T0_sq << T1_sq
 
     Likelihood uses multinomial counts qjt, q0t:
       log p(q_t | s_t) = q0t*log s0t + sum_j qjt*log sjt + const
@@ -43,8 +42,9 @@ class LuPosteriorTF:
         # Prior on E_bar_t (normal): center at Lu Section 4 DGP mean (-1)
         E_bar_mean: float = -1.0,
         E_bar_var: float = 10.0,
-        # Slab variance for n | gamma=1 (Option A: gamma=0 implies n=0 exactly)
-        sigma_n_sq: float = 1.0,
+        # Spike-and-slab variances for n_jt | gamma_jt
+        T0_sq: float = 1e-3,
+        T1_sq: float = 1.0,
         # Beta prior for phi_t
         a_phi: float = 1.0,
         b_phi: float = 1.0,
@@ -74,8 +74,11 @@ class LuPosteriorTF:
         self.E_bar_mean = tf.constant(E_bar_mean, dtype=dtype)
         self.E_bar_var = tf.constant(E_bar_var, dtype=dtype)
 
-        self.sigma_n_sq = tf.constant(sigma_n_sq, dtype=dtype)
-        self.log_sigma_n_sq = tf.math.log(self.sigma_n_sq)
+        self.T0_sq = tf.constant(T0_sq, dtype=dtype)
+        self.T1_sq = tf.constant(T1_sq, dtype=dtype)
+
+        self.log_T0_sq = tf.math.log(self.T0_sq)
+        self.log_T1_sq = tf.math.log(self.T1_sq)
 
         self.a_phi = tf.constant(a_phi, dtype=dtype)
         self.b_phi = tf.constant(b_phi, dtype=dtype)
@@ -273,32 +276,22 @@ class LuPosteriorTF:
 
     def logprior_n(self, *, njt, gamma):
         """
-        Option A (point-mass spike-and-slab):
+        Mixture-of-normals spike-and-slab prior (Lu paper):
 
-          njt_j | gamma_j=1 ~ N(0, sigma_n_sq)
-          njt_j | gamma_j=0 = 0
+          njt_j | gamma_j=1 ~ N(0, T1_sq)
+          njt_j | gamma_j=0 ~ N(0, T0_sq)
 
-        Returns -inf if any inactive coordinate has njt != 0 (within tolerance).
-        Otherwise returns the slab Normal log density for active coordinates only.
+        Returns sum_j log N(njt_j; 0, T(gamma_j)).
         """
         njt = tf.convert_to_tensor(njt, dtype=self.dtype)
         gamma = tf.cast(gamma, self.dtype)
 
-        tol = tf.cast(1e-12, self.dtype)
-        inactive = 1.0 - gamma
-        violates = tf.reduce_any(tf.abs(njt) * inactive > tol)
+        # var_j = gamma*T1_sq + (1-gamma)*T0_sq
+        var = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq
+        log_var = gamma * self.log_T1_sq + (1.0 - gamma) * self.log_T0_sq
 
-        def lp_valid():
-            var = self.sigma_n_sq
-            n_active = tf.reduce_sum(gamma)
-            return -0.5 * n_active * tf.math.log(
-                self.two_pi * var
-            ) - 0.5 * tf.reduce_sum(gamma * tf.square(njt) / var)
-
-        return tf.cond(
-            violates,
-            lambda: tf.cast(-float("inf"), self.dtype),
-            lp_valid,
+        return -0.5 * tf.reduce_sum(
+            tf.math.log(self.two_pi) + log_var + tf.square(njt) / var
         )
 
     def logprior_gamma(self, *, gamma, phi):
@@ -373,9 +366,9 @@ class LuPosteriorTF:
         """
         Market-local log posterior contribution:
           log p(q_t | ...) + market_logprior(...)
-        """
-        njt_eff = tf.cast(gamma_t, self.dtype) * tf.cast(njt_t, self.dtype)
 
+        Under Lu's model, the likelihood uses the full njt_t (no masking by gamma).
+        """
         return self.market_loglik(
             qjt_t=qjt_t,
             q0t_t=q0t_t,
@@ -385,7 +378,7 @@ class LuPosteriorTF:
             beta_w=beta_w,
             r=r,
             E_bar_t=E_bar_t,
-            njt_t=njt_eff,
+            njt_t=njt_t,
         ) + self.market_logprior(
             E_bar_t=E_bar_t, njt_t=njt_t, gamma_t=gamma_t, phi_t=phi_t
         )

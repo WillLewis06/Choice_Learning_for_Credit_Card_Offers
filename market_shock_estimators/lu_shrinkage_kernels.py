@@ -1,122 +1,105 @@
 from __future__ import annotations
+
 import tensorflow as tf
 
 """
 MCMC kernels for the Lu–Shimizu (2025) shrinkage estimator.
 
-This module contains *market-level* update kernels that are used by the
-Lu shrinkage estimator but are factored out for clarity and testability.
+This module contains *market-level* update kernels aligned with the
+two-normal spike-and-slab prior in the Lu paper.
 
 Included kernels
 ----------------
-1. mh_toggle_gamma_market
-   Metropolis–Hastings kernel that jointly updates:
-     - gamma_{jt} ∈ {0,1}
-     - n_{jt} (latent market–product shocks)
-   using the Lu spike-and-slab prior and the market-level log posterior.
+1. sample_gamma_given_n_phi_market
+   Gibbs update for gamma_t given n_t and phi_t:
+     gamma_jt | n_jt, phi_t ~ Bernoulli(p_jt)
+   where p_jt follows from the two-normal mixture:
+     n_jt | gamma_jt=1 ~ N(0, T1_sq)
+     n_jt | gamma_jt=0 ~ N(0, T0_sq)
 
 2. gibbs_phi_market
    Gibbs update for the market-level inclusion probability phi_t:
-     phi_t | gamma_t ~ Beta(a_phi + sum_j gamma_{jt},
-                            b_phi + J − sum_j gamma_{jt})
+     phi_t | gamma_t ~ Beta(a_phi + sum_j gamma_jt,
+                            b_phi + J − sum_j gamma_jt)
 
-3. sample_beta_tf
+3. _sample_beta_tf
    Stateless Beta sampler implemented via two Gamma draws, compatible
-   with tf.random.Generator and reproducible seeding.
+   with tf.random.Generator.
 
 Design notes
 ------------
-- These kernels operate on a *single market t* at a time.
-- They mutate estimator state (tf.Variables) and therefore expect to be
-  called from an owning estimator object that provides:
-    - posterior object (with market_logpost and hyperparameters)
-    - tf.random.Generator (rng)
-    - model dimensions and data tensors
-- No orchestration, iteration control, or diagnostics are included here.
-- The code follows the blocking scheme described in Lu & Shimizu (2025),
-  Section 3–4, and is intended to be unit-testable at the kernel level.
-
-This file contains no simulation logic and no estimator API.
+- Kernels operate on a *single market t* at a time.
+- No masking of n_jt by gamma_jt is performed.
+- No Metropolis–Hastings birth/death logic is used.
+- These kernels are mathematically aligned with Lu & Shimizu (2025).
 """
 
 
-def mh_toggle_gamma_market(
-    shrink: LuShrinkageEstimator,
-    t: int,
-) -> tuple[tf.Tensor, tf.Tensor]:
+def sample_gamma_given_n_phi_market(
+    *,
+    njt_t: tf.Tensor,
+    phi_t: tf.Tensor,
+    T0_sq: tf.Tensor,
+    T1_sq: tf.Tensor,
+    log_T0_sq: tf.Tensor,
+    log_T1_sq: tf.Tensor,
+    rng: tf.random.Generator,
+) -> tf.Tensor:
+    """
+    Gibbs update for gamma_t given n_t and phi_t under the Lu spike-and-slab:
 
-    gamma_t = tf.cast(shrink.gamma[t], tf.int32)
-    njt_t = tf.cast(shrink.njt[t], tf.float64)
-    phi_t = tf.cast(shrink.phi[t], tf.float64)
+      p(gamma_j=1 | n_j, phi)
+        ∝ phi * N(n_j; 0, T1_sq)
+      p(gamma_j=0 | n_j, phi)
+        ∝ (1-phi) * N(n_j; 0, T0_sq)
 
-    for j in range(shrink.J):
-        g_old = int(gamma_t[j].numpy())
-        gamma_old = gamma_t
-        njt_old = njt_t * tf.cast(gamma_old, tf.float64)
+    Parameters
+    ----------
+    njt_t : (J,) tf.Tensor
+        Latent market–product shocks for market t.
+    phi_t : scalar tf.Tensor
+        Inclusion probability for market t.
+    T0_sq, T1_sq : scalar tf.Tensor
+        Spike and slab variances.
+    log_T0_sq, log_T1_sq : scalar tf.Tensor
+        Precomputed logs of the variances.
+    rng : tf.random.Generator
 
-        if g_old == 0:
-            var = tf.cast(shrink.posterior.sigma_n_sq, tf.float64)
-            sd = tf.sqrt(var)
-            njt_j_prop = sd * shrink.rng.normal([], dtype=tf.float64)
-            gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [1])
-            njt_new = tf.tensor_scatter_nd_update(njt_old, [[j]], [njt_j_prop])
-        else:
-            gamma_new = tf.tensor_scatter_nd_update(gamma_old, [[j]], [0])
-            njt_new = tf.tensor_scatter_nd_update(
-                njt_old, [[j]], [tf.cast(0.0, tf.float64)]
-            )
+    Returns
+    -------
+    gamma_t : (J,) tf.Tensor, dtype int32
+    """
+    njt_t = tf.cast(njt_t, tf.float64)
+    phi_t = tf.cast(phi_t, tf.float64)
 
-        njt_new = njt_new * tf.cast(gamma_new, tf.float64)
+    # Numerical safety
+    eps = tf.constant(1e-15, dtype=tf.float64)
+    phi_t = tf.clip_by_value(phi_t, eps, 1.0 - eps)
 
-        lp_old = shrink.posterior.market_logpost(
-            qjt_t=shrink.qjt[t],
-            q0t_t=shrink.q0t[t],
-            pjt_t=shrink.pjt[t],
-            wjt_t=shrink.wjt[t],
-            beta_p=shrink.beta_p,
-            beta_w=shrink.beta_w,
-            r=shrink.r,
-            E_bar_t=shrink.E_bar[t],
-            njt_t=njt_old,
-            gamma_t=gamma_old,
-            phi_t=phi_t,
-        )
-        lp_new = shrink.posterior.market_logpost(
-            qjt_t=shrink.qjt[t],
-            q0t_t=shrink.q0t[t],
-            pjt_t=shrink.pjt[t],
-            wjt_t=shrink.wjt[t],
-            beta_p=shrink.beta_p,
-            beta_w=shrink.beta_w,
-            r=shrink.r,
-            E_bar_t=shrink.E_bar[t],
-            njt_t=njt_new,
-            gamma_t=gamma_new,
-            phi_t=phi_t,
-        )
+    two_pi = tf.constant(2.0 * 3.141592653589793, dtype=tf.float64)
 
-        var = tf.cast(shrink.posterior.sigma_n_sq, tf.float64)
-        if g_old == 0:
-            log_q_forward = (
-                -0.5 * tf.math.log(shrink.posterior.two_pi * var)
-                - 0.5 * tf.square(njt_j_prop) / var
-            )
-            log_q_reverse = tf.cast(0.0, tf.float64)
-        else:
-            njt_j_old = tf.cast(njt_old[j], tf.float64)
-            log_q_forward = tf.cast(0.0, tf.float64)
-            log_q_reverse = (
-                -0.5 * tf.math.log(shrink.posterior.two_pi * var)
-                - 0.5 * tf.square(njt_j_old) / var
-            )
+    # log N(n_j; 0, T1_sq)
+    logp1 = (
+        tf.math.log(phi_t)
+        - 0.5 * (tf.math.log(two_pi) + log_T1_sq)
+        - 0.5 * tf.square(njt_t) / T1_sq
+    )
 
-        log_alpha = (lp_new - lp_old) + (log_q_reverse - log_q_forward)
-        u = shrink.rng.uniform([], dtype=tf.float64)
-        if bool((tf.math.log(u) < log_alpha).numpy()):
-            gamma_t = tf.cast(gamma_new, tf.int32)
-            njt_t = njt_new
+    # log N(n_j; 0, T0_sq)
+    logp0 = (
+        tf.math.log(1.0 - phi_t)
+        - 0.5 * (tf.math.log(two_pi) + log_T0_sq)
+        - 0.5 * tf.square(njt_t) / T0_sq
+    )
 
-    return gamma_t, njt_t
+    # p = sigmoid(logp1 - logp0)
+    logit_p = logp1 - logp0
+    p = tf.math.sigmoid(logit_p)
+
+    u = rng.uniform(shape=tf.shape(p), dtype=tf.float64)
+    gamma_t = tf.cast(u < p, tf.int32)
+
+    return gamma_t
 
 
 def gibbs_phi_market(
@@ -142,7 +125,14 @@ def gibbs_phi_market(
     return phi_t_new
 
 
-def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor):
+def _sample_beta_tf(
+    rng: tf.random.Generator,
+    a: tf.Tensor,
+    b: tf.Tensor,
+) -> tf.Tensor:
+    """
+    Stateless Beta(a,b) sampler using two Gamma draws.
+    """
     a = tf.convert_to_tensor(a, dtype=tf.float64)
     b = tf.convert_to_tensor(b, dtype=tf.float64)
 
@@ -164,4 +154,5 @@ def _sample_beta_tf(rng: tf.random.Generator, a: tf.Tensor, b: tf.Tensor):
         beta=tf.cast(1.0, tf.float64),
         dtype=tf.float64,
     )
+
     return x / (x + y)
