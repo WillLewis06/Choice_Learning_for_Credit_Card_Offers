@@ -33,11 +33,17 @@ def main() -> None:
     # -----------------------------
     # Lu shrinkage (MCMC) hyperparameters
     # -----------------------------
-
     shrink_n_iter = 15
-    # RW–MH step sizes
-    shrink_r_step = 0.05
-    shrink_E_bar_step = 0.05
+
+    # Initial k values (these are INITIAL GUESSES; fit() will tune once using   pilot_length)
+    shrink_k_beta = 0.10
+    shrink_k_njt = 0.10
+    shrink_k_r = 0.05
+    shrink_k_E_bar = 0.05
+
+    # One-shot pilot length used to tune each k once (Option A)
+    shrink_pilot_length = 200
+
     # TMH numerical parameters
     shrink_ridge = 1e-6
     shrink_max_lbfgs_iters = 100
@@ -129,8 +135,11 @@ def main() -> None:
         print(f"=== Shrinkage Estimator built ===")
         shrink.fit(
             n_iter=shrink_n_iter,
-            r_step=shrink_r_step,
-            E_bar_step=shrink_E_bar_step,
+            k_beta=shrink_k_beta,
+            k_njt=shrink_k_njt,
+            k_r=shrink_k_r,
+            k_E_bar=shrink_k_E_bar,
+            pilot_length=shrink_pilot_length,
             ridge=shrink_ridge,
             max_lbfgs_iters=shrink_max_lbfgs_iters,
         )

@@ -20,11 +20,12 @@ import tensorflow as tf
 from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_shrinkage_diagnostics import LuShrinkageDiagnostics
 from market_shock_estimators.lu_shrinkage_kernels import (
+    tmh_step,
+    rw_mh_step,
+    tune_k,
     gibbs_phi_market,
     sample_gamma_given_n_phi_market,
 )
-from market_shock_estimators.rw_mh import rw_mh_step
-from market_shock_estimators.tmh import tmh_step
 
 
 class LuShrinkageEstimator:
@@ -120,8 +121,11 @@ class LuShrinkageEstimator:
     def fit(
         self,
         n_iter: int,
-        r_step: float,
-        E_bar_step: float,
+        k_beta: float,
+        k_njt: float,
+        k_r: float,
+        k_E_bar: float,
+        pilot_length: int,
         ridge: float,
         max_lbfgs_iters: int,
     ) -> None:
@@ -131,12 +135,164 @@ class LuShrinkageEstimator:
         if n_iter <= 0:
             raise ValueError("n_iter must be positive.")
 
+        if pilot_length <= 0:
+            raise ValueError("pilot_length must be positive.")
+
+        ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
+
+        # ------------------------------------------------------------
+        # Pilot tuning (Option A): tune each k ONCE, then freeze
+        # ------------------------------------------------------------
+
+        # 1) Tune k_r (RW-MH on scalar r)
+        def step_r(theta, k):
+            def logp_r(r_val: tf.Tensor) -> tf.Tensor:
+                ll = tf.constant(0.0, dtype=tf.float64)
+                for t in range(self.T):
+                    ll += self.posterior.market_loglik(
+                        qjt_t=self.qjt[t],
+                        q0t_t=self.q0t[t],
+                        pjt_t=self.pjt[t],
+                        wjt_t=self.wjt[t],
+                        beta_p=self.beta_p,
+                        beta_w=self.beta_w,
+                        r=r_val,
+                        E_bar_t=self.E_bar[t],
+                        njt_t=self.njt[t],
+                    )
+                return ll + self.posterior.logprior_r(r=r_val)
+
+            theta_new, accepted, _ = rw_mh_step(
+                theta0=theta,
+                logp_fn=logp_r,
+                k=k,
+                rng=self.rng,
+            )
+            return theta_new, accepted
+
+        k_r_tuned, _, _ = tune_k(
+            theta0=self.r.read_value(),
+            step_fn=step_r,
+            k0=k_r,
+            pilot_length=pilot_length,
+        )
+
+        # 2) Tune k_E_bar (RW-MH on scalar E_bar_0 using market t=0)
+        def step_E_bar(theta, k):
+            t = 0
+
+            def logp_E_bar_t(E_bar_t_val: tf.Tensor) -> tf.Tensor:
+                return self.posterior.market_logpost(
+                    qjt_t=self.qjt[t],
+                    q0t_t=self.q0t[t],
+                    pjt_t=self.pjt[t],
+                    wjt_t=self.wjt[t],
+                    beta_p=self.beta_p,
+                    beta_w=self.beta_w,
+                    r=self.r,
+                    E_bar_t=E_bar_t_val,
+                    njt_t=self.njt[t],
+                    gamma_t=self.gamma[t],
+                    phi_t=self.phi[t],
+                )
+
+            theta_new, accepted, _ = rw_mh_step(
+                theta0=theta,
+                logp_fn=logp_E_bar_t,
+                k=k,
+                rng=self.rng,
+            )
+            return theta_new, accepted
+
+        k_E_bar_tuned, _, _ = tune_k(
+            theta0=self.E_bar[0],
+            step_fn=step_E_bar,
+            k0=k_E_bar,
+            pilot_length=pilot_length,
+        )
+
+        # 3) Tune k_beta (TMH on beta vector)
+        def step_beta(theta, k):
+            def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
+                beta_p = theta_vec[0]
+                beta_w = theta_vec[1]
+                ll = tf.constant(0.0, dtype=tf.float64)
+                for t in range(self.T):
+                    ll += self.posterior.market_loglik(
+                        qjt_t=self.qjt[t],
+                        q0t_t=self.q0t[t],
+                        pjt_t=self.pjt[t],
+                        wjt_t=self.wjt[t],
+                        beta_p=beta_p,
+                        beta_w=beta_w,
+                        r=self.r,
+                        E_bar_t=self.E_bar[t],
+                        njt_t=self.njt[t],
+                    )
+                return ll + self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
+
+            theta_new, accepted = tmh_step(
+                theta0=theta,
+                logp_fn=logp_beta,
+                ridge=ridge_t,
+                max_lbfgs_iters=max_lbfgs_iters,
+                rng=self.rng,
+                k=k,
+            )
+            return theta_new, accepted
+
+        beta0 = tf.stack([self.beta_p, self.beta_w], axis=0)
+        k_beta_tuned, _, _ = tune_k(
+            theta0=beta0,
+            step_fn=step_beta,
+            k0=k_beta,
+            pilot_length=pilot_length,
+        )
+
+        # 4) Tune k_njt (TMH on njt vector for market t=0)
+        def step_njt(theta, k):
+            t = 0
+
+            def logp_njt_full(njt_t_val: tf.Tensor) -> tf.Tensor:
+                return self.posterior.market_logpost(
+                    qjt_t=self.qjt[t],
+                    q0t_t=self.q0t[t],
+                    pjt_t=self.pjt[t],
+                    wjt_t=self.wjt[t],
+                    beta_p=self.beta_p,
+                    beta_w=self.beta_w,
+                    r=self.r,
+                    E_bar_t=self.E_bar[t],
+                    njt_t=njt_t_val,
+                    gamma_t=self.gamma[t],
+                    phi_t=self.phi[t],
+                )
+
+            theta_new, accepted = tmh_step(
+                theta0=theta,
+                logp_fn=logp_njt_full,
+                ridge=ridge_t,
+                max_lbfgs_iters=max_lbfgs_iters,
+                rng=self.rng,
+                k=k,
+            )
+            return theta_new, accepted
+
+        k_njt_tuned, _, _ = tune_k(
+            theta0=self.njt[0],
+            step_fn=step_njt,
+            k0=k_njt,
+            pilot_length=pilot_length,
+        )
+
         diag = LuShrinkageDiagnostics(T=self.T, J=self.J)
 
         self._run_mcmc_loop(
             n_iter=n_iter,
-            r_step=r_step,
-            E_bar_step=E_bar_step,
+            k_beta=k_beta_tuned,
+            k_njt=k_njt_tuned,
+            k_r=k_r_tuned,
+            k_E_bar=k_E_bar_tuned,
             ridge=ridge,
             max_lbfgs_iters=max_lbfgs_iters,
             diag=diag,
@@ -169,8 +325,10 @@ class LuShrinkageEstimator:
     def _run_mcmc_loop(
         self,
         n_iter: int,
-        r_step: float,
-        E_bar_step: float,
+        k_beta: tf.Tensor,
+        k_njt: tf.Tensor,
+        k_r: tf.Tensor,
+        k_E_bar: tf.Tensor,
         ridge: float,
         max_lbfgs_iters: int,
         diag: LuShrinkageDiagnostics,
@@ -180,14 +338,14 @@ class LuShrinkageEstimator:
         accumulating posterior draw sums.
         """
         # Make scalar hyperparams tensors (stable dtypes; reduces retracing risk when
-        # passed into tf.function-compiled market updates).
-        r_step_t = tf.convert_to_tensor(r_step, dtype=tf.float64)
-        E_bar_step_t = tf.convert_to_tensor(E_bar_step, dtype=tf.float64)
+        # passed into tf.function-compiled market updates)
         ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
 
         for it in range(n_iter):
-            self._update_beta_block(ridge=float(ridge), max_lbfgs_iters=max_lbfgs_iters)
-            self._update_r_block(r_step=r_step_t)
+            self._update_beta_block(
+                k_beta=k_beta, ridge=ridge_t, max_lbfgs_iters=max_lbfgs_iters
+            )
+            self._update_r_block(k_r=k_r)
 
             for t in range(self.T):
                 # Slice market-specific data/state in Python using t (int).
@@ -210,7 +368,8 @@ class LuShrinkageEstimator:
                     njt_t=njt_t,
                     gamma_t=gamma_t,
                     phi_t=phi_t,
-                    E_bar_step=E_bar_step_t,
+                    k_E_bar=k_E_bar,
+                    k_njt=k_njt,
                     ridge=ridge_t,
                     max_lbfgs_iters=max_lbfgs_iters,
                 )
@@ -219,9 +378,15 @@ class LuShrinkageEstimator:
                 self.E_bar.assign(
                     tf.tensor_scatter_nd_update(self.E_bar, [[t]], [E_bar_new])
                 )
-                self.njt.assign(tf.tensor_scatter_nd_update(self.njt, [[t]], [njt_new]))
+                self.njt.assign(
+                    tf.tensor_scatter_nd_update(
+                        self.njt, [[t]], tf.expand_dims(njt_new, axis=0)
+                    )
+                )
                 self.gamma.assign(
-                    tf.tensor_scatter_nd_update(self.gamma, [[t]], [gamma_new])
+                    tf.tensor_scatter_nd_update(
+                        self.gamma, [[t]], tf.expand_dims(gamma_new, axis=0)
+                    )
                 )
                 self.phi.assign(tf.tensor_scatter_nd_update(self.phi, [[t]], [phi_new]))
 
@@ -264,7 +429,9 @@ class LuShrinkageEstimator:
     # Block updates (mutate state)
     # ------------------------------------------------------------------
 
-    def _update_beta_block(self, ridge: float, max_lbfgs_iters: int) -> None:
+    def _update_beta_block(
+        self, k_beta: tf.Tensor, ridge: tf.Tensor, max_lbfgs_iters: int
+    ) -> None:
         beta0 = tf.stack([self.beta_p, self.beta_w], axis=0)
 
         def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
@@ -288,14 +455,15 @@ class LuShrinkageEstimator:
         beta_new, _ = tmh_step(
             theta0=beta0,
             logp_fn=logp_beta,
-            ridge=tf.cast(ridge, tf.float64),
+            ridge=ridge,
             max_lbfgs_iters=max_lbfgs_iters,
             rng=self.rng,
+            k=k_beta,
         )
         self.beta_p.assign(beta_new[0])
         self.beta_w.assign(beta_new[1])
 
-    def _update_r_block(self, r_step: tf.Tensor) -> None:
+    def _update_r_block(self, k_r: tf.Tensor) -> None:
         def logp_r(r_val: tf.Tensor) -> tf.Tensor:
             ll = tf.constant(0.0, dtype=tf.float64)
             for t in range(self.T):
@@ -312,8 +480,11 @@ class LuShrinkageEstimator:
                 )
             return ll + self.posterior.logprior_r(r=r_val)
 
-        r_new, _ = rw_mh_step(
-            theta0=self.r, logp_fn=logp_r, step_size=r_step, rng=self.rng
+        r_new, _, _ = rw_mh_step(
+            theta0=self.r,
+            logp_fn=logp_r,
+            k=k_r,
+            rng=self.rng,
         )
         self.r.assign(r_new)
 
@@ -333,7 +504,8 @@ class LuShrinkageEstimator:
         njt_t: tf.Tensor,
         gamma_t: tf.Tensor,
         phi_t: tf.Tensor,
-        E_bar_step: tf.Tensor,
+        k_E_bar: tf.Tensor,
+        k_njt: tf.Tensor,
         ridge: tf.Tensor,
         max_lbfgs_iters: int,
     ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -346,7 +518,7 @@ class LuShrinkageEstimator:
             njt_t=njt_t,
             gamma_t=gamma_t,
             phi_t=phi_t,
-            E_bar_step=E_bar_step,
+            k_E_bar=k_E_bar,
         )
 
         njt_t_new = self._update_njt_tmh_full(
@@ -358,6 +530,7 @@ class LuShrinkageEstimator:
             njt_t=njt_t,
             gamma_t=gamma_t,
             phi_t=phi_t,
+            k_njt=k_njt,
             ridge=ridge,
             max_lbfgs_iters=max_lbfgs_iters,
         )
@@ -384,7 +557,7 @@ class LuShrinkageEstimator:
         njt_t: tf.Tensor,
         gamma_t: tf.Tensor,
         phi_t: tf.Tensor,
-        E_bar_step: tf.Tensor,
+        k_E_bar: tf.Tensor,
     ) -> tf.Tensor:
         def logp_E_bar_t(E_bar_t_val: tf.Tensor) -> tf.Tensor:
             return self.posterior.market_logpost(
@@ -401,12 +574,13 @@ class LuShrinkageEstimator:
                 phi_t=phi_t,
             )
 
-        E_bar_new, _ = rw_mh_step(
+        E_bar_new, _, _ = rw_mh_step(
             theta0=E_bar_t,
             logp_fn=logp_E_bar_t,
-            step_size=E_bar_step,
+            k=k_E_bar,
             rng=self.rng,
         )
+
         return E_bar_new
 
     def _update_njt_tmh_full(
@@ -420,6 +594,7 @@ class LuShrinkageEstimator:
         njt_t: tf.Tensor,
         gamma_t: tf.Tensor,
         phi_t: tf.Tensor,
+        k_njt: tf.Tensor,
         ridge: tf.Tensor,
         max_lbfgs_iters: int,
     ) -> tf.Tensor:
@@ -444,6 +619,7 @@ class LuShrinkageEstimator:
             ridge=tf.cast(ridge, tf.float64),
             max_lbfgs_iters=max_lbfgs_iters,
             rng=self.rng,
+            k=k_njt,
         )
         return njt_new
 

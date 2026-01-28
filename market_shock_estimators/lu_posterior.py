@@ -40,7 +40,7 @@ class LuPosteriorTF:
         r_mean: float = 0.0,
         r_var: float = 0.5,
         # Prior on E_bar_t (normal): center at Lu Section 4 DGP mean (-1)
-        E_bar_mean: float = -1.0,
+        E_bar_mean: float = 0.0,
         E_bar_var: float = 10.0,
         # Spike-and-slab variances for n_jt | gamma_jt
         T0_sq: float = 1e-3,
