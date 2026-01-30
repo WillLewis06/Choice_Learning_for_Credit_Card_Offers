@@ -35,14 +35,15 @@ def main() -> None:
     # -----------------------------
     shrink_n_iter = 15
 
-    # Initial k values (these are INITIAL GUESSES; fit() will tune once using   pilot_length)
-    shrink_k_beta = 0.10
-    shrink_k_njt = 0.10
-    shrink_k_r = 0.05
-    shrink_k_E_bar = 0.05
+    # Tuning hyperparameters (passed through to tune_shrinkage)
+    shrink_target_low = 0.3
+    shrink_target_high = 0.5
+    shrink_max_rounds = 4
+    shrink_factor_rw = 1.3
+    shrink_factor_tmh = 1.05
 
     # One-shot pilot length used to tune each k once (Option A)
-    shrink_pilot_length = 200
+    shrink_pilot_length = 15
 
     # TMH numerical parameters
     shrink_ridge = 1e-6
@@ -135,13 +136,14 @@ def main() -> None:
         print(f"=== Shrinkage Estimator built ===")
         shrink.fit(
             n_iter=shrink_n_iter,
-            k_beta=shrink_k_beta,
-            k_njt=shrink_k_njt,
-            k_r=shrink_k_r,
-            k_E_bar=shrink_k_E_bar,
             pilot_length=shrink_pilot_length,
             ridge=shrink_ridge,
             max_lbfgs_iters=shrink_max_lbfgs_iters,
+            target_low=shrink_target_low,
+            target_high=shrink_target_high,
+            max_rounds=shrink_max_rounds,
+            factor_rw=shrink_factor_rw,
+            factor_tmh=shrink_factor_tmh,
         )
         res_shrink = shrink.get_results()
         print(f"=== Shrinkage Estimator fitted ===")
