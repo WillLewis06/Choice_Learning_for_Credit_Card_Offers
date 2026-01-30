@@ -3,6 +3,9 @@ from __future__ import annotations
 import tensorflow as tf
 
 
+round4 = lambda x: tf.round(x * 1e4) / 1e4
+
+
 def init_progress_state(shrink: "LuShrinkageEstimator") -> dict:
     """
     Initialize a lightweight snapshot of the current state.
@@ -45,19 +48,19 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> dict:
         "[LuShrinkage] it=",
         it_t,
         " | beta_p=",
-        beta_p,
+        round4(beta_p),
         ", beta_w=",
-        beta_w,
+        round4(beta_w),
         ", sigma=",
-        sigma,
+        round4(sigma),
         " | E_bar_norm=",
-        E_bar_norm,
+        round4(E_bar_norm),
         ", njt_norm=",
-        njt_norm,
+        round4(njt_norm),
         " | mean(gamma)=",
-        gamma_mean,
+        round4(gamma_mean),
         ", mean(phi)=",
-        phi_mean,
+        round4(phi_mean),
     )
 
     return {

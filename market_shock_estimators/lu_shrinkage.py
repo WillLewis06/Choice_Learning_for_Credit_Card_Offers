@@ -14,6 +14,10 @@
 #
 from __future__ import annotations
 
+# tmp debugging
+import json
+from pathlib import Path
+
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -118,6 +122,31 @@ class LuShrinkageEstimator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def _debug_save_k(self, k_r, k_E_bar, k_beta, k_njt):
+        path = Path("./_debug_cache/lu_shrinkage_k.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text(
+            json.dumps(
+                {
+                    "k_r": float(k_r.numpy()),
+                    "k_E_bar": float(k_E_bar.numpy()),
+                    "k_beta": float(k_beta.numpy()),
+                    "k_njt": float(k_njt.numpy()),
+                }
+            )
+        )
+
+    def _debug_load_k(self):
+        path = Path("./_debug_cache/lu_shrinkage_k.json")
+        d = json.loads(path.read_text())
+
+        return (
+            tf.constant(d["k_r"], dtype=tf.float64),
+            tf.constant(d["k_E_bar"], dtype=tf.float64),
+            tf.constant(d["k_beta"], dtype=tf.float64),
+            tf.constant(d["k_njt"], dtype=tf.float64),
+        )
 
     def fit(
         self,
@@ -154,7 +183,10 @@ class LuShrinkageEstimator:
         self.factor_rw = float(factor_rw)
         self.factor_tmh = float(factor_tmh)
 
-        k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
+        # k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
+        # tmp for faster debugging
+        # self._debug_save_k(k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned)
+        k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = self._debug_load_k()
 
         # One-time warm start for TMH njt block (prevents njt from sticking at 0)
         self._initialize_njt_modes(ridge=ridge, max_lbfgs_iters=max_lbfgs_iters)
@@ -589,6 +621,5 @@ class LuShrinkageEstimator:
             gamma_t=gamma_t,
             a_phi=self.posterior.a_phi,
             b_phi=self.posterior.b_phi,
-            J=self.J,
             rng=self.rng,
         )
