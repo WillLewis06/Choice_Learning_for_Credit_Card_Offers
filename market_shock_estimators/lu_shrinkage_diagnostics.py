@@ -3,39 +3,21 @@ from __future__ import annotations
 import tensorflow as tf
 
 
-round4 = lambda x: tf.round(x * 1e4) / 1e4
+def round4(x: tf.Tensor) -> tf.Tensor:
+    x = tf.convert_to_tensor(x)
+    return tf.strings.as_string(x, precision=4, scientific=False)
 
 
-def init_progress_state(shrink: "LuShrinkageEstimator") -> dict:
-    """
-    Initialize a lightweight snapshot of the current state.
-    Scalars + cheap aggregates only.
-
-    TF-compatible: returns tensors (no .numpy(), no Python floats).
-    """
-    return {
-        "beta_p": tf.identity(shrink.beta_p),
-        "beta_w": tf.identity(shrink.beta_w),
-        "r": tf.identity(shrink.r),
-        "E_bar_norm": tf.norm(shrink.E_bar),
-        "njt_norm": tf.norm(shrink.njt),
-        "gamma_mean": tf.reduce_mean(tf.cast(shrink.gamma, tf.float64)),
-        "phi_mean": tf.reduce_mean(shrink.phi),
-    }
-
-
-def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> dict:
+def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
     """
     Print current state values (scalars + cheap aggregates) at end of iteration.
-    Returns updated snapshot for next iteration.
 
-    TF-compatible: uses tf.print and returns tensors (no .numpy(), no Python floats).
+    TF-compatible: uses tf.print (no .numpy(), no Python floats).
     """
     it_t = tf.convert_to_tensor(it)
 
     beta_p = tf.identity(shrink.beta_p)
     beta_w = tf.identity(shrink.beta_w)
-    r_val = tf.identity(shrink.r)
     sigma = tf.exp(shrink.r)
 
     E_bar_norm = tf.norm(shrink.E_bar)
@@ -62,16 +44,6 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> dict:
         ", mean(phi)=",
         round4(phi_mean),
     )
-
-    return {
-        "beta_p": beta_p,
-        "beta_w": beta_w,
-        "r": r_val,
-        "E_bar_norm": E_bar_norm,
-        "njt_norm": njt_norm,
-        "gamma_mean": gamma_mean,
-        "phi_mean": phi_mean,
-    }
 
 
 class LuShrinkageDiagnostics:
@@ -124,12 +96,14 @@ class LuShrinkageDiagnostics:
         self.sum_phi.assign_add(shrink.phi)
         self.sum_gamma.assign_add(tf.cast(shrink.gamma, tf.float64))
 
+    @tf.function
     def step(self, shrink: "LuShrinkageEstimator", it) -> None:
         """
         Called once per iteration:
           - accumulate current draw into running sums
           - print progress line
         """
+        it = tf.convert_to_tensor(it, dtype=tf.int32)
         self._accumulate_draw(shrink)
         report_iteration_progress(shrink, it)
 

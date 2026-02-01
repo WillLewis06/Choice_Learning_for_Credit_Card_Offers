@@ -119,6 +119,9 @@ class LuShrinkageEstimator:
         )
         self.phi = tf.Variable(tf.fill([self.T], phi0), trainable=False)
 
+        # set in _run_mcmc_loop (python-owned), used inside compiled iteration step
+        self._diag: LuShrinkageDiagnostics | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -183,10 +186,10 @@ class LuShrinkageEstimator:
         self.factor_rw = float(factor_rw)
         self.factor_tmh = float(factor_tmh)
 
-        # k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
+        k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
         # tmp for faster debugging
         # self._debug_save_k(k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned)
-        k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = self._debug_load_k()
+        # k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = self._debug_load_k()
 
         # One-time warm start for TMH njt block (prevents njt from sticking at 0)
         self._initialize_njt_modes(ridge=ridge, max_lbfgs_iters=max_lbfgs_iters)
@@ -204,25 +207,42 @@ class LuShrinkageEstimator:
             diag=diag,
         )
 
-        saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
-            diag.get_sums()
-        )
-
-        self._finalize_results(
-            saved=saved,
-            sum_beta=sum_beta,
-            sum_sigma=sum_sigma,
-            sum_E_bar=sum_E_bar,
-            sum_njt=sum_njt,
-            sum_phi=sum_phi,
-            sum_gamma=sum_gamma,
-        )
         self.success = True
 
     def get_results(self) -> dict:
-        if self._results is None:
-            return {"success": False}
-        return dict(self._results)
+        """
+        Return the minimal posterior-mean quantities needed by assess_estimator.py.
+
+        Notes
+        -----
+        - This computes posterior means on-demand from the diagnostics running sums.
+        - It assumes `fit()` has been run and `self._diag` is populated.
+        """
+        saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
+            self._diag.get_sums()
+        )
+        saved_f = tf.cast(saved, tf.float64)
+
+        beta_mean = (sum_beta / saved_f).numpy()
+        sigma_mean = float((sum_sigma / saved_f).numpy())
+        E_bar_mean = (sum_E_bar / saved_f).numpy()
+        njt_mean = (sum_njt / saved_f).numpy()
+        E_mean = E_bar_mean[:, None] + njt_mean
+        phi_mean = (sum_phi / saved_f).numpy()
+        gamma_mean = (sum_gamma / saved_f).numpy()
+
+        return {
+            "success": True,
+            "beta_p_hat": float(beta_mean[0]),
+            "beta_w_hat": float(beta_mean[1]),
+            "sigma_hat": sigma_mean,
+            "E_hat": E_mean,
+            "E_bar_hat": E_bar_mean,
+            "njt_hat": njt_mean,
+            "phi_hat": phi_mean,
+            "gamma_hat": gamma_mean,
+            "n_saved": int(saved),
+        }
 
     def _initialize_njt_modes(self, ridge: float, max_lbfgs_iters: int) -> None:
         """
@@ -312,98 +332,112 @@ class LuShrinkageEstimator:
         Owns the full MCMC loop, mutating sampler state (tf.Variables) and
         accumulating posterior draw sums.
         """
-        # Make scalar hyperparams tensors (stable dtypes; reduces retracing risk when
-        # passed into tf.function-compiled market updates)
+        self._diag = diag  # python-owned handle, used inside compiled step
+
         ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
+        max_lbfgs_iters_i = int(max_lbfgs_iters)
 
         for it in range(n_iter):
-            self._update_beta_block(
-                k_beta=k_beta, ridge=ridge_t, max_lbfgs_iters=max_lbfgs_iters
+            it_t = tf.convert_to_tensor(it, dtype=tf.int32)
+            self._mcmc_iteration_step(
+                it=it_t,
+                k_beta=k_beta,
+                k_njt=k_njt,
+                k_r=k_r,
+                k_E_bar=k_E_bar,
+                ridge=ridge_t,
+                max_lbfgs_iters=max_lbfgs_iters_i,
             )
-            self._update_r_block(k_r=k_r)
 
-            for t in range(self.T):
-                # Slice market-specific data/state in Python using t (int).
-                qjt_t = self.qjt[t]
-                q0t_t = self.q0t[t]
-                pjt_t = self.pjt[t]
-                wjt_t = self.wjt[t]
-
-                E_bar_t = self.E_bar[t]
-                njt_t = self.njt[t]
-                gamma_t = self.gamma[t]
-                phi_t = self.phi[t]
-
-                E_bar_new, njt_new, gamma_new, phi_new = self._update_market_block(
-                    qjt_t=qjt_t,
-                    q0t_t=q0t_t,
-                    pjt_t=pjt_t,
-                    wjt_t=wjt_t,
-                    E_bar_t=E_bar_t,
-                    njt_t=njt_t,
-                    gamma_t=gamma_t,
-                    phi_t=phi_t,
-                    k_E_bar=k_E_bar,
-                    k_njt=k_njt,
-                    ridge=ridge_t,
-                    max_lbfgs_iters=max_lbfgs_iters,
-                )
-
-                # Write back into full state (scatter update) using t (int).
-                self.E_bar.assign(
-                    tf.tensor_scatter_nd_update(self.E_bar, [[t]], [E_bar_new])
-                )
-                self.njt.assign(
-                    tf.tensor_scatter_nd_update(
-                        self.njt, [[t]], tf.expand_dims(njt_new, axis=0)
-                    )
-                )
-                self.gamma.assign(
-                    tf.tensor_scatter_nd_update(
-                        self.gamma, [[t]], tf.expand_dims(gamma_new, axis=0)
-                    )
-                )
-                self.phi.assign(tf.tensor_scatter_nd_update(self.phi, [[t]], [phi_new]))
-
-            diag.step(self, it)
-
-    def _finalize_results(
+    @tf.function(reduce_retracing=True)
+    def _mcmc_iteration_step(
         self,
-        saved: int,
-        sum_beta: tf.Tensor,
-        sum_sigma: tf.Tensor,
-        sum_E_bar: tf.Tensor,
-        sum_njt: tf.Tensor,
-        sum_phi: tf.Tensor,
-        sum_gamma: tf.Tensor,
+        *,
+        it: tf.Tensor,
+        k_beta: tf.Tensor,
+        k_njt: tf.Tensor,
+        k_r: tf.Tensor,
+        k_E_bar: tf.Tensor,
+        ridge: tf.Tensor,
+        max_lbfgs_iters: int,
     ) -> None:
-        saved_f = tf.cast(saved, tf.float64)
+        # Global blocks (compiled)
+        self._update_beta_block(
+            k_beta=k_beta, ridge=ridge, max_lbfgs_iters=max_lbfgs_iters
+        )
+        self._update_r_block(k_r=k_r)
 
-        beta_mean = (sum_beta / saved_f).numpy()
-        sigma_mean = float((sum_sigma / saved_f).numpy())
-        E_bar_mean = (sum_E_bar / saved_f).numpy()
-        njt_mean = (sum_njt / saved_f).numpy()
-        E_mean = E_bar_mean[:, None] + njt_mean
-        phi_mean = (sum_phi / saved_f).numpy()
-        gamma_mean = (sum_gamma / saved_f).numpy()
+        # Snapshot full state as tensors for loop-carried updates
+        E_bar0 = self.E_bar.read_value()  # (T,)
+        njt0 = self.njt.read_value()  # (T,J)
+        gamma0 = self.gamma.read_value()  # (T,J)
+        phi0 = self.phi.read_value()  # (T,)
 
-        self._results = {
-            "success": True,
-            "beta_p_hat": float(beta_mean[0]),
-            "beta_w_hat": float(beta_mean[1]),
-            "sigma_hat": sigma_mean,
-            "E_hat": E_mean,
-            "E_bar_hat": E_bar_mean,
-            "njt_hat": njt_mean,
-            "phi_hat": phi_mean,
-            "gamma_hat": gamma_mean,
-            "n_saved": int(saved),
-        }
+        T_t = tf.shape(self.pjt)[0]
+
+        ta_E = tf.TensorArray(tf.float64, size=T_t).unstack(E_bar0)
+        ta_n = tf.TensorArray(tf.float64, size=T_t).unstack(njt0)
+        ta_g = tf.TensorArray(tf.float64, size=T_t).unstack(gamma0)
+        ta_p = tf.TensorArray(tf.float64, size=T_t).unstack(phi0)
+
+        def cond(t, ta_E_in, ta_n_in, ta_g_in, ta_p_in):
+            return t < T_t
+
+        def body(t, ta_E_in, ta_n_in, ta_g_in, ta_p_in):
+            qjt_t = self.qjt[t]
+            q0t_t = self.q0t[t]
+            pjt_t = self.pjt[t]
+            wjt_t = self.wjt[t]
+
+            E_bar_t = ta_E_in.read(t)
+            njt_t = ta_n_in.read(t)
+            gamma_t = ta_g_in.read(t)
+            phi_t = ta_p_in.read(t)
+
+            E_bar_new, njt_new, gamma_new, phi_new = self._update_market_block(
+                qjt_t=qjt_t,
+                q0t_t=q0t_t,
+                pjt_t=pjt_t,
+                wjt_t=wjt_t,
+                E_bar_t=E_bar_t,
+                njt_t=njt_t,
+                gamma_t=gamma_t,
+                phi_t=phi_t,
+                k_E_bar=k_E_bar,
+                k_njt=k_njt,
+                ridge=ridge,
+                max_lbfgs_iters=max_lbfgs_iters,
+            )
+
+            ta_E_out = ta_E_in.write(t, E_bar_new)
+            ta_n_out = ta_n_in.write(t, njt_new)
+            ta_g_out = ta_g_in.write(t, gamma_new)
+            ta_p_out = ta_p_in.write(t, phi_new)
+
+            return t + 1, ta_E_out, ta_n_out, ta_g_out, ta_p_out
+
+        t0 = tf.constant(0, dtype=tf.int32)
+        _, ta_E, ta_n, ta_g, ta_p = tf.while_loop(
+            cond,
+            body,
+            loop_vars=(t0, ta_E, ta_n, ta_g, ta_p),
+            parallel_iterations=1,
+        )
+
+        # Assign back once per tensor (minimal state mutation in graph)
+        self.E_bar.assign(ta_E.stack())
+        self.njt.assign(ta_n.stack())
+        self.gamma.assign(ta_g.stack())
+        self.phi.assign(ta_p.stack())
+
+        # Fully on-graph diagnostics (observational only)
+        self._diag.step(self, it)
 
     # ------------------------------------------------------------------
     # Block updates (mutate state)
     # ------------------------------------------------------------------
 
+    @tf.function(reduce_retracing=True)
     def _update_beta_block(
         self, k_beta: tf.Tensor, ridge: tf.Tensor, max_lbfgs_iters: int
     ) -> None:
@@ -412,20 +446,19 @@ class LuShrinkageEstimator:
         def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
             beta_p = theta_vec[0]
             beta_w = theta_vec[1]
-            ll = tf.constant(0.0, dtype=tf.float64)
-            for t in range(self.T):
-                ll += self.posterior.market_loglik(
-                    qjt_t=self.qjt[t],
-                    q0t_t=self.q0t[t],
-                    pjt_t=self.pjt[t],
-                    wjt_t=self.wjt[t],
-                    beta_p=beta_p,
-                    beta_w=beta_w,
-                    r=self.r,
-                    E_bar_t=self.E_bar[t],
-                    njt_t=self.njt[t],
-                )
-            return ll + self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
+            ll = self.posterior.full_loglik(
+                qjt=self.qjt,
+                q0t=self.q0t,
+                pjt=self.pjt,
+                wjt=self.wjt,
+                beta_p=beta_p,
+                beta_w=beta_w,
+                r=self.r,
+                E_bar=self.E_bar,
+                njt=self.njt,
+            )
+            lp = self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
+            return tf.cast(ll, tf.float64) + tf.cast(lp, tf.float64)
 
         beta_new, _ = tmh_step(
             theta0=beta0,
@@ -437,22 +470,22 @@ class LuShrinkageEstimator:
         self.beta_p.assign(beta_new[0])
         self.beta_w.assign(beta_new[1])
 
+    @tf.function(reduce_retracing=True)
     def _update_r_block(self, k_r: tf.Tensor) -> None:
         def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-            ll = tf.constant(0.0, dtype=tf.float64)
-            for t in range(self.T):
-                ll += self.posterior.market_loglik(
-                    qjt_t=self.qjt[t],
-                    q0t_t=self.q0t[t],
-                    pjt_t=self.pjt[t],
-                    wjt_t=self.wjt[t],
-                    beta_p=self.beta_p,
-                    beta_w=self.beta_w,
-                    r=r_val,
-                    E_bar_t=self.E_bar[t],
-                    njt_t=self.njt[t],
-                )
-            return ll + self.posterior.logprior_r(r=r_val)
+            ll = self.posterior.full_loglik(
+                qjt=self.qjt,
+                q0t=self.q0t,
+                pjt=self.pjt,
+                wjt=self.wjt,
+                beta_p=self.beta_p,
+                beta_w=self.beta_w,
+                r=r_val,
+                E_bar=self.E_bar,
+                njt=self.njt,
+            )
+            lp = self.posterior.logprior_r(r=r_val)
+            return tf.cast(ll, tf.float64) + tf.cast(lp, tf.float64)
 
         r_new, _, _ = rw_mh_step(
             theta0=self.r,

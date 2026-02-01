@@ -98,6 +98,8 @@ class BLPEstimator:
 
         self.sigma_hat = None
         self.beta_hat = None
+        self.beta_p_hat = None
+        self.beta_w_hat = None
         self.E_hat = None
         self.success = False
 
@@ -279,6 +281,10 @@ class BLPEstimator:
         """
         delta = self._invert_demand(sigma)
         beta_hat = self._estimate_beta(delta)
+        # Split coefficients: X = [p, w]
+        self.beta_p_hat = float(beta_hat[0, 0])
+        self.beta_w_hat = float(beta_hat[1, 0])
+
         E_hat = self._compute_E_hat(delta, beta_hat)
 
         g_bar, _ = self._moments_and_omega(E_hat)
@@ -408,6 +414,7 @@ class BLPEstimator:
         return {
             "success": self.success,
             "sigma_hat": self.sigma_hat,
-            "beta_hat": self.beta_hat,
+            "beta_p_hat": self.beta_p_hat,  # scalar
+            "beta_w_hat": self.beta_w_hat,  # scalar
             "E_hat": self.E_hat,
         }

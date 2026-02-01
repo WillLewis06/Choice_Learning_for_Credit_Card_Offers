@@ -154,6 +154,7 @@ class LuPosteriorTF:
     # Log likelihood
     # ------------------------------------------------------------------
 
+    @tf.function(reduce_retracing=True)
     def market_loglik(
         self,
         *,
@@ -191,6 +192,7 @@ class LuPosteriorTF:
         ll += q0t_t * tf.math.log(s0t)
         return ll
 
+    @tf.function(reduce_retracing=True)
     def full_loglik(
         self,
         *,
@@ -348,6 +350,7 @@ class LuPosteriorTF:
             + self.logprior_phi(phi=tf.reshape(phi_t, (1,)))
         )
 
+    @tf.function(reduce_retracing=True)
     def market_logpost(
         self,
         *,

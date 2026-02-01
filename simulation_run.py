@@ -7,10 +7,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
 
 from datasets.dgp import BasicLuChoiceModel, generate_market, generate_market_conditions
-from market_shock_estimators.assess_estimator import (
-    assess_estimator_results,
-    print_assessment,
-)
+from toolbox.assess_estimator import print_assessment
 from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
 from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
 
@@ -37,7 +34,7 @@ def main() -> None:
     # -----------------------------
     # Lu shrinkage (MCMC) hyperparameters
     # -----------------------------
-    shrink_n_iter = 3
+    shrink_n_iter = 200
 
     # Tuning hyperparameters (passed through to tune_shrinkage)
     shrink_target_low = 0.3
@@ -53,7 +50,7 @@ def main() -> None:
     shrink_ridge = 1e-6
     shrink_max_lbfgs_iters = 100
 
-    for dgp_type in [1]:  # (1, 2, 3, 4):
+    for dgp_type in (1, 2, 3, 4):
         print(f"=== DGP {dgp_type} ===")
 
         # -----------------------------
@@ -84,7 +81,7 @@ def main() -> None:
         # Orchestration builds IV matrices; estimator owns RC integration draws internally.
         # Demand regressors (Lu-aligned): X = [p, w] (no constant).
         # -----------------------------
-        """
+
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
             sjt=sjt,
@@ -124,7 +121,7 @@ def main() -> None:
         )
         res_weak = blp_weak.get_results()
         print(f"=== Weak Estimator fitted ===")
-        """
+
         # -----------------------------
         # Lu shrinkage (posterior sampling)
         # Assumes estimator constructs Z=p[...,None], initializes state, owns TF RNG, and runs MCMC internally.
@@ -155,24 +152,15 @@ def main() -> None:
         # -----------------------------
         # Assessment
         # -----------------------------
-        """
+
         print(f"=== Strong BLP Estimator Results ===")
-        strong_BLPEst_assessment = assess_estimator_results(
-            results=res_strong, E_true=Ejt, sigma_true=sigma_true
-        )
-        print_assessment(strong_BLPEst_assessment)
+        print_assessment(results=res_strong, E_true=Ejt, sigma_true=sigma_true)
 
         print(f"=== Weak BLP Estimator Results ===")
-        weak_BLPEst_assessment = assess_estimator_results(
-            results=res_weak, E_true=Ejt, sigma_true=sigma_true
-        )
-        print_assessment(weak_BLPEst_assessment)
-        """
+        print_assessment(results=res_weak, E_true=Ejt, sigma_true=sigma_true)
+
         print(f"=== Shrinkage Estimator Results ===")
-        shrink_est_assessment = assess_estimator_results(
-            results=res_shrink, E_true=Ejt, sigma_true=sigma_true
-        )
-        print_assessment(shrink_est_assessment)
+        print_assessment(results=res_shrink, E_true=Ejt, sigma_true=sigma_true)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Callable, Tuple
 import tensorflow as tf
 
 
+@tf.function(reduce_retracing=True)
 def rw_mh_step(
     theta0: tf.Tensor,
     logp_fn: Callable[[tf.Tensor], tf.Tensor],
@@ -32,6 +33,7 @@ def rw_mh_step(
     return theta_new, accepted, log_alpha
 
 
+@tf.function(reduce_retracing=True)
 def tmh_step(
     theta0: tf.Tensor,
     logp_fn: Callable[[tf.Tensor], tf.Tensor],
@@ -234,6 +236,7 @@ def tmh_step(
     )
 
 
+@tf.function(reduce_retracing=True)
 def sample_gamma_given_n_phi_market(
     njt_t: tf.Tensor,
     phi_t: tf.Tensor,
@@ -261,6 +264,7 @@ def sample_gamma_given_n_phi_market(
     return tf.cast(u < prob1, dtype=tf.float64)
 
 
+@tf.function(reduce_retracing=True)
 def gibbs_phi_market(
     *,
     gamma_t: tf.Tensor,
