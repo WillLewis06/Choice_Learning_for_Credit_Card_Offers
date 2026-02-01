@@ -34,7 +34,7 @@ def main() -> None:
     # -----------------------------
     # Lu shrinkage (MCMC) hyperparameters
     # -----------------------------
-    shrink_n_iter = 200
+    shrink_n_iter = 10
 
     # Tuning hyperparameters (passed through to tune_shrinkage)
     shrink_target_low = 0.3
@@ -48,9 +48,8 @@ def main() -> None:
 
     # TMH numerical parameters
     shrink_ridge = 1e-6
-    shrink_max_lbfgs_iters = 100
 
-    for dgp_type in (1, 2, 3, 4):
+    for dgp_type in [1]:  # (1, 2, 3, 4):
         print(f"=== DGP {dgp_type} ===")
 
         # -----------------------------
@@ -81,7 +80,7 @@ def main() -> None:
         # Orchestration builds IV matrices; estimator owns RC integration draws internally.
         # Demand regressors (Lu-aligned): X = [p, w] (no constant).
         # -----------------------------
-
+        """
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
             sjt=sjt,
@@ -121,7 +120,7 @@ def main() -> None:
         )
         res_weak = blp_weak.get_results()
         print(f"=== Weak Estimator fitted ===")
-
+        """
         # -----------------------------
         # Lu shrinkage (posterior sampling)
         # Assumes estimator constructs Z=p[...,None], initializes state, owns TF RNG, and runs MCMC internally.
@@ -139,7 +138,6 @@ def main() -> None:
             n_iter=shrink_n_iter,
             pilot_length=shrink_pilot_length,
             ridge=shrink_ridge,
-            max_lbfgs_iters=shrink_max_lbfgs_iters,
             target_low=shrink_target_low,
             target_high=shrink_target_high,
             max_rounds=shrink_max_rounds,
@@ -152,13 +150,13 @@ def main() -> None:
         # -----------------------------
         # Assessment
         # -----------------------------
-
+        """
         print(f"=== Strong BLP Estimator Results ===")
         print_assessment(results=res_strong, E_true=Ejt, sigma_true=sigma_true)
 
         print(f"=== Weak BLP Estimator Results ===")
         print_assessment(results=res_weak, E_true=Ejt, sigma_true=sigma_true)
-
+        """
         print(f"=== Shrinkage Estimator Results ===")
         print_assessment(results=res_shrink, E_true=Ejt, sigma_true=sigma_true)
 

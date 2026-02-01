@@ -14,11 +14,22 @@ def rw_mh_step(
     rng: tf.random.Generator,
 ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """
-    Random-walk MH step:
+    Random-walk MH step (batched).
+
+    Proposal:
       theta' = theta0 + k * z,  z ~ N(0, I)
 
-    Assumes inputs are tf.float64 tensors. Keeps casting logp outputs for safety.
+    Supports:
+      - scalar theta0 (shape []) -> scalar accept/reject
+      - vector theta0 (e.g. shape (T,)) -> elementwise accept/reject (batch)
+
+    Requirements for batched use:
+      - logp_fn(theta) must return a tensor with the same shape as theta
+        (e.g. (T,) for (T,) inputs), giving per-element log densities.
     """
+    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
+    k = tf.cast(k, tf.float64)
+
     z = rng.normal(tf.shape(theta0), dtype=tf.float64)
     theta_prop = theta0 + k * z
 
@@ -26,8 +37,10 @@ def rw_mh_step(
     logp_prop = tf.cast(logp_fn(theta_prop), tf.float64)
     log_alpha = logp_prop - logp_curr
 
-    u = rng.uniform([], dtype=tf.float64)
+    # Draw U with same batch shape; for scalar theta0 this is shape []
+    u = rng.uniform(tf.shape(theta0), dtype=tf.float64)
     accepted = tf.math.log(u) < log_alpha
+
     theta_new = tf.where(accepted, theta_prop, theta0)
 
     return theta_new, accepted, log_alpha
@@ -265,27 +278,56 @@ def sample_gamma_given_n_phi_market(
 
 
 @tf.function(reduce_retracing=True)
-def gibbs_phi_market(
-    *,
-    gamma_t: tf.Tensor,
+def gibbs_phi(
+    gamma: tf.Tensor,
     a_phi: tf.Tensor,
     b_phi: tf.Tensor,
     rng: tf.random.Generator,
 ) -> tf.Tensor:
     """
-    Gibbs update for phi_t | gamma_t under Beta-Bernoulli:
-      phi_t ~ Beta(a_phi + sum_j gamma_jt, b_phi + J - sum_j gamma_jt)
+    Batched Gibbs update for phi | gamma under Beta-Bernoulli:
 
-    Uses stateless gamma with seeds from `rng` (Generator has no .gamma in TF 2.16).
-    Assumes gamma_t is 0/1 in tf.float64, and a_phi/b_phi are scalar tf.float64 tensors.
+      phi_t | gamma_t ~ Beta(a_phi + sum_j gamma_tj, b_phi + J - sum_j gamma_tj)
+
+    Inputs
+    ------
+    gamma : tf.Tensor
+        Shape (T, J) (batched markets) or (J,) (single market). Values 0/1.
+    a_phi, b_phi : tf.Tensor
+        Scalar hyperparameters (tf.float64).
+    rng : tf.random.Generator
+        Used only to generate stateless seeds.
+
+    Returns
+    -------
+    phi : tf.Tensor
+        Shape (T,) if gamma is (T,J), else scalar if gamma is (J,).
+
+    Notes
+    -----
+    Uses stateless gamma with seeds from `rng`.
     """
-    s = tf.reduce_sum(gamma_t)
-    J = tf.cast(tf.shape(gamma_t)[0], tf.float64)
+    gamma = tf.convert_to_tensor(gamma, dtype=tf.float64)
+    a_phi = tf.cast(a_phi, tf.float64)
+    b_phi = tf.cast(b_phi, tf.float64)
+
+    # Sum successes per market.
+    # If gamma is (J,), this returns scalar.
+    s = tf.reduce_sum(gamma, axis=-1)  # (T,) or ()
+
+    # Number of products J as float64 scalar
+    J = tf.cast(tf.shape(gamma)[-1], tf.float64)
 
     a = a_phi + s
     b = b_phi + (J - s)
 
+    # Sample Beta(a,b) via Gamma(a,1) / (Gamma(a,1)+Gamma(b,1))
+    # Use independent stateless seeds for x and y.
     seeds = rng.make_seeds(2)
-    x = tf.random.stateless_gamma(shape=[], seed=seeds[0], alpha=a, dtype=tf.float64)
-    y = tf.random.stateless_gamma(shape=[], seed=seeds[1], alpha=b, dtype=tf.float64)
+    x = tf.random.stateless_gamma(
+        shape=tf.shape(s), seed=seeds[0], alpha=a, dtype=tf.float64
+    )
+    y = tf.random.stateless_gamma(
+        shape=tf.shape(s), seed=seeds[1], alpha=b, dtype=tf.float64
+    )
     return x / (x + y)

@@ -18,7 +18,7 @@ def _lu_k0(d: tf.Tensor) -> tf.Tensor:
 
 
 def _lbfgs_mode(
-    theta0: tf.Tensor, logp_fn: Callable[[tf.Tensor], tf.Tensor], max_lbfgs_iters: int
+    theta0: tf.Tensor, logp_fn: Callable[[tf.Tensor], tf.Tensor]
 ) -> tf.Tensor:
     """Return argmax_theta logp_fn(theta) via L-BFGS starting from theta0."""
     theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
@@ -31,11 +31,7 @@ def _lbfgs_mode(
         g = tape.gradient(val, x)
         return val, g
 
-    res = tfp.optimizer.lbfgs_minimize(
-        val_and_grad,
-        initial_position=theta0,
-        max_iterations=int(max_lbfgs_iters),
-    )
+    res = tfp.optimizer.lbfgs_minimize(val_and_grad, initial_position=theta0)
     return tf.where(tf.cast(res.converged, tf.bool), res.position, theta0)
 
 
@@ -641,7 +637,6 @@ def _tune_njt(
     factor_tmh: float,
     k_njt0: tf.Tensor,
     ridge_t: tf.Tensor,
-    max_lbfgs_iters: int,
 ) -> Tuple[tf.Tensor, tf.Tensor]:
     k_njt = tf.cast(k_njt0, tf.float64)
     eps_k = tf.constant(1e-12, tf.float64)
@@ -696,7 +691,7 @@ def _tune_njt(
     for t in range(T_int):
         logp_t = _make_logp_njt_full(t)
         theta0_t = tf.cast(tf.convert_to_tensor(shrink.njt[t]), tf.float64)
-        mu_t = _lbfgs_mode(theta0_t, logp_t, max_lbfgs_iters=max_lbfgs_iters)
+        mu_t = _lbfgs_mode(theta0_t, logp_t)
         mu_list.append(mu_t)
 
     njt_mat = tf.stack(mu_list, axis=0)  # (T,J)
@@ -773,7 +768,6 @@ def tune_shrinkage(shrink):
     required = [
         "pilot_length",
         "ridge",
-        "max_lbfgs_iters",
         "target_low",
         "target_high",
         "max_rounds",
@@ -802,7 +796,6 @@ def tune_shrinkage(shrink):
 
     pilot_length = int(shrink.pilot_length)
     ridge = float(shrink.ridge)
-    max_lbfgs_iters = int(shrink.max_lbfgs_iters)
 
     target_low = float(shrink.target_low)
     target_high = float(shrink.target_high)
@@ -832,8 +825,6 @@ def tune_shrinkage(shrink):
         J_int,
         "| ridge=",
         ridge,
-        "| max_lbfgs_iters=",
-        max_lbfgs_iters,
     )
     print(
         f"[LuShrinkage:Tune] k0 defaults | "
@@ -897,7 +888,6 @@ def tune_shrinkage(shrink):
         factor_tmh=factor_tmh,
         k_njt0=k_njt0,
         ridge_t=ridge_t,
-        max_lbfgs_iters=max_lbfgs_iters,
     )
 
     print("[LuShrinkage:Tune] done")

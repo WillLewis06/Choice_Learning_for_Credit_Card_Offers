@@ -442,3 +442,61 @@ class LuPosteriorTF:
         return tf.reduce_sum(lp_t) + self.global_logprior(
             beta_p=beta_p, beta_w=beta_w, r=r
         )
+
+    @tf.function(reduce_retracing=True)
+    def market_logpost_batched(
+        self,
+        *,
+        qjt,
+        q0t,
+        pjt,
+        wjt,
+        beta_p,
+        beta_w,
+        r,
+        E_bar,
+        njt,
+        gamma,
+        phi,
+    ):
+        """
+        Vector of market-local log posterior contributions.
+
+        Returns
+        -------
+        lp_t : (T,) tensor where
+          lp_t[t] = market_loglik_t + market_logprior_t
+
+        Notes
+        -----
+        This is the batched analogue of `market_logpost(...)`:
+          - input arrays are (T,...) rather than per-market slices
+          - output is a vector (T,) rather than a scalar sum
+        """
+        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)  # (T,J)
+        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)  # (T,)
+        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
+        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
+        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
+        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
+        gamma = tf.cast(gamma, self.dtype)  # (T,J)
+        phi = tf.cast(phi, self.dtype)  # (T,)
+
+        T = tf.shape(pjt)[0]
+
+        def per_t(t):
+            return self.market_logpost(
+                qjt_t=qjt[t],
+                q0t_t=q0t[t],
+                pjt_t=pjt[t],
+                wjt_t=wjt[t],
+                beta_p=beta_p,
+                beta_w=beta_w,
+                r=r,
+                E_bar_t=E_bar[t],
+                njt_t=njt[t],
+                gamma_t=gamma[t],
+                phi_t=phi[t],
+            )
+
+        return tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
