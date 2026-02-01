@@ -102,9 +102,6 @@ class LuPosteriorTF:
         """
         delta_t (J,) = beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
         """
-        pjt_t = tf.convert_to_tensor(pjt_t, dtype=self.dtype)
-        wjt_t = tf.convert_to_tensor(wjt_t, dtype=self.dtype)
-        njt_t = tf.convert_to_tensor(njt_t, dtype=self.dtype)
         beta_p = tf.cast(beta_p, self.dtype)
         beta_w = tf.cast(beta_w, self.dtype)
         E_bar_t = tf.cast(E_bar_t, self.dtype)
@@ -124,8 +121,7 @@ class LuPosteriorTF:
           sjt_t: (J,)
           s0t : scalar
         """
-        pjt_t = tf.convert_to_tensor(pjt_t, dtype=self.dtype)  # (J,)
-        delta_t = tf.convert_to_tensor(delta_t, dtype=self.dtype)  # (J,)
+
         r = tf.cast(r, self.dtype)
 
         sigma = tf.exp(r)  # scalar
@@ -209,12 +205,6 @@ class LuPosteriorTF:
         """
         Sum of market log-likelihoods over t.
         """
-        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)  # (T,J)
-        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)  # (T,)
-        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
-        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
-        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
-        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
 
         T = tf.shape(pjt)[0]
 
@@ -269,7 +259,6 @@ class LuPosteriorTF:
         """
         Sum_t log p(E_bar_t), iid normal (up to constants).
         """
-        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)
         T = tf.cast(tf.size(E_bar), self.dtype)
 
         return -0.5 * T * tf.math.log(
@@ -285,7 +274,6 @@ class LuPosteriorTF:
 
         Returns sum_j log N(njt_j; 0, T(gamma_j)).
         """
-        njt = tf.convert_to_tensor(njt, dtype=self.dtype)
         gamma = tf.cast(gamma, self.dtype)
 
         # var_j = gamma*T1_sq + (1-gamma)*T0_sq
@@ -412,12 +400,6 @@ class LuPosteriorTF:
         Full log posterior:
           sum_t market_logpost_t + global_logprior
         """
-        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)  # (T,J)
-        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)  # (T,)
-        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
-        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
-        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
-        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
         gamma = tf.cast(gamma, self.dtype)  # (T,J)
         phi = tf.cast(phi, self.dtype)  # (T,)
 

@@ -103,7 +103,7 @@ class LuShrinkageEstimator:
         self.r = tf.Variable(0.0, dtype=tf.float64, trainable=False)  # log(sigma)
 
         self.E_bar = tf.Variable(
-            tf.fill([self.T], tf.cast(self.posterior.E_bar_mean, tf.float64)),
+            tf.fill([self.T], self.posterior.E_bar_mean),
             trainable=False,
         )
 
@@ -114,9 +114,7 @@ class LuShrinkageEstimator:
             tf.zeros([self.T, self.J], dtype=tf.float64), trainable=False
         )
 
-        phi0 = tf.cast(self.posterior.a_phi, tf.float64) / tf.cast(
-            (self.posterior.a_phi + self.posterior.b_phi), tf.float64
-        )
+        phi0 = self.posterior.a_phi / (self.posterior.a_phi + self.posterior.b_phi)
         self.phi = tf.Variable(tf.fill([self.T], phi0), trainable=False)
 
         # set in _run_mcmc_loop (python-owned), used inside compiled iteration step
@@ -170,8 +168,6 @@ class LuShrinkageEstimator:
 
         if pilot_length <= 0:
             raise ValueError("pilot_length must be positive.")
-
-        ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
 
         # Tuning
         self.pilot_length = pilot_length
@@ -304,7 +300,7 @@ class LuShrinkageEstimator:
                 njt=self.njt,
             )
             lp = self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
-            return tf.cast(ll, tf.float64) + tf.cast(lp, tf.float64)
+            return ll + lp
 
         beta_new, _ = tmh_step(
             theta0=beta0,
@@ -331,7 +327,7 @@ class LuShrinkageEstimator:
                 njt=self.njt,
             )
             lp = self.posterior.logprior_r(r=r_val)
-            return tf.cast(ll, tf.float64) + tf.cast(lp, tf.float64)
+            return ll + lp
 
         r_new, _, _ = rw_mh_step(
             theta0=self.r,
@@ -428,7 +424,7 @@ class LuShrinkageEstimator:
             njt_new, _ = tmh_step(
                 theta0=njt_t,
                 logp_fn=logp_njt_t,
-                ridge=tf.cast(ridge, tf.float64),
+                ridge=ridge,
                 rng=self.rng,
                 k=k_njt,
             )

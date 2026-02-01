@@ -27,14 +27,12 @@ def rw_mh_step(
       - logp_fn(theta) must return a tensor with the same shape as theta
         (e.g. (T,) for (T,) inputs), giving per-element log densities.
     """
-    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
-    k = tf.cast(k, tf.float64)
 
     z = rng.normal(tf.shape(theta0), dtype=tf.float64)
     theta_prop = theta0 + k * z
 
-    logp_curr = tf.cast(logp_fn(theta0), tf.float64)
-    logp_prop = tf.cast(logp_fn(theta_prop), tf.float64)
+    logp_curr = logp_fn(theta0)
+    logp_prop = logp_fn(theta_prop)
     log_alpha = logp_prop - logp_curr
 
     # Draw U with same batch shape; for scalar theta0 this is shape []
@@ -82,10 +80,6 @@ def tmh_step(
         H = t2.jacobian(g, theta, experimental_use_pfor=False)
         del t2
 
-        # Safety casts (do not change core logic)
-        lp = tf.cast(lp, tf.float64)
-        g = tf.cast(g, tf.float64)
-        H = tf.cast(H, tf.float64)
         return lp, g, H
 
     def _sym(A: tf.Tensor) -> tf.Tensor:
@@ -307,9 +301,6 @@ def gibbs_phi(
     -----
     Uses stateless gamma with seeds from `rng`.
     """
-    gamma = tf.convert_to_tensor(gamma, dtype=tf.float64)
-    a_phi = tf.cast(a_phi, tf.float64)
-    b_phi = tf.cast(b_phi, tf.float64)
 
     # Sum successes per market.
     # If gamma is (J,), this returns scalar.

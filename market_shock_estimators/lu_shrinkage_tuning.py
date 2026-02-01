@@ -27,12 +27,12 @@ def _lbfgs_mode(
         x = tf.convert_to_tensor(x, dtype=tf.float64)
         with tf.GradientTape() as tape:
             tape.watch(x)
-            val = -tf.cast(logp_fn(x), tf.float64)
+            val = -logp_fn(x)
         g = tape.gradient(val, x)
         return val, g
 
     res = tfp.optimizer.lbfgs_minimize(val_and_grad, initial_position=theta0)
-    return tf.where(tf.cast(res.converged, tf.bool), res.position, theta0)
+    return tf.where(res.converged, res.position, theta0)
 
 
 def _pilot_run(
@@ -154,25 +154,6 @@ def tune_k(
     return k, last_acc, last_theta_end
 
 
-def _stack_global_data(
-    shrink,
-) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """
-    Return stacked tensors needed for full-sample likelihood evaluation.
-
-    Expected shapes:
-      qjt, pjt, wjt, njt: (T,J)
-      q0t, E_bar: (T,)
-    """
-    qjt = tf.convert_to_tensor(shrink.qjt, dtype=tf.float64)
-    q0t = tf.convert_to_tensor(shrink.q0t, dtype=tf.float64)
-    pjt = tf.convert_to_tensor(shrink.pjt, dtype=tf.float64)
-    wjt = tf.convert_to_tensor(shrink.wjt, dtype=tf.float64)
-    E_bar = tf.convert_to_tensor(shrink.E_bar, dtype=tf.float64)
-    njt = tf.convert_to_tensor(shrink.njt, dtype=tf.float64)
-    return qjt, q0t, pjt, wjt, E_bar, njt
-
-
 def _make_step_r(
     *,
     posterior,
@@ -199,9 +180,7 @@ def _make_step_r(
                 E_bar=E_bar,
                 njt=njt,
             )
-            return tf.cast(ll, tf.float64) + tf.cast(
-                posterior.logprior_r(r=r_val), tf.float64
-            )
+            return ll + posterior.logprior_r(r=r_val)
 
         theta_new, accepted, _ = rw_mh_step(theta0=theta, logp_fn=logp_r, k=k, rng=rng)
         return theta_new, accepted
@@ -238,7 +217,7 @@ def _make_step_beta(
                 njt=njt,
             )
             lp = posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
-            return tf.cast(ll, tf.float64) + tf.cast(lp, tf.float64)
+            return ll + lp
 
         theta_new, accepted = tmh_step(
             theta0=theta, logp_fn=logp_beta, ridge=ridge_t, rng=rng, k=k
@@ -457,16 +436,16 @@ def _tune_r(
         q0t=q0t,
         pjt=pjt,
         wjt=wjt,
-        beta_p=tf.convert_to_tensor(shrink.beta_p, tf.float64),
-        beta_w=tf.convert_to_tensor(shrink.beta_w, tf.float64),
+        beta_p=shrink.beta_p,
+        beta_w=shrink.beta_w,
         E_bar=E_bar,
         njt=njt,
     )
 
     k_r_tuned, acc_r, _ = tune_k(
-        theta0=tf.cast(theta_r0, tf.float64),
+        theta0=theta_r0,
         step_fn=step_r,
-        k0=tf.cast(k_r0, tf.float64),
+        k0=k_r0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
@@ -498,9 +477,7 @@ def _tune_beta(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
 ) -> Tuple[tf.Tensor, tf.Tensor]:
-    beta0 = tf.stack(
-        [tf.cast(shrink.beta_p, tf.float64), tf.cast(shrink.beta_w, tf.float64)], axis=0
-    )
+    beta0 = tf.stack([shrink.beta_p, shrink.beta_w], axis=0)
 
     step_beta = _make_step_beta(
         posterior=shrink.posterior,
@@ -509,7 +486,7 @@ def _tune_beta(
         q0t=q0t,
         pjt=pjt,
         wjt=wjt,
-        r_fixed=tf.cast(shrink.r, tf.float64),
+        r_fixed=shrink.r,
         E_bar=E_bar,
         njt=njt,
         ridge_t=ridge_t,
@@ -518,7 +495,7 @@ def _tune_beta(
     k_beta_tuned, acc_beta, _ = tune_k(
         theta0=beta0,
         step_fn=step_beta,
-        k0=tf.cast(k_beta0, tf.float64),
+        k0=k_beta0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
@@ -543,7 +520,7 @@ def _tune_E_bar(
     factor_rw: float,
     k_E_bar0: tf.Tensor,
 ) -> Tuple[tf.Tensor, tf.Tensor]:
-    k_E_bar = tf.cast(k_E_bar0, tf.float64)
+    k_E_bar = k_E_bar0
     eps_k = tf.constant(1e-12, tf.float64)
 
     pilot_length_t = tf.constant(int(pilot_length), tf.int32)
@@ -551,19 +528,18 @@ def _tune_E_bar(
     target_high_t = tf.constant(float(target_high), tf.float64)
     factor_rw_t = tf.constant(float(factor_rw), tf.float64)
 
-    qjt = tf.convert_to_tensor(shrink.qjt, tf.float64)
-    q0t = tf.convert_to_tensor(shrink.q0t, tf.float64)
-    pjt = tf.convert_to_tensor(shrink.pjt, tf.float64)
-    wjt = tf.convert_to_tensor(shrink.wjt, tf.float64)
-    njt = tf.convert_to_tensor(shrink.njt, tf.float64)
-    gamma = tf.convert_to_tensor(shrink.gamma, tf.float64)
-    phi = tf.convert_to_tensor(shrink.phi, tf.float64)
+    qjt = shrink.qjt
+    q0t = shrink.q0t
+    pjt = shrink.pjt
+    wjt = shrink.wjt
+    njt = shrink.njt.read_value()
+    gamma = shrink.gamma.read_value()
+    phi = shrink.phi.read_value()
+    beta_p = shrink.beta_p
+    beta_w = shrink.beta_w
+    r = shrink.r
 
-    beta_p = tf.convert_to_tensor(shrink.beta_p, tf.float64)
-    beta_w = tf.convert_to_tensor(shrink.beta_w, tf.float64)
-    r = tf.convert_to_tensor(shrink.r, tf.float64)
-
-    E_bar_vec0 = tf.convert_to_tensor(shrink.E_bar, tf.float64)
+    E_bar_vec0 = shrink.E_bar.read_value()
     total_steps = tf.cast(tf.size(E_bar_vec0) * pilot_length, tf.float64)
 
     print(
@@ -638,7 +614,7 @@ def _tune_njt(
     k_njt0: tf.Tensor,
     ridge_t: tf.Tensor,
 ) -> Tuple[tf.Tensor, tf.Tensor]:
-    k_njt = tf.cast(k_njt0, tf.float64)
+    k_njt = k_njt0
     eps_k = tf.constant(1e-12, tf.float64)
 
     pilot_length_t = tf.constant(int(pilot_length), tf.int32)
@@ -646,17 +622,16 @@ def _tune_njt(
     target_high_t = tf.constant(float(target_high), tf.float64)
     factor_tmh_t = tf.constant(float(factor_tmh), tf.float64)
 
-    qjt = tf.convert_to_tensor(shrink.qjt, tf.float64)
-    q0t = tf.convert_to_tensor(shrink.q0t, tf.float64)
-    pjt = tf.convert_to_tensor(shrink.pjt, tf.float64)
-    wjt = tf.convert_to_tensor(shrink.wjt, tf.float64)
-    gamma = tf.convert_to_tensor(shrink.gamma, tf.float64)
-    phi = tf.convert_to_tensor(shrink.phi, tf.float64)
-    E_bar = tf.convert_to_tensor(shrink.E_bar, tf.float64)
-
-    beta_p = tf.convert_to_tensor(shrink.beta_p, tf.float64)
-    beta_w = tf.convert_to_tensor(shrink.beta_w, tf.float64)
-    r = tf.convert_to_tensor(shrink.r, tf.float64)
+    qjt = shrink.qjt
+    q0t = shrink.q0t
+    pjt = shrink.pjt
+    wjt = shrink.wjt
+    gamma = shrink.gamma.read_value()
+    phi = shrink.phi.read_value()
+    E_bar = shrink.E_bar.read_value()
+    beta_p = shrink.beta_p
+    beta_w = shrink.beta_w
+    r = shrink.r
 
     # Precompute per-market mode (mu_t) once in Python via L-BFGS.
     mu_list = []
@@ -690,7 +665,7 @@ def _tune_njt(
     T_int = int(shrink.T)
     for t in range(T_int):
         logp_t = _make_logp_njt_full(t)
-        theta0_t = tf.cast(tf.convert_to_tensor(shrink.njt[t]), tf.float64)
+        theta0_t = shrink.njt[t]
         mu_t = _lbfgs_mode(theta0_t, logp_t)
         mu_list.append(mu_t)
 
@@ -809,12 +784,12 @@ def tune_shrinkage(shrink):
     k_beta0 = _lu_k0(tf.constant(2.0, tf.float64))
     k_E_bar0 = _lu_k0(tf.constant(1.0, tf.float64))
 
-    njt0_any = tf.convert_to_tensor(shrink.njt[0], dtype=tf.float64)
+    njt0_any = shrink.njt[0]
     J_static = njt0_any.shape[0]
     J_int = (
         int(J_static) if J_static is not None else int(tf.shape(njt0_any)[0].numpy())
     )
-    k_njt0 = _lu_k0(tf.cast(tf.constant(J_int), tf.float64))
+    k_njt0 = _lu_k0(tf.constant(J_int))
 
     print(
         "[LuShrinkage:Tune] begin | pilot_length=",
@@ -834,7 +809,16 @@ def tune_shrinkage(shrink):
         f"k_njt0={float(k_njt0.numpy()):.4f}"
     )
 
-    qjt, q0t, pjt, wjt, E_bar, njt = _stack_global_data(shrink)
+    qjt = shrink.qjt
+    q0t = shrink.q0t
+    pjt = shrink.pjt
+    wjt = shrink.wjt
+    E_bar = (
+        shrink.E_bar.read_value()
+        if hasattr(shrink.E_bar, "read_value")
+        else shrink.E_bar
+    )
+    njt = shrink.njt.read_value() if hasattr(shrink.njt, "read_value") else shrink.njt
 
     k_r_tuned, _ = _tune_r(
         shrink=shrink,

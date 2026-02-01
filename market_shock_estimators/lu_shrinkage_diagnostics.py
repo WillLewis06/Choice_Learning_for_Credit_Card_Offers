@@ -14,7 +14,6 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
 
     TF-compatible: uses tf.print (no .numpy(), no Python floats).
     """
-    it_t = tf.convert_to_tensor(it)
 
     beta_p = tf.identity(shrink.beta_p)
     beta_w = tf.identity(shrink.beta_w)
@@ -23,12 +22,12 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
     E_bar_norm = tf.norm(shrink.E_bar)
     njt_norm = tf.norm(shrink.njt)
 
-    gamma_mean = tf.reduce_mean(tf.cast(shrink.gamma, tf.float64))
+    gamma_mean = tf.reduce_mean(shrink.gamma)
     phi_mean = tf.reduce_mean(shrink.phi)
 
     tf.print(
         "[LuShrinkage] it=",
-        it_t,
+        it,
         " | beta_p=",
         round4(beta_p),
         ", beta_w=",
@@ -94,7 +93,7 @@ class LuShrinkageDiagnostics:
         self.sum_E_bar.assign_add(shrink.E_bar)
         self.sum_njt.assign_add(shrink.njt)
         self.sum_phi.assign_add(shrink.phi)
-        self.sum_gamma.assign_add(tf.cast(shrink.gamma, tf.float64))
+        self.sum_gamma.assign_add(shrink.gamma)
 
     @tf.function
     def step(self, shrink: "LuShrinkageEstimator", it) -> None:
