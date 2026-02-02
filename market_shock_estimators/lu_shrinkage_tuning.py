@@ -1,12 +1,16 @@
-# lu_shrinkage_tuning.py
+# market_shock_estimators/lu_shrinkage_tuning.py
 from __future__ import annotations
 
 from typing import Callable, Tuple
 
 import tensorflow as tf
-import tensorflow_probability as tfp
 
-from market_shock_estimators.lu_shrinkage_kernels import rw_mh_step, tmh_step
+from market_shock_estimators.lu_shrinkage_updates import (
+    update_E_bar,
+    update_beta,
+    update_njt,
+    update_r,
+)
 
 
 def _lu_k0(d: tf.Tensor) -> tf.Tensor:
@@ -17,56 +21,23 @@ def _lu_k0(d: tf.Tensor) -> tf.Tensor:
     )
 
 
-def _lbfgs_mode(
-    theta0: tf.Tensor, logp_fn: Callable[[tf.Tensor], tf.Tensor]
-) -> tf.Tensor:
-    """Return argmax_theta logp_fn(theta) via L-BFGS starting from theta0."""
-    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
-
-    def val_and_grad(x):
-        x = tf.convert_to_tensor(x, dtype=tf.float64)
-        with tf.GradientTape() as tape:
-            tape.watch(x)
-            val = -logp_fn(x)
-        g = tape.gradient(val, x)
-        return val, g
-
-    res = tfp.optimizer.lbfgs_minimize(val_and_grad, initial_position=theta0)
-    return tf.where(res.converged, res.position, theta0)
-
-
-def _pilot_run(
-    theta0: tf.Tensor,
-    k: tf.Tensor,
-    pilot_length_t: tf.Tensor,
-    step_fn: Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]],
-) -> Tuple[tf.Tensor, tf.Tensor]:
+def _leading_none_shape_invariant(shape: tf.TensorShape) -> tf.TensorShape:
     """
-    Run a pilot chain of length `pilot_length_t` in TF control flow.
-
-    Returns:
-      theta_end: final state
-      acc_sum: float64 scalar acceptance count
+    Shape invariant for tf.while_loop loop-carried state:
+      - rank 0: unchanged
+      - rank >= 1: first dim set to None, remaining dims preserved if known
     """
-    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
-    k = tf.convert_to_tensor(k, dtype=tf.float64)
-    pilot_length_t = tf.convert_to_tensor(pilot_length_t, dtype=tf.int32)
-
-    def cond(i, theta, acc_sum):
-        return i < pilot_length_t
-
-    def body(i, theta, acc_sum):
-        theta_new, accepted = step_fn(theta, k)
-        acc_sum = acc_sum + tf.cast(accepted, tf.float64)
-        return i + 1, theta_new, acc_sum
-
-    i0 = tf.constant(0, tf.int32)
-    acc0 = tf.constant(0.0, tf.float64)
-    _, theta_end, acc_sum = tf.while_loop(cond, body, loop_vars=(i0, theta0, acc0))
-    return theta_end, acc_sum
+    if shape.rank is None:
+        return tf.TensorShape(None)
+    if shape.rank == 0:
+        return shape
+    dims = shape.as_list()
+    dims[0] = None
+    return tf.TensorShape(dims)
 
 
 def tune_k(
+    *,
     theta0: tf.Tensor,
     step_fn: Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]],
     k0: tf.Tensor,
@@ -75,684 +46,96 @@ def tune_k(
     target_high: float,
     max_rounds: int,
     factor: float,
-) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    name: str,
+) -> Tuple[tf.Tensor, float, tf.Tensor]:
     """
-    Iteratively tune a scalar proposal scale k to an acceptance band.
+    Generic step-size tuner with one-line per-round diagnostics.
 
-    Each round:
-      - run a pilot chain of length `pilot_length` (in TF)
-      - compute acceptance rate
-      - adjust k multiplicatively until acc in [target_low, target_high]
-        or max_rounds reached
+    Runs short pilot chains of length `pilot_length` and adapts scalar k so that the
+    average per-iteration acceptance rate lies in [target_low, target_high].
 
-    Returns (k_tuned, acc_rate_last, theta_end_last_round).
+    Conventions:
+      - step_fn(theta, k) -> (theta_new, acc_inc)
+      - acc_inc is a float64 scalar in [0, 1]
+        * for scalar proposals: 0/1
+        * for batched proposals: mean acceptance across the batch in that step
     """
     if pilot_length <= 0:
-        raise ValueError("pilot_length must be positive.")
+        raise ValueError("pilot_length must be positive")
     if max_rounds <= 0:
-        raise ValueError("max_rounds must be positive.")
-    if not (0.0 < target_low < target_high < 1.0):
-        raise ValueError("Require 0 < target_low < target_high < 1.")
+        raise ValueError("max_rounds must be positive")
+    if factor <= 1.0:
+        raise ValueError("factor must be > 1.0")
+    if not (0.0 <= target_low <= target_high <= 1.0):
+        raise ValueError("target_low/target_high must satisfy 0<=low<=high<=1")
 
-    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
-    k = tf.maximum(
-        tf.convert_to_tensor(k0, dtype=tf.float64), tf.constant(1e-12, tf.float64)
-    )
+    pilot_length_t = tf.constant(int(pilot_length), dtype=tf.int32)
+    k = tf.convert_to_tensor(k0, dtype=tf.float64)
+    theta = tf.convert_to_tensor(theta0, dtype=tf.float64)
 
-    pilot_length_t = tf.constant(int(pilot_length), tf.int32)
-    target_low_t = tf.constant(float(target_low), tf.float64)
-    target_high_t = tf.constant(float(target_high), tf.float64)
+    theta_inv_shape = _leading_none_shape_invariant(theta.shape)
     factor_t = tf.constant(float(factor), tf.float64)
 
-    last_acc = tf.constant(0.0, tf.float64)
-    last_theta_end = tf.identity(theta0)
+    # Compile one pilot runner per step_fn to avoid passing Python callables as
+    # tf.function arguments.
+    @tf.function(reduce_retracing=True)
+    def _pilot(theta_in: tf.Tensor, k_in: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        i0 = tf.constant(0, tf.int32)
+        acc0 = tf.constant(0.0, tf.float64)
 
-    step_name = getattr(step_fn, "__name__", "step")
-    print(
-        f"[LuShrinkage:Tune:{step_name}] start | "
-        f"pilot_length={pilot_length} | target=[{target_low},{target_high}] | "
-        f"max_rounds={max_rounds} | k0={float(k.numpy()):.4f}"
-    )
+        def cond(i, theta_cur, acc_sum):
+            return i < pilot_length_t
 
-    @tf.function
-    def _pilot(theta_init: tf.Tensor, k_in: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        return _pilot_run(theta_init, k_in, pilot_length_t, step_fn)
+        def body(i, theta_cur, acc_sum):
+            theta_new, acc_inc = step_fn(theta_cur, k_in)
+            acc_sum = acc_sum + tf.cast(acc_inc, tf.float64)
+            return i + 1, theta_new, acc_sum
 
-    for r in range(int(max_rounds)):
-        theta_end, acc_sum = _pilot(theta0, k)
-        acc_rate = acc_sum / tf.cast(pilot_length, tf.float64)
+        _, theta_out, acc_sum = tf.while_loop(
+            cond,
+            body,
+            loop_vars=(i0, theta_in, acc0),
+            shape_invariants=(i0.shape, theta_inv_shape, acc0.shape),
+            parallel_iterations=1,
+        )
+        return theta_out, acc_sum
 
-        last_acc = acc_rate
-        last_theta_end = theta_end
+    last_acc_rate = 0.0
+    last_theta = theta
 
-        decision = "keep"
-        if acc_rate < target_low_t:
-            decision = "shrink"
-        elif acc_rate > target_high_t:
-            decision = "grow"
+    for round_id in range(int(max_rounds)):
+        theta_end, acc_sum = _pilot(theta, k)
+        acc_rate = float((acc_sum / tf.cast(pilot_length_t, tf.float64)).numpy())
+
+        k_before = float(k.numpy())
+
+        if acc_rate < target_low:
+            action = "shrink"
+            k = k / factor_t
+        elif acc_rate > target_high:
+            action = "grow"
+            k = k * factor_t
+        else:
+            action = "ok"
+
+        k_after = float(k.numpy())
 
         print(
-            f"[LuShrinkage:Tune:{step_name}] "
-            f"round={r} | k={float(k.numpy()):.4f} | "
-            f"acc={float(acc_rate.numpy()):.3f} | action={decision}"
+            f"[LuShrinkage:Tune:{name}] "
+            f"round={round_id} | "
+            f"k={k_before:.4f}->{k_after:.4f} | "
+            f"acc={acc_rate:.3f} | "
+            f"action={action}"
         )
 
-        if acc_rate < target_low_t:
-            k = tf.maximum(k / factor_t, tf.constant(1e-12, tf.float64))
-            continue
+        last_acc_rate = acc_rate
+        last_theta = theta_end
+        theta = theta_end
 
-        if acc_rate > target_high_t:
-            k = tf.maximum(k * factor_t, tf.constant(1e-12, tf.float64))
-            continue
+        if action == "ok":
+            break
 
-        break
-
-    print(
-        f"[LuShrinkage:Tune:{step_name}] done | "
-        f"k={float(k.numpy()):.4f} | acc={float(last_acc.numpy()):.3f}"
-    )
-    return k, last_acc, last_theta_end
-
-
-def _make_step_r(
-    *,
-    posterior,
-    rng: tf.random.Generator,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    pjt: tf.Tensor,
-    wjt: tf.Tensor,
-    beta_p: tf.Tensor,
-    beta_w: tf.Tensor,
-    E_bar: tf.Tensor,
-    njt: tf.Tensor,
-) -> Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]:
-    def step_r(theta: tf.Tensor, k: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-            ll_t = posterior.loglik_vec(
-                qjt=qjt,
-                q0t=q0t,
-                pjt=pjt,
-                wjt=wjt,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r_val,
-                E_bar=E_bar,
-                njt=njt,
-            )
-            ll = tf.reduce_sum(ll_t)
-            lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_val)
-            return ll + lp
-
-        theta_new, accepted, _ = rw_mh_step(theta0=theta, logp_fn=logp_r, k=k, rng=rng)
-        return theta_new, accepted
-
-    return step_r
-
-
-def _make_step_beta(
-    *,
-    posterior,
-    rng: tf.random.Generator,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    pjt: tf.Tensor,
-    wjt: tf.Tensor,
-    r_fixed: tf.Tensor,
-    E_bar: tf.Tensor,
-    njt: tf.Tensor,
-    ridge_t: tf.Tensor,
-) -> Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]:
-    def step_beta(theta: tf.Tensor, k: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        def logp_beta(beta_vec: tf.Tensor) -> tf.Tensor:
-            beta_p = beta_vec[0]
-            beta_w = beta_vec[1]
-            ll_t = posterior.loglik_vec(
-                qjt=qjt,
-                q0t=q0t,
-                pjt=pjt,
-                wjt=wjt,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r_fixed,
-                E_bar=E_bar,
-                njt=njt,
-            )
-            ll = tf.reduce_sum(ll_t)
-
-            # includes r term too, constant here since r_fixed is fixed
-            lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_fixed)
-            return ll + lp
-
-        theta_new, accepted = tmh_step(
-            theta0=theta, logp_fn=logp_beta, ridge=ridge_t, rng=rng, k=k
-        )
-        return theta_new, accepted
-
-    return step_beta
-
-
-@tf.function
-def _pilot_E_bar_all_markets(
-    *,
-    E_bar_vec: tf.Tensor,  # (T,)
-    k_run: tf.Tensor,  # scalar
-    pilot_length_t: tf.Tensor,  # int32 scalar
-    qjt: tf.Tensor,  # (T,J)
-    q0t: tf.Tensor,  # (T,)
-    pjt: tf.Tensor,  # (T,J)
-    wjt: tf.Tensor,  # (T,J)
-    beta_p: tf.Tensor,  # scalar
-    beta_w: tf.Tensor,  # scalar
-    r: tf.Tensor,  # scalar
-    njt: tf.Tensor,  # (T,J)
-    gamma: tf.Tensor,  # (T,J)
-    phi: tf.Tensor,  # (T,)
-    posterior,
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """
-    Run RW-MH pilots for all markets' E_bar in TF control flow.
-
-    Returns:
-      E_bar_new: (T,)
-      acc_sum: float64 scalar
-    """
-    E_bar_vec = tf.convert_to_tensor(E_bar_vec, tf.float64)
-    T_t = tf.shape(E_bar_vec)[0]
-    k_run = tf.convert_to_tensor(k_run, tf.float64)
-    pilot_length_t = tf.convert_to_tensor(pilot_length_t, tf.int32)
-
-    ta = tf.TensorArray(tf.float64, size=T_t)
-    ta = ta.unstack(E_bar_vec)
-
-    def cond_t(t, ta_in, acc_sum):
-        return t < T_t
-
-    def body_t(t, ta_in, acc_sum):
-        E_bar_t = ta_in.read(t)
-
-        qjt_t = qjt[t]
-        q0t_t = q0t[t]
-        pjt_t = pjt[t]
-        wjt_t = wjt[t]
-        njt_t = njt[t]
-        gamma_t = gamma[t]
-        phi_t = phi[t]
-
-        def logp_E_bar_t(E_bar_t_val: tf.Tensor) -> tf.Tensor:
-            ll = posterior.market_loglik(
-                qjt_t=qjt_t,
-                q0t_t=q0t_t,
-                pjt_t=pjt_t,
-                wjt_t=wjt_t,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar_t_val,
-                njt_t=njt_t,
-            )
-
-            lp_1 = posterior.logprior_market_vec(
-                E_bar=tf.reshape(E_bar_t_val, (1,)),
-                njt=tf.expand_dims(njt_t, axis=0),
-                gamma=tf.expand_dims(gamma_t, axis=0),
-                phi=tf.reshape(phi_t, (1,)),
-            )
-            return ll + lp_1[0]
-
-        def cond_s(s, theta, acc_sum_s):
-            return s < pilot_length_t
-
-        def body_s(s, theta, acc_sum_s):
-            theta_new, accepted, _ = rw_mh_step(
-                theta0=theta, logp_fn=logp_E_bar_t, k=k_run, rng=rng
-            )
-            acc_sum_s = acc_sum_s + tf.cast(accepted, tf.float64)
-            return s + 1, theta_new, acc_sum_s
-
-        s0 = tf.constant(0, tf.int32)
-        _, E_bar_t_new, acc_sum = tf.while_loop(
-            cond_s, body_s, loop_vars=(s0, E_bar_t, acc_sum)
-        )
-
-        ta_out = ta_in.write(t, E_bar_t_new)
-        return t + 1, ta_out, acc_sum
-
-    t0 = tf.constant(0, tf.int32)
-    acc0 = tf.constant(0.0, tf.float64)
-    _, ta_out, acc_sum = tf.while_loop(cond_t, body_t, loop_vars=(t0, ta, acc0))
-    return ta_out.stack(), acc_sum
-
-
-@tf.function
-def _pilot_njt_all_markets(
-    *,
-    njt_mat: tf.Tensor,  # (T,J)
-    k_run: tf.Tensor,  # scalar
-    pilot_length_t: tf.Tensor,  # int32 scalar
-    ridge_t: tf.Tensor,  # scalar
-    qjt: tf.Tensor,  # (T,J)
-    q0t: tf.Tensor,  # (T,)
-    pjt: tf.Tensor,  # (T,J)
-    wjt: tf.Tensor,  # (T,J)
-    beta_p: tf.Tensor,  # scalar
-    beta_w: tf.Tensor,  # scalar
-    r: tf.Tensor,  # scalar
-    E_bar: tf.Tensor,  # (T,)
-    gamma: tf.Tensor,  # (T,J)
-    phi: tf.Tensor,  # (T,)
-    posterior,
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """
-    Run TMH pilots for all markets' njt in TF control flow.
-
-    Returns:
-      njt_new: (T,J)
-      acc_sum: float64 scalar
-    """
-    njt_mat = tf.convert_to_tensor(njt_mat, tf.float64)
-    T_t = tf.shape(njt_mat)[0]
-    k_run = tf.convert_to_tensor(k_run, tf.float64)
-    pilot_length_t = tf.convert_to_tensor(pilot_length_t, tf.int32)
-    ridge_t = tf.convert_to_tensor(ridge_t, tf.float64)
-
-    ta = tf.TensorArray(tf.float64, size=T_t)
-    ta = ta.unstack(njt_mat)
-
-    def cond_t(t, ta_in, acc_sum):
-        return t < T_t
-
-    def body_t(t, ta_in, acc_sum):
-        theta = ta_in.read(t)
-
-        qjt_t = qjt[t]
-        q0t_t = q0t[t]
-        pjt_t = pjt[t]
-        wjt_t = wjt[t]
-        gamma_t = gamma[t]
-        phi_t = phi[t]
-        E_bar_t = E_bar[t]
-
-        def logp_njt_t(njt_t_val: tf.Tensor) -> tf.Tensor:
-            ll = posterior.market_loglik(
-                qjt_t=qjt_t,
-                q0t_t=q0t_t,
-                pjt_t=pjt_t,
-                wjt_t=wjt_t,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar_t,
-                njt_t=njt_t_val,
-            )
-
-            lp_1 = posterior.logprior_market_vec(
-                E_bar=tf.reshape(E_bar_t, (1,)),
-                njt=tf.expand_dims(njt_t_val, axis=0),
-                gamma=tf.expand_dims(gamma_t, axis=0),
-                phi=tf.reshape(phi_t, (1,)),
-            )
-            return ll + lp_1[0]
-
-        def cond_s(s, theta_s, acc_sum_s):
-            return s < pilot_length_t
-
-        def body_s(s, theta_s, acc_sum_s):
-            theta_new, accepted = tmh_step(
-                theta0=theta_s,
-                logp_fn=logp_njt_t,
-                ridge=ridge_t,
-                rng=rng,
-                k=k_run,
-            )
-            acc_sum_s = acc_sum_s + tf.cast(accepted, tf.float64)
-            return s + 1, theta_new, acc_sum_s
-
-        s0 = tf.constant(0, tf.int32)
-        _, theta_new, acc_sum = tf.while_loop(
-            cond_s, body_s, loop_vars=(s0, theta, acc_sum)
-        )
-
-        ta_out = ta_in.write(t, theta_new)
-        return t + 1, ta_out, acc_sum
-
-    t0 = tf.constant(0, tf.int32)
-    acc0 = tf.constant(0.0, tf.float64)
-    _, ta_out, acc_sum = tf.while_loop(cond_t, body_t, loop_vars=(t0, ta, acc0))
-    return ta_out.stack(), acc_sum
-
-
-def _tune_r(
-    *,
-    shrink,
-    pilot_length: int,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor_rw: float,
-    k_r0: tf.Tensor,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    pjt: tf.Tensor,
-    wjt: tf.Tensor,
-    E_bar: tf.Tensor,
-    njt: tf.Tensor,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    theta_r0 = (
-        shrink.r.read_value()
-        if hasattr(shrink.r, "read_value")
-        else tf.convert_to_tensor(shrink.r, tf.float64)
-    )
-
-    step_r = _make_step_r(
-        posterior=shrink.posterior,
-        rng=shrink.rng,
-        qjt=qjt,
-        q0t=q0t,
-        pjt=pjt,
-        wjt=wjt,
-        beta_p=shrink.beta_p,
-        beta_w=shrink.beta_w,
-        E_bar=E_bar,
-        njt=njt,
-    )
-
-    k_r_tuned, acc_r, _ = tune_k(
-        theta0=theta_r0,
-        step_fn=step_r,
-        k0=k_r0,
-        pilot_length=pilot_length,
-        target_low=target_low,
-        target_high=target_high,
-        max_rounds=max_rounds,
-        factor=factor_rw,
-    )
-    print(
-        f"[LuShrinkage:Tune] k_r final: "
-        f"{float(k_r0.numpy()):.4f} -> {float(k_r_tuned.numpy()):.4f} | "
-        f"acc={float(acc_r.numpy()):.3f}"
-    )
-    return k_r_tuned, acc_r
-
-
-def _tune_beta(
-    *,
-    shrink,
-    pilot_length: int,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor_tmh: float,
-    k_beta0: tf.Tensor,
-    ridge_t: tf.Tensor,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    pjt: tf.Tensor,
-    wjt: tf.Tensor,
-    E_bar: tf.Tensor,
-    njt: tf.Tensor,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    beta0 = tf.stack([shrink.beta_p, shrink.beta_w], axis=0)
-
-    step_beta = _make_step_beta(
-        posterior=shrink.posterior,
-        rng=shrink.rng,
-        qjt=qjt,
-        q0t=q0t,
-        pjt=pjt,
-        wjt=wjt,
-        r_fixed=shrink.r,
-        E_bar=E_bar,
-        njt=njt,
-        ridge_t=ridge_t,
-    )
-
-    k_beta_tuned, acc_beta, _ = tune_k(
-        theta0=beta0,
-        step_fn=step_beta,
-        k0=k_beta0,
-        pilot_length=pilot_length,
-        target_low=target_low,
-        target_high=target_high,
-        max_rounds=max_rounds,
-        factor=factor_tmh,
-    )
-    print(
-        f"[LuShrinkage:Tune] k_beta final: "
-        f"{float(k_beta0.numpy()):.4f} -> {float(k_beta_tuned.numpy()):.4f} | "
-        f"acc={float(acc_beta.numpy()):.3f}"
-    )
-    return k_beta_tuned, acc_beta
-
-
-def _tune_E_bar(
-    *,
-    shrink,
-    pilot_length: int,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor_rw: float,
-    k_E_bar0: tf.Tensor,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    k_E_bar = k_E_bar0
-    eps_k = tf.constant(1e-12, tf.float64)
-
-    pilot_length_t = tf.constant(int(pilot_length), tf.int32)
-    target_low_t = tf.constant(float(target_low), tf.float64)
-    target_high_t = tf.constant(float(target_high), tf.float64)
-    factor_rw_t = tf.constant(float(factor_rw), tf.float64)
-
-    qjt = shrink.qjt
-    q0t = shrink.q0t
-    pjt = shrink.pjt
-    wjt = shrink.wjt
-    njt = shrink.njt.read_value()
-    gamma = shrink.gamma.read_value()
-    phi = shrink.phi.read_value()
-    beta_p = shrink.beta_p
-    beta_w = shrink.beta_w
-    r = shrink.r
-
-    E_bar_vec0 = shrink.E_bar.read_value()
-    total_steps = tf.cast(tf.size(E_bar_vec0) * pilot_length, tf.float64)
-
-    print(
-        "[LuShrinkage:Tune:E_bar] start | "
-        f"target=[{target_low},{target_high}] | max_rounds={max_rounds} | "
-        f"steps_per_round={int(total_steps.numpy())}"
-    )
-
-    E_bar_vec = tf.identity(E_bar_vec0)
-    acc_E_bar = tf.constant(0.0, tf.float64)
-
-    for r_i in range(int(max_rounds)):
-        k_run = tf.maximum(k_E_bar, eps_k)
-        E_bar_vec, acc_sum = _pilot_E_bar_all_markets(
-            E_bar_vec=E_bar_vec,
-            k_run=k_run,
-            pilot_length_t=pilot_length_t,
-            qjt=qjt,
-            q0t=q0t,
-            pjt=pjt,
-            wjt=wjt,
-            beta_p=beta_p,
-            beta_w=beta_w,
-            r=r,
-            njt=njt,
-            gamma=gamma,
-            phi=phi,
-            posterior=shrink.posterior,
-            rng=shrink.rng,
-        )
-
-        acc_E_bar = acc_sum / total_steps
-
-        decision = "keep"
-        if acc_E_bar < target_low_t:
-            decision = "shrink"
-        elif acc_E_bar > target_high_t:
-            decision = "grow"
-
-        print(
-            f"[LuShrinkage:Tune:E_bar] "
-            f"round={r_i} | k={float(k_E_bar.numpy()):.4f} | "
-            f"acc={float(acc_E_bar.numpy()):.3f} | action={decision}"
-        )
-
-        if acc_E_bar < target_low_t:
-            k_E_bar = tf.maximum(k_E_bar / factor_rw_t, eps_k)
-            continue
-
-        if acc_E_bar > target_high_t:
-            k_E_bar = tf.maximum(k_E_bar * factor_rw_t, eps_k)
-            continue
-
-        break
-
-    print(
-        f"[LuShrinkage:Tune] k_E_bar final: "
-        f"{float(k_E_bar0.numpy()):.4f} -> {float(k_E_bar.numpy()):.4f} | "
-        f"acc={float(acc_E_bar.numpy()):.3f}"
-    )
-    return k_E_bar, acc_E_bar
-
-
-def _tune_njt(
-    *,
-    shrink,
-    pilot_length: int,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor_tmh: float,
-    k_njt0: tf.Tensor,
-    ridge_t: tf.Tensor,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    k_njt = k_njt0
-    eps_k = tf.constant(1e-12, tf.float64)
-
-    pilot_length_t = tf.constant(int(pilot_length), tf.int32)
-    target_low_t = tf.constant(float(target_low), tf.float64)
-    target_high_t = tf.constant(float(target_high), tf.float64)
-    factor_tmh_t = tf.constant(float(factor_tmh), tf.float64)
-
-    qjt = shrink.qjt
-    q0t = shrink.q0t
-    pjt = shrink.pjt
-    wjt = shrink.wjt
-    gamma = shrink.gamma.read_value()
-    phi = shrink.phi.read_value()
-    E_bar = shrink.E_bar.read_value()
-    beta_p = shrink.beta_p
-    beta_w = shrink.beta_w
-    r = shrink.r
-
-    # Precompute per-market mode (mu_t) once in Python via L-BFGS.
-    mu_list = []
-
-    def _make_logp_njt_full(t_: int):
-        qjt_t = qjt[t_]
-        q0t_t = q0t[t_]
-        pjt_t = pjt[t_]
-        wjt_t = wjt[t_]
-        gamma_t = gamma[t_]
-        phi_t = phi[t_]
-        E_bar_t = E_bar[t_]
-
-        def logp_njt_full(njt_t_val: tf.Tensor) -> tf.Tensor:
-            ll = shrink.posterior.market_loglik(
-                qjt_t=qjt_t,
-                q0t_t=q0t_t,
-                pjt_t=pjt_t,
-                wjt_t=wjt_t,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar_t,
-                njt_t=njt_t_val,
-            )
-            lp_1 = shrink.posterior.logprior_market_vec(
-                E_bar=tf.reshape(E_bar_t, (1,)),
-                njt=tf.expand_dims(njt_t_val, axis=0),
-                gamma=tf.expand_dims(gamma_t, axis=0),
-                phi=tf.reshape(phi_t, (1,)),
-            )
-            return ll + lp_1[0]
-
-        return logp_njt_full
-
-    T_int = int(shrink.T)
-    for t in range(T_int):
-        logp_t = _make_logp_njt_full(t)
-        theta0_t = shrink.njt[t]
-        mu_t = _lbfgs_mode(theta0_t, logp_t)
-        mu_list.append(mu_t)
-
-    njt_mat = tf.stack(mu_list, axis=0)  # (T,J)
-    total_steps = tf.cast(tf.shape(njt_mat)[0] * pilot_length, tf.float64)
-
-    print(
-        "[LuShrinkage:Tune:njt] start | "
-        f"target=[{target_low},{target_high}] | max_rounds={max_rounds} | "
-        f"steps_per_round={int(total_steps.numpy())}"
-    )
-
-    acc_njt = tf.constant(0.0, tf.float64)
-
-    for r_i in range(int(max_rounds)):
-        k_run = tf.maximum(k_njt, eps_k)
-        njt_mat, acc_sum = _pilot_njt_all_markets(
-            njt_mat=njt_mat,
-            k_run=k_run,
-            pilot_length_t=pilot_length_t,
-            ridge_t=ridge_t,
-            qjt=qjt,
-            q0t=q0t,
-            pjt=pjt,
-            wjt=wjt,
-            beta_p=beta_p,
-            beta_w=beta_w,
-            r=r,
-            E_bar=E_bar,
-            gamma=gamma,
-            phi=phi,
-            posterior=shrink.posterior,
-            rng=shrink.rng,
-        )
-
-        acc_njt = acc_sum / total_steps
-
-        decision = "keep"
-        if acc_njt < target_low_t:
-            decision = "shrink"
-        elif acc_njt > target_high_t:
-            decision = "grow"
-
-        print(
-            f"[LuShrinkage:Tune:njt] "
-            f"round={r_i} | k={float(k_njt.numpy()):.4f} | "
-            f"acc={float(acc_njt.numpy()):.3f} | action={decision}"
-        )
-
-        if acc_njt < target_low_t:
-            k_njt = tf.maximum(k_njt / factor_tmh_t, eps_k)
-            continue
-
-        if acc_njt > target_high_t:
-            k_njt = tf.maximum(k_njt * factor_tmh_t, eps_k)
-            continue
-
-        break
-
-    print(
-        f"[LuShrinkage:Tune] k_njt final: "
-        f"{float(k_njt0.numpy()):.4f} -> {float(k_njt.numpy()):.4f} | "
-        f"acc={float(acc_njt.numpy()):.3f}"
-    )
-    return k_njt, acc_njt
+    return k, last_acc_rate, last_theta
 
 
 def tune_shrinkage(shrink):
@@ -792,7 +175,7 @@ def tune_shrinkage(shrink):
         )
 
     pilot_length = int(shrink.pilot_length)
-    ridge = float(shrink.ridge)
+    ridge_t = tf.convert_to_tensor(float(shrink.ridge), dtype=tf.float64)
 
     target_low = float(shrink.target_low)
     target_high = float(shrink.target_high)
@@ -800,101 +183,189 @@ def tune_shrinkage(shrink):
     factor_rw = float(shrink.factor_rw)
     factor_tmh = float(shrink.factor_tmh)
 
-    ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
-
+    # Initial k's (Lu scaling).
     k_r0 = _lu_k0(tf.constant(1.0, tf.float64))
     k_beta0 = _lu_k0(tf.constant(2.0, tf.float64))
     k_E_bar0 = _lu_k0(tf.constant(1.0, tf.float64))
 
+    # J for k_njt0.
     njt0_any = shrink.njt[0]
     J_static = njt0_any.shape[0]
-    J_int = (
-        int(J_static) if J_static is not None else int(tf.shape(njt0_any)[0].numpy())
-    )
+    if J_static is None:
+        J_int = int(tf.shape(njt0_any)[0].numpy())
+    else:
+        J_int = int(J_static)
     k_njt0 = _lu_k0(tf.constant(J_int))
 
-    print(
-        "[LuShrinkage:Tune] begin | pilot_length=",
-        pilot_length,
-        "| T=",
-        int(getattr(shrink, "T")),
-        "| J=",
-        J_int,
-        "| ridge=",
-        ridge,
-    )
-    print(
-        f"[LuShrinkage:Tune] k0 defaults | "
-        f"k_r0={float(k_r0.numpy()):.4f} | "
-        f"k_E_bar0={float(k_E_bar0.numpy()):.4f} | "
-        f"k_beta0={float(k_beta0.numpy()):.4f} | "
-        f"k_njt0={float(k_njt0.numpy()):.4f}"
-    )
-
+    # Fixed data tensors.
     qjt = shrink.qjt
     q0t = shrink.q0t
     pjt = shrink.pjt
     wjt = shrink.wjt
-    E_bar = (
+
+    # Fixed "other" parameters for each tuning run (do not mutate shrink state).
+    beta_p0 = (
+        shrink.beta_p.read_value()
+        if hasattr(shrink.beta_p, "read_value")
+        else shrink.beta_p
+    )
+    beta_w0 = (
+        shrink.beta_w.read_value()
+        if hasattr(shrink.beta_w, "read_value")
+        else shrink.beta_w
+    )
+    r0 = shrink.r.read_value() if hasattr(shrink.r, "read_value") else shrink.r
+    E_bar0 = (
         shrink.E_bar.read_value()
         if hasattr(shrink.E_bar, "read_value")
         else shrink.E_bar
     )
-    njt = shrink.njt.read_value() if hasattr(shrink.njt, "read_value") else shrink.njt
+    njt0 = shrink.njt.read_value() if hasattr(shrink.njt, "read_value") else shrink.njt
+    gamma0 = (
+        shrink.gamma.read_value()
+        if hasattr(shrink.gamma, "read_value")
+        else shrink.gamma
+    )
+    phi0 = shrink.phi.read_value() if hasattr(shrink.phi, "read_value") else shrink.phi
 
-    k_r_tuned, _ = _tune_r(
-        shrink=shrink,
+    posterior = shrink.posterior
+    rng = shrink.rng
+
+    # ---- step_r: scalar RW-MH; acc_inc ∈ {0,1}
+    def step_r(theta_r: tf.Tensor, k_r: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        r_new, accepted = update_r(
+            posterior=posterior,
+            rng=rng,
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p0,
+            beta_w=beta_w0,
+            r=theta_r,
+            E_bar=E_bar0,
+            njt=njt0,
+            k_r=k_r,
+        )
+        return r_new, tf.cast(accepted, tf.float64)
+
+    k_r_tuned, _, _ = tune_k(
+        theta0=r0,
+        step_fn=step_r,
+        k0=k_r0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor_rw=factor_rw,
-        k_r0=k_r0,
-        qjt=qjt,
-        q0t=q0t,
-        pjt=pjt,
-        wjt=wjt,
-        E_bar=E_bar,
-        njt=njt,
+        factor=factor_rw,
+        name="r",
     )
 
-    k_beta_tuned, _ = _tune_beta(
-        shrink=shrink,
+    # ---- step_beta: 2D TMH; acc_inc ∈ {0,1}
+    def step_beta(
+        theta_beta: tf.Tensor, k_beta: tf.Tensor
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        bp0 = theta_beta[0]
+        bw0 = theta_beta[1]
+        bp_new, bw_new, accepted = update_beta(
+            posterior=posterior,
+            rng=rng,
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=bp0,
+            beta_w=bw0,
+            r=r0,
+            E_bar=E_bar0,
+            njt=njt0,
+            k_beta=k_beta,
+            ridge=ridge_t,
+        )
+        theta_new = tf.stack([bp_new, bw_new], axis=0)
+        return theta_new, tf.cast(accepted, tf.float64)
+
+    beta_vec0 = tf.stack([beta_p0, beta_w0], axis=0)
+    k_beta_tuned, _, _ = tune_k(
+        theta0=beta_vec0,
+        step_fn=step_beta,
+        k0=k_beta0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor_tmh=factor_tmh,
-        k_beta0=k_beta0,
-        ridge_t=ridge_t,
-        qjt=qjt,
-        q0t=q0t,
-        pjt=pjt,
-        wjt=wjt,
-        E_bar=E_bar,
-        njt=njt,
+        factor=factor_tmh,
+        name="beta",
     )
 
-    k_E_bar_tuned, _ = _tune_E_bar(
-        shrink=shrink,
+    # ---- step_E_bar: batched RW-MH over (T,); acc_inc = mean accept across markets
+    def step_E_bar(
+        theta_E_bar: tf.Tensor, k_E_bar: tf.Tensor
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        E_bar_new, accepted_vec = update_E_bar(
+            posterior=posterior,
+            rng=rng,
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p0,
+            beta_w=beta_w0,
+            r=r0,
+            E_bar=theta_E_bar,
+            njt=njt0,
+            gamma=gamma0,
+            phi=phi0,
+            k_E_bar=k_E_bar,
+        )
+        acc_inc = tf.reduce_mean(tf.cast(accepted_vec, tf.float64))
+        return E_bar_new, acc_inc
+
+    k_E_bar_tuned, _, _ = tune_k(
+        theta0=E_bar0,
+        step_fn=step_E_bar,
+        k0=k_E_bar0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor_rw=factor_rw,
-        k_E_bar0=k_E_bar0,
+        factor=factor_rw,
+        name="E_bar",
     )
 
-    k_njt_tuned, _ = _tune_njt(
-        shrink=shrink,
+    # ---- step_njt: market sweep TMH; acc_inc = mean accept across markets
+    def step_njt(theta_njt: tf.Tensor, k_njt: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        njt_new, acc_sum = update_njt(
+            posterior=posterior,
+            rng=rng,
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p0,
+            beta_w=beta_w0,
+            r=r0,
+            E_bar=E_bar0,
+            njt=theta_njt,
+            gamma=gamma0,
+            phi=phi0,
+            k_njt=k_njt,
+            ridge=ridge_t,
+        )
+        T_t = tf.cast(tf.shape(theta_njt)[0], tf.float64)
+        acc_inc = acc_sum / tf.maximum(T_t, tf.constant(1.0, tf.float64))
+        return njt_new, acc_inc
+
+    k_njt_tuned, _, _ = tune_k(
+        theta0=njt0,
+        step_fn=step_njt,
+        k0=k_njt0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor_tmh=factor_tmh,
-        k_njt0=k_njt0,
-        ridge_t=ridge_t,
+        factor=factor_tmh,
+        name="njt",
     )
 
-    print("[LuShrinkage:Tune] done")
     return k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned
