@@ -288,7 +288,7 @@ class LuShrinkageEstimator:
         def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
             beta_p = theta_vec[0]
             beta_w = theta_vec[1]
-            ll = self.posterior.full_loglik(
+            ll_t = self.posterior.loglik_vec(
                 qjt=self.qjt,
                 q0t=self.q0t,
                 pjt=self.pjt,
@@ -299,7 +299,10 @@ class LuShrinkageEstimator:
                 E_bar=self.E_bar,
                 njt=self.njt,
             )
-            lp = self.posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
+            ll = tf.reduce_sum(ll_t)
+
+            # Global prior includes r as well; r is fixed in this update so that term is constant.
+            lp = self.posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=self.r)
             return ll + lp
 
         beta_new, _ = tmh_step(
@@ -315,7 +318,7 @@ class LuShrinkageEstimator:
     @tf.function(reduce_retracing=True)
     def _update_r(self, k_r: tf.Tensor) -> None:
         def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-            ll = self.posterior.full_loglik(
+            ll_t = self.posterior.loglik_vec(
                 qjt=self.qjt,
                 q0t=self.q0t,
                 pjt=self.pjt,
@@ -326,7 +329,12 @@ class LuShrinkageEstimator:
                 E_bar=self.E_bar,
                 njt=self.njt,
             )
-            lp = self.posterior.logprior_r(r=r_val)
+            ll = tf.reduce_sum(ll_t)
+
+            # Global prior includes beta terms too; beta is fixed here so those terms are constant.
+            lp = self.posterior.logprior_global(
+                beta_p=self.beta_p, beta_w=self.beta_w, r=r_val
+            )
             return ll + lp
 
         r_new, _, _ = rw_mh_step(
@@ -348,7 +356,8 @@ class LuShrinkageEstimator:
 
         def logp_E_bar_vec(E_bar_val: tf.Tensor) -> tf.Tensor:
             # Returns (T,) where entry t is market t log posterior contribution.
-            return self.posterior.market_logpost_batched(
+
+            return self.posterior.logpost_vec(
                 qjt=self.qjt,
                 q0t=self.q0t,
                 pjt=self.pjt,
@@ -407,7 +416,7 @@ class LuShrinkageEstimator:
             phi_t = phi0[t]
 
             def logp_njt_t(njt_t_val: tf.Tensor) -> tf.Tensor:
-                return self.posterior.market_logpost(
+                ll = self.posterior.market_loglik(
                     qjt_t=qjt_t,
                     q0t_t=q0t_t,
                     pjt_t=pjt_t,
@@ -417,9 +426,14 @@ class LuShrinkageEstimator:
                     r=self.r,
                     E_bar_t=E_bar_t,
                     njt_t=njt_t_val,
-                    gamma_t=gamma_t,
-                    phi_t=phi_t,
                 )
+                lp_1 = self.posterior.logprior_market_vec(
+                    E_bar=tf.reshape(E_bar_t, (1,)),
+                    njt=tf.expand_dims(njt_t_val, axis=0),
+                    gamma=tf.expand_dims(gamma_t, axis=0),
+                    phi=tf.reshape(phi_t, (1,)),
+                )
+                return ll + lp_1[0]
 
             njt_new, _ = tmh_step(
                 theta0=njt_t,

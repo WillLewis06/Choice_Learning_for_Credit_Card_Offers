@@ -5,8 +5,8 @@ import tensorflow as tf
 
 class LuPosteriorTF:
     """
-    Lu (2025) shrinkage model posterior pieces (TF-only), aligned with the paper's
-    factorization and MCMC blocking.
+    Lu (2025) shrinkage model posterior pieces (TF-only), organized around a
+    canonical per-market vector factorization.
 
     Model (Section 3/4, simulation uses price-only random coefficient):
       delta_jt = beta_p * pjt + beta_w * wjt + E_bar_t + n_jt
@@ -23,7 +23,13 @@ class LuPosteriorTF:
       log p(q_t | s_t) = q0t*log s0t + sum_j qjt*log sjt + const
     (we drop the combinatorial constant).
 
-    All methods return scalar log-density contributions.
+    Canonical interfaces:
+      - market_loglik(...) -> scalar          (single market)
+      - loglik_vec(...)    -> (T,)            (per-market likelihood vector)
+      - logprior_global(...) -> scalar        (global prior for beta_p,beta_w,r)
+      - logprior_market_vec(...) -> (T,)      (per-market prior contributions)
+      - logpost_vec(...)   -> (T,)            (per-market posterior contributions)
+      - logpost(...)       -> scalar          (full posterior scalar)
     """
 
     def __init__(
@@ -39,7 +45,7 @@ class LuPosteriorTF:
         # Prior on r = log(sigma) (normal)
         r_mean: float = 0.0,
         r_var: float = 0.5,
-        # Prior on E_bar_t (normal): center at Lu Section 4 DGP mean (-1)
+        # Prior on E_bar_t (normal)
         E_bar_mean: float = 0.0,
         E_bar_var: float = 10.0,
         # Spike-and-slab variances for n_jt | gamma_jt
@@ -76,7 +82,6 @@ class LuPosteriorTF:
 
         self.T0_sq = tf.constant(T0_sq, dtype=dtype)
         self.T1_sq = tf.constant(T1_sq, dtype=dtype)
-
         self.log_T0_sq = tf.math.log(self.T0_sq)
         self.log_T1_sq = tf.math.log(self.T1_sq)
 
@@ -86,7 +91,7 @@ class LuPosteriorTF:
         self.two_pi = tf.constant(2.0 * 3.141592653589793, dtype=self.dtype)
 
     # ------------------------------------------------------------------
-    # Likelihood helpers (price-only random coefficient)
+    # Deterministic helpers (price-only random coefficient)
     # ------------------------------------------------------------------
 
     def _mean_utility_jt(
@@ -121,7 +126,6 @@ class LuPosteriorTF:
           sjt_t: (J,)
           s0t : scalar
         """
-
         r = tf.cast(r, self.dtype)
 
         sigma = tf.exp(r)  # scalar
@@ -147,7 +151,7 @@ class LuPosteriorTF:
         return sjt_t, s0t
 
     # ------------------------------------------------------------------
-    # Log likelihood
+    # Likelihood
     # ------------------------------------------------------------------
 
     @tf.function(reduce_retracing=True)
@@ -163,7 +167,7 @@ class LuPosteriorTF:
         r,
         E_bar_t,
         njt_t,
-    ):
+    ) -> tf.Tensor:
         """
         Per-market log likelihood contribution (up to multinomial constant):
           q0t*log s0t + sum_j qjt*log sjt
@@ -189,7 +193,7 @@ class LuPosteriorTF:
         return ll
 
     @tf.function(reduce_retracing=True)
-    def full_loglik(
+    def loglik_vec(
         self,
         *,
         qjt,
@@ -201,10 +205,23 @@ class LuPosteriorTF:
         r,
         E_bar,
         njt,
-    ):
+    ) -> tf.Tensor:
         """
-        Sum of market log-likelihoods over t.
+        Per-market log-likelihood vector.
+
+        Inputs are batched:
+          qjt, pjt, wjt, njt: (T,J)
+          q0t, E_bar: (T,)
+
+        Returns:
+          ll_t: (T,)
         """
+        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)
+        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)
+        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)
+        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)
+        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)
+        njt = tf.convert_to_tensor(njt, dtype=self.dtype)
 
         T = tf.shape(pjt)[0]
 
@@ -221,264 +238,171 @@ class LuPosteriorTF:
                 njt_t=njt[t],
             )
 
-        ll_t = tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
-        return tf.reduce_sum(ll_t)
+        return tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
 
     # ------------------------------------------------------------------
     # Priors
     # ------------------------------------------------------------------
 
-    def logprior_beta(self, *, beta_p, beta_w):
+    def logprior_global(self, *, beta_p, beta_w, r) -> tf.Tensor:
         """
-        log p(beta_p) + log p(beta_w), independent normals (up to constants).
+        Global prior contribution (scalar):
+          log p(beta_p) + log p(beta_w) + log p(r)
         """
         beta_p = tf.cast(beta_p, self.dtype)
         beta_w = tf.cast(beta_w, self.dtype)
+        r = tf.cast(r, self.dtype)
 
-        lp_p = (
+        lp_beta_p = (
             -0.5 * tf.math.log(self.two_pi * self.beta_p_var)
             - 0.5 * tf.square(beta_p - self.beta_p_mean) / self.beta_p_var
         )
-        lp_w = (
+        lp_beta_w = (
             -0.5 * tf.math.log(self.two_pi * self.beta_w_var)
             - 0.5 * tf.square(beta_w - self.beta_w_mean) / self.beta_w_var
         )
-        return lp_p + lp_w
-
-    def logprior_r(self, *, r):
-        """
-        log p(r), normal on r=log(sigma) (up to constants).
-        """
-        r = tf.cast(r, self.dtype)
-        return (
+        lp_r = (
             -0.5 * tf.math.log(self.two_pi * self.r_var)
             - 0.5 * tf.square(r - self.r_mean) / self.r_var
         )
+        return lp_beta_p + lp_beta_w + lp_r
 
-    def logprior_E_bar(self, *, E_bar):
-        """
-        Sum_t log p(E_bar_t), iid normal (up to constants).
-        """
-        T = tf.cast(tf.size(E_bar), self.dtype)
-
-        return -0.5 * T * tf.math.log(
-            self.two_pi * self.E_bar_var
-        ) - 0.5 * tf.reduce_sum(tf.square(E_bar - self.E_bar_mean) / self.E_bar_var)
-
-    def logprior_n(self, *, njt, gamma):
-        """
-        Mixture-of-normals spike-and-slab prior (Lu paper):
-
-          njt_j | gamma_j=1 ~ N(0, T1_sq)
-          njt_j | gamma_j=0 ~ N(0, T0_sq)
-
-        Returns sum_j log N(njt_j; 0, T(gamma_j)).
-        """
-        gamma = tf.cast(gamma, self.dtype)
-
-        # var_j = gamma*T1_sq + (1-gamma)*T0_sq
-        var = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq
-        log_var = gamma * self.log_T1_sq + (1.0 - gamma) * self.log_T0_sq
-
-        return -0.5 * tf.reduce_sum(
-            tf.math.log(self.two_pi) + log_var + tf.square(njt) / var
-        )
-
-    def logprior_gamma(self, *, gamma, phi):
-        """
-        log p(gamma | phi), Bernoulli per j and t.
-
-        gamma : (T,J) or (J,)
-        phi   : (T,) or scalar for market t
-        """
-        gamma = tf.cast(gamma, self.dtype)
-        phi = tf.cast(phi, self.dtype)
-
-        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)
-
-        if gamma.shape.rank == 2 and phi.shape.rank == 1:
-            phi = phi[:, None]
-
-        return tf.reduce_sum(
-            gamma * tf.math.log(phi) + (1.0 - gamma) * tf.math.log(1.0 - phi)
-        )
-
-    def logprior_phi(self, *, phi):
-        """
-        Sum_t log pi(phi_t), Beta(a_phi,b_phi) (up to constants).
-        """
-        phi = tf.cast(phi, self.dtype)
-        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)
-
-        a = self.a_phi
-        b = self.b_phi
-
-        logB = tf.math.lgamma(a) + tf.math.lgamma(b) - tf.math.lgamma(a + b)
-        lp = (a - 1.0) * tf.math.log(phi) + (b - 1.0) * tf.math.log(1.0 - phi) - logB
-        return tf.reduce_sum(lp)
-
-    # ------------------------------------------------------------------
-    # Posterior composition (matches Lu factorization / blocking)
-    # ------------------------------------------------------------------
-
-    def market_logprior(self, *, E_bar_t, njt_t, gamma_t, phi_t):
-        """
-        Market-local prior contribution:
-          log p(E_bar_t) + log p(njt_t | gamma_t) + log p(gamma_t | phi_t) + log pi(phi_t)
-        """
-        E_bar_t = tf.cast(E_bar_t, self.dtype)
-        phi_t = tf.cast(phi_t, self.dtype)
-        return (
-            (
-                -0.5 * tf.math.log(self.two_pi * self.E_bar_var)
-                - 0.5 * tf.square(E_bar_t - self.E_bar_mean) / self.E_bar_var
-            )
-            + self.logprior_n(njt=njt_t, gamma=gamma_t)
-            + self.logprior_gamma(gamma=gamma_t, phi=phi_t)
-            + self.logprior_phi(phi=tf.reshape(phi_t, (1,)))
-        )
-
-    @tf.function(reduce_retracing=True)
-    def market_logpost(
+    def logprior_market_vec(
         self,
         *,
-        qjt_t,
-        q0t_t,
-        pjt_t,
-        wjt_t,
-        beta_p,
-        beta_w,
-        r,
-        E_bar_t,
-        njt_t,
-        gamma_t,
-        phi_t,
-    ):
-        """
-        Market-local log posterior contribution:
-          log p(q_t | ...) + market_logprior(...)
-
-        Under Lu's model, the likelihood uses the full njt_t (no masking by gamma).
-        """
-        return self.market_loglik(
-            qjt_t=qjt_t,
-            q0t_t=q0t_t,
-            pjt_t=pjt_t,
-            wjt_t=wjt_t,
-            beta_p=beta_p,
-            beta_w=beta_w,
-            r=r,
-            E_bar_t=E_bar_t,
-            njt_t=njt_t,
-        ) + self.market_logprior(
-            E_bar_t=E_bar_t, njt_t=njt_t, gamma_t=gamma_t, phi_t=phi_t
-        )
-
-    def global_logprior(self, *, beta_p, beta_w, r):
-        """
-        Global prior contribution:
-          log p(beta_p,beta_w) + log p(r)
-        """
-        return self.logprior_beta(beta_p=beta_p, beta_w=beta_w) + self.logprior_r(r=r)
-
-    def full_logpost(
-        self,
-        *,
-        qjt,
-        q0t,
-        pjt,
-        wjt,
-        beta_p,
-        beta_w,
-        r,
         E_bar,
         njt,
         gamma,
         phi,
-    ):
+    ) -> tf.Tensor:
         """
-        Full log posterior:
-          sum_t market_logpost_t + global_logprior
+        Per-market prior contributions (vector of length T):
+
+          log p(E_bar_t)
+          + sum_j log p(n_jt | gamma_jt)
+          + sum_j log p(gamma_jt | phi_t)
+          + log p(phi_t)
+
+        Inputs:
+          E_bar : (T,)
+          njt   : (T,J)
+          gamma : (T,J) entries in {0,1} (float ok)
+          phi   : (T,) entries in (0,1)
+
+        Returns:
+          lp_t : (T,)
         """
-        gamma = tf.cast(gamma, self.dtype)  # (T,J)
-        phi = tf.cast(phi, self.dtype)  # (T,)
-
-        T = tf.shape(pjt)[0]
-
-        def per_t(t):
-            return self.market_logpost(
-                qjt_t=qjt[t],
-                q0t_t=q0t[t],
-                pjt_t=pjt[t],
-                wjt_t=wjt[t],
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar[t],
-                njt_t=njt[t],
-                gamma_t=gamma[t],
-                phi_t=phi[t],
-            )
-
-        lp_t = tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
-        return tf.reduce_sum(lp_t) + self.global_logprior(
-            beta_p=beta_p, beta_w=beta_w, r=r
-        )
-
-    @tf.function(reduce_retracing=True)
-    def market_logpost_batched(
-        self,
-        *,
-        qjt,
-        q0t,
-        pjt,
-        wjt,
-        beta_p,
-        beta_w,
-        r,
-        E_bar,
-        njt,
-        gamma,
-        phi,
-    ):
-        """
-        Vector of market-local log posterior contributions.
-
-        Returns
-        -------
-        lp_t : (T,) tensor where
-          lp_t[t] = market_loglik_t + market_logprior_t
-
-        Notes
-        -----
-        This is the batched analogue of `market_logpost(...)`:
-          - input arrays are (T,...) rather than per-market slices
-          - output is a vector (T,) rather than a scalar sum
-        """
-        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)  # (T,J)
-        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)  # (T,)
-        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)  # (T,J)
-        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)  # (T,J)
         E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
         njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
         gamma = tf.cast(gamma, self.dtype)  # (T,J)
         phi = tf.cast(phi, self.dtype)  # (T,)
 
-        T = tf.shape(pjt)[0]
+        # ---- E_bar_t ~ N(E_bar_mean, E_bar_var)
+        lp_E = (
+            -0.5 * tf.math.log(self.two_pi * self.E_bar_var)
+            - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
+        )  # (T,)
 
-        def per_t(t):
-            return self.market_logpost(
-                qjt_t=qjt[t],
-                q0t_t=q0t[t],
-                pjt_t=pjt[t],
-                wjt_t=wjt[t],
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar[t],
-                njt_t=njt[t],
-                gamma_t=gamma[t],
-                phi_t=phi[t],
-            )
+        # ---- n_jt | gamma_jt is Normal with variance chosen by gamma_jt
+        var = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq  # (T,J)
+        log_var = gamma * self.log_T1_sq + (1.0 - gamma) * self.log_T0_sq  # (T,J)
 
-        return tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
+        lp_n_entry = -0.5 * (tf.math.log(self.two_pi) + log_var + tf.square(njt) / var)
+        lp_n = tf.reduce_sum(lp_n_entry, axis=1)  # (T,)
+
+        # ---- gamma_jt | phi_t ~ Bernoulli(phi_t), independent across j
+        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)  # (T,)
+        phi_b = phi[:, None]  # (T,1) -> broadcast to (T,J)
+        lp_g_entry = gamma * tf.math.log(phi_b) + (1.0 - gamma) * tf.math.log(
+            1.0 - phi_b
+        )
+        lp_g = tf.reduce_sum(lp_g_entry, axis=1)  # (T,)
+
+        # ---- phi_t ~ Beta(a_phi, b_phi), independent across t
+        a = self.a_phi
+        b = self.b_phi
+        logB = tf.math.lgamma(a) + tf.math.lgamma(b) - tf.math.lgamma(a + b)
+        lp_phi = (
+            (a - 1.0) * tf.math.log(phi) + (b - 1.0) * tf.math.log(1.0 - phi) - logB
+        )  # (T,)
+
+        return lp_E + lp_n + lp_g + lp_phi
+
+    # ------------------------------------------------------------------
+    # Posterior (canonical factorization)
+    # ------------------------------------------------------------------
+
+    @tf.function(reduce_retracing=True)
+    def logpost_vec(
+        self,
+        *,
+        qjt,
+        q0t,
+        pjt,
+        wjt,
+        beta_p,
+        beta_w,
+        r,
+        E_bar,
+        njt,
+        gamma,
+        phi,
+    ) -> tf.Tensor:
+        """
+        Per-market log posterior contributions (vector length T):
+
+          logpost_t = loglik_t + logprior_market_t
+
+        Returns:
+          lp_t : (T,)
+        """
+        ll_t = self.loglik_vec(
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar=E_bar,
+            njt=njt,
+        )
+        lp_t = self.logprior_market_vec(E_bar=E_bar, njt=njt, gamma=gamma, phi=phi)
+        return ll_t + lp_t
+
+    def logpost(
+        self,
+        *,
+        qjt,
+        q0t,
+        pjt,
+        wjt,
+        beta_p,
+        beta_w,
+        r,
+        E_bar,
+        njt,
+        gamma,
+        phi,
+    ) -> tf.Tensor:
+        """
+        Full log posterior (scalar):
+
+          sum_t logpost_vec[t] + logprior_global(beta_p,beta_w,r)
+        """
+        lp_t = self.logpost_vec(
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar=E_bar,
+            njt=njt,
+            gamma=gamma,
+            phi=phi,
+        )
+        return tf.reduce_sum(lp_t) + self.logprior_global(
+            beta_p=beta_p, beta_w=beta_w, r=r
+        )

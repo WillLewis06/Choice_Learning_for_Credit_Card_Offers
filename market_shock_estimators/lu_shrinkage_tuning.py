@@ -169,7 +169,7 @@ def _make_step_r(
 ) -> Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]:
     def step_r(theta: tf.Tensor, k: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-            ll = posterior.full_loglik(
+            ll_t = posterior.loglik_vec(
                 qjt=qjt,
                 q0t=q0t,
                 pjt=pjt,
@@ -180,7 +180,9 @@ def _make_step_r(
                 E_bar=E_bar,
                 njt=njt,
             )
-            return ll + posterior.logprior_r(r=r_val)
+            ll = tf.reduce_sum(ll_t)
+            lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_val)
+            return ll + lp
 
         theta_new, accepted, _ = rw_mh_step(theta0=theta, logp_fn=logp_r, k=k, rng=rng)
         return theta_new, accepted
@@ -205,7 +207,7 @@ def _make_step_beta(
         def logp_beta(beta_vec: tf.Tensor) -> tf.Tensor:
             beta_p = beta_vec[0]
             beta_w = beta_vec[1]
-            ll = posterior.full_loglik(
+            ll_t = posterior.loglik_vec(
                 qjt=qjt,
                 q0t=q0t,
                 pjt=pjt,
@@ -216,7 +218,10 @@ def _make_step_beta(
                 E_bar=E_bar,
                 njt=njt,
             )
-            lp = posterior.logprior_beta(beta_p=beta_p, beta_w=beta_w)
+            ll = tf.reduce_sum(ll_t)
+
+            # includes r term too, constant here since r_fixed is fixed
+            lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_fixed)
             return ll + lp
 
         theta_new, accepted = tmh_step(
@@ -276,7 +281,7 @@ def _pilot_E_bar_all_markets(
         phi_t = phi[t]
 
         def logp_E_bar_t(E_bar_t_val: tf.Tensor) -> tf.Tensor:
-            return posterior.market_logpost(
+            ll = posterior.market_loglik(
                 qjt_t=qjt_t,
                 q0t_t=q0t_t,
                 pjt_t=pjt_t,
@@ -286,9 +291,15 @@ def _pilot_E_bar_all_markets(
                 r=r,
                 E_bar_t=E_bar_t_val,
                 njt_t=njt_t,
-                gamma_t=gamma_t,
-                phi_t=phi_t,
             )
+
+            lp_1 = posterior.logprior_market_vec(
+                E_bar=tf.reshape(E_bar_t_val, (1,)),
+                njt=tf.expand_dims(njt_t, axis=0),
+                gamma=tf.expand_dims(gamma_t, axis=0),
+                phi=tf.reshape(phi_t, (1,)),
+            )
+            return ll + lp_1[0]
 
         def cond_s(s, theta, acc_sum_s):
             return s < pilot_length_t
@@ -365,7 +376,7 @@ def _pilot_njt_all_markets(
         E_bar_t = E_bar[t]
 
         def logp_njt_t(njt_t_val: tf.Tensor) -> tf.Tensor:
-            return posterior.market_logpost(
+            ll = posterior.market_loglik(
                 qjt_t=qjt_t,
                 q0t_t=q0t_t,
                 pjt_t=pjt_t,
@@ -375,9 +386,15 @@ def _pilot_njt_all_markets(
                 r=r,
                 E_bar_t=E_bar_t,
                 njt_t=njt_t_val,
-                gamma_t=gamma_t,
-                phi_t=phi_t,
             )
+
+            lp_1 = posterior.logprior_market_vec(
+                E_bar=tf.reshape(E_bar_t, (1,)),
+                njt=tf.expand_dims(njt_t_val, axis=0),
+                gamma=tf.expand_dims(gamma_t, axis=0),
+                phi=tf.reshape(phi_t, (1,)),
+            )
+            return ll + lp_1[0]
 
         def cond_s(s, theta_s, acc_sum_s):
             return s < pilot_length_t
@@ -646,7 +663,7 @@ def _tune_njt(
         E_bar_t = E_bar[t_]
 
         def logp_njt_full(njt_t_val: tf.Tensor) -> tf.Tensor:
-            return shrink.posterior.market_logpost(
+            ll = shrink.posterior.market_loglik(
                 qjt_t=qjt_t,
                 q0t_t=q0t_t,
                 pjt_t=pjt_t,
@@ -656,9 +673,14 @@ def _tune_njt(
                 r=r,
                 E_bar_t=E_bar_t,
                 njt_t=njt_t_val,
-                gamma_t=gamma_t,
-                phi_t=phi_t,
             )
+            lp_1 = shrink.posterior.logprior_market_vec(
+                E_bar=tf.reshape(E_bar_t, (1,)),
+                njt=tf.expand_dims(njt_t_val, axis=0),
+                gamma=tf.expand_dims(gamma_t, axis=0),
+                phi=tf.reshape(phi_t, (1,)),
+            )
+            return ll + lp_1[0]
 
         return logp_njt_full
 
