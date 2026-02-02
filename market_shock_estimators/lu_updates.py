@@ -15,10 +15,10 @@ from __future__ import annotations
 import tensorflow as tf
 
 from market_shock_estimators.lu_kernels import (
-    gibbs_phi,
     rw_mh_step,
-    sample_gamma_given_n_phi_market,
     tmh_step,
+    gibbs_gamma,
+    gibbs_phi,
 )
 
 
@@ -251,7 +251,7 @@ def update_gamma(
     Batched Gibbs update for gamma (T,J) given njt and phi.
     Returns gamma_new (float64 0/1).
     """
-    gamma_new = sample_gamma_given_n_phi_market(
+    gamma_new = gibbs_gamma(
         njt_t=njt,
         phi_t=phi[:, None],
         T0_sq=posterior.T0_sq,

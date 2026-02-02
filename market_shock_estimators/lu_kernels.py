@@ -53,20 +53,30 @@ def tmh_step(
     k: tf.Tensor,
 ) -> Tuple[tf.Tensor, tf.Tensor]:
     """
-    TensorFlow-graph-safe TMH step (no Python branching on tensors).
-    Core TMH mechanism is unchanged:
-      - local quadratic drift using A = -H + ridge*I
-      - proposal: N(mu0, k^2 A0^{-1})
-      - asymmetric MH correction using forward/reverse q from local metrics
+    TensorFlow-graph-safe TMH step (Lu-style manifold MH).
 
-    Assumes inputs are tf.float64 tensors. Keeps casting logp/grad/Hess for safety.
+    Core mechanism (unchanged):
+      - local quadratic metric A(theta) = -H(theta) + ridge*I
+      - proposal: theta' ~ N(mu0, k^2 A0^{-1})
+        with mu0 = theta0 + 0.5*k^2*A0^{-1} g0
+      - asymmetric MH correction using forward/reverse proposal densities
+
+    Assumptions:
+      - theta0 is rank-1 (shape (d,)) and tf.float64
+      - logp_fn(theta) returns a scalar tf.float64
     """
+    tf.debugging.assert_rank(theta0, 1)
+
     d = tf.shape(theta0)[0]
     I = tf.eye(d, dtype=tf.float64)
     eps_floor = tf.constant(1e-8, dtype=tf.float64)
     false = tf.constant(False)
 
-    # --- Helpers (all TF-safe) -------------------------------------------------
+    def _all_finite(*xs: tf.Tensor) -> tf.Tensor:
+        ok = tf.constant(True)
+        for x in xs:
+            ok = tf.logical_and(ok, tf.reduce_all(tf.math.is_finite(x)))
+        return ok
 
     def _lp_grad_hess(theta: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         with tf.GradientTape(persistent=True) as t2:
@@ -79,23 +89,23 @@ def tmh_step(
             )
         H = t2.jacobian(g, theta, experimental_use_pfor=False)
         del t2
-
         return lp, g, H
 
     def _sym(A: tf.Tensor) -> tf.Tensor:
         return 0.5 * (A + tf.transpose(A))
 
-    def _chol_spd(A: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    def _chol_spd(A: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         """
-        Always returns tensors: (L, jitter, min_eig, ok).
-        If ok is False, L is I and jitter/min_eig are zeros.
+        Cholesky of (approximately) SPD matrix using eigenvalue-based jitter.
+
+        Returns:
+          L  : cholesky factor (d,d) if ok else identity
+          ok : boolean scalar
         """
         A = _sym(A)
         evals = tf.linalg.eigvalsh(A)
-
         ok_evals = tf.reduce_all(tf.math.is_finite(evals))
         min_eig = tf.where(ok_evals, tf.reduce_min(evals), tf.constant(0.0, tf.float64))
-
         jitter = tf.where(
             ok_evals,
             tf.maximum(tf.constant(0.0, tf.float64), -min_eig + eps_floor),
@@ -106,30 +116,31 @@ def tmh_step(
         def _do_chol() -> Tuple[tf.Tensor, tf.Tensor]:
             L = tf.linalg.cholesky(A_spd)
             ok_L = tf.reduce_all(tf.math.is_finite(L))
-            L_safe = tf.where(ok_L, L, I)
-            return L_safe, ok_L
+            return tf.where(ok_L, L, I), ok_L
 
-        def _do_fail() -> Tuple[tf.Tensor, tf.Tensor]:
+        def _fail() -> Tuple[tf.Tensor, tf.Tensor]:
             return I, tf.constant(False)
 
-        L, ok_L = tf.cond(ok_evals, _do_chol, _do_fail)
+        L, ok_L = tf.cond(ok_evals, _do_chol, _fail)
         ok = tf.logical_and(ok_evals, ok_L)
-        return L, jitter, min_eig, ok
+        return L, ok
 
-    def _invA_times_vec_from_chol(L: tf.Tensor, v: tf.Tensor) -> tf.Tensor:
+    def _solve_Ainv(L: tf.Tensor, v: tf.Tensor) -> tf.Tensor:
         x = tf.linalg.cholesky_solve(L, v[:, None])
         return x[:, 0]
 
-    def _sample_from_cov_invA_from_chol(L: tf.Tensor) -> tf.Tensor:
-        # delta ~ N(0, k^2 * A^{-1}), with A = L L^T  =>  A^{-1/2} z = L^{-T} z
+    def _sample_kAinv(L: tf.Tensor) -> tf.Tensor:
+        # delta ~ N(0, k^2 A^{-1}) with chol(A)=L, so A^{-1/2} z = L^{-T} z
         z = rng.normal(tf.shape(theta0), dtype=tf.float64)
         x = tf.linalg.triangular_solve(tf.transpose(L), z[:, None], lower=False)[:, 0]
         return k * x
 
-    def _log_q_from_chol(x: tf.Tensor, mu_theta: tf.Tensor, L: tf.Tensor) -> tf.Tensor:
-        # Precision P = A/k^2. Using chol(A)=L:
-        # quad = (x-mu)^T P (x-mu) = ||L^T (x-mu)||^2 / k^2
-        diff = x - mu_theta
+    def _log_q_gaussian_precision(
+        x: tf.Tensor, mu: tf.Tensor, L: tf.Tensor
+    ) -> tf.Tensor:
+        # Proposal precision P = A/k^2. With chol(A)=L:
+        # quad = ||L^T (x-mu)||^2 / k^2
+        diff = x - mu
         y = tf.linalg.matvec(tf.transpose(L), diff)
         quad = tf.reduce_sum(tf.square(y)) / (k * k)
 
@@ -138,113 +149,70 @@ def tmh_step(
         logdetP = logdetA - tf.cast(d, tf.float64) * tf.math.log(k * k)
         return 0.5 * logdetP - 0.5 * quad
 
+    def _geometry(
+        theta: tf.Tensor,
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        """
+        Returns (lp, g, L, ok) at theta, where L is chol(A(theta)).
+        """
+        lp, g, H = _lp_grad_hess(theta)
+        A = -H + ridge * I
+        L, ok_chol = _chol_spd(A)
+        ok = tf.logical_and(_all_finite(lp, g, H), ok_chol)
+        return lp, g, L, ok
+
     def _fallback(msg: tf.Tensor | str) -> Tuple[tf.Tensor, tf.Tensor]:
         tf.print("[TMH] fallback:", msg)
         return theta0, false
 
-    # --- Precompute at theta0 --------------------------------------------------
-    lp0, g0, H0 = _lp_grad_hess(theta0)
+    # --- Geometry at current ---------------------------------------------------
+    lp0, g0, L0, ok0 = _geometry(theta0)
 
-    ok_lp0 = tf.reduce_all(tf.math.is_finite(lp0))
-    ok_g0 = tf.reduce_all(tf.math.is_finite(g0))
-    ok_H0 = tf.reduce_all(tf.math.is_finite(H0))
-    ok0_basic = tf.logical_and(ok_lp0, tf.logical_and(ok_g0, ok_H0))
-
-    A0 = -H0 + ridge * I
-    L0, jitter0, min_eig0, ok0_chol = _chol_spd(A0)
-    ok0 = tf.logical_and(ok0_basic, ok0_chol)
-
-    # --- Main step -------------------------------------------------------------
-    def _do_step_from_theta0() -> Tuple[tf.Tensor, tf.Tensor]:
-        # mu0 = theta0 + 0.5*k^2 * A0^{-1} g0
-        invA0_g0 = _invA_times_vec_from_chol(L0, g0)
+    def _do_step() -> Tuple[tf.Tensor, tf.Tensor]:
+        # mu0 = theta0 + 0.5*k^2*A0^{-1} g0
+        invA0_g0 = _solve_Ainv(L0, g0)
         mu0 = theta0 + tf.constant(0.5, tf.float64) * (k * k) * invA0_g0
 
         # propose
-        delta = _sample_from_cov_invA_from_chol(L0)
-        prop = mu0 + delta
-
+        prop = mu0 + _sample_kAinv(L0)
         ok_prop = tf.reduce_all(tf.math.is_finite(prop))
 
         def _do_from_prop() -> Tuple[tf.Tensor, tf.Tensor]:
-            lpp, gp, Hp = _lp_grad_hess(prop)
-
-            ok_lpp = tf.reduce_all(tf.math.is_finite(lpp))
-            ok_gp = tf.reduce_all(tf.math.is_finite(gp))
-            ok_Hp = tf.reduce_all(tf.math.is_finite(Hp))
-            okp_basic = tf.logical_and(ok_lpp, tf.logical_and(ok_gp, ok_Hp))
-
-            Ap = -Hp + ridge * I
-            Lp, jitterp, min_eigp, okp_chol = _chol_spd(Ap)
-            okp = tf.logical_and(okp_basic, okp_chol)
+            lpp, gp, Lp, okp = _geometry(prop)
 
             def _do_accept_reject() -> Tuple[tf.Tensor, tf.Tensor]:
-                invAp_gp = _invA_times_vec_from_chol(Lp, gp)
+                # reverse mean mup = prop + 0.5*k^2*Ap^{-1} gp
+                invAp_gp = _solve_Ainv(Lp, gp)
                 mup = prop + tf.constant(0.5, tf.float64) * (k * k) * invAp_gp
 
-                logq_prop_given_0 = _log_q_from_chol(prop, mu0, L0)
-                logq_0_given_prop = _log_q_from_chol(theta0, mup, Lp)
+                logq_prop_given_0 = _log_q_gaussian_precision(prop, mu0, L0)
+                logq_0_given_prop = _log_q_gaussian_precision(theta0, mup, Lp)
 
                 log_alpha = lpp + logq_0_given_prop - lp0 - logq_prop_given_0
                 ok_alpha = tf.reduce_all(tf.math.is_finite(log_alpha))
 
-                def _do_mh() -> Tuple[tf.Tensor, tf.Tensor]:
+                def _mh() -> Tuple[tf.Tensor, tf.Tensor]:
                     u = rng.uniform([], dtype=tf.float64)
-                    logu = tf.math.log(u)
-                    accepted = logu < log_alpha
-
-                    def _print_reject() -> tf.Tensor:
-                        tf.print(
-                            "[TMH] reject:",
-                            "log_alpha=",
-                            log_alpha,
-                            "logu=",
-                            logu,
-                            "||g0||=",
-                            tf.norm(g0),
-                            "||gp||=",
-                            tf.norm(gp),
-                            "min_eig(A0)=",
-                            min_eig0,
-                            "min_eig(Ap)=",
-                            min_eigp,
-                            "jitter0=",
-                            jitter0,
-                            "jitterp=",
-                            jitterp,
-                            "||delta||=",
-                            tf.norm(delta),
-                            "k=",
-                            k,
-                            "ridge=",
-                            ridge,
-                        )
-                        return tf.constant(0)
-
-                    # tf.cond(accepted, lambda: tf.constant(0), _print_reject)
-
+                    accepted = tf.math.log(u) < log_alpha
                     theta_new = tf.where(accepted, prop, theta0)
                     return theta_new, accepted
 
-                return tf.cond(
-                    ok_alpha, _do_mh, lambda: _fallback("non-finite log_alpha")
-                )
+                return tf.cond(ok_alpha, _mh, lambda: _fallback("non-finite log_alpha"))
 
+            ok_all = tf.logical_and(okp, ok_prop)
             return tf.cond(
-                okp,
+                ok_all,
                 _do_accept_reject,
                 lambda: _fallback("non-finite / non-SPD at proposal"),
             )
 
         return tf.cond(ok_prop, _do_from_prop, lambda: _fallback("non-finite proposal"))
 
-    return tf.cond(
-        ok0, _do_step_from_theta0, lambda: _fallback("non-finite / non-SPD at theta0")
-    )
+    return tf.cond(ok0, _do_step, lambda: _fallback("non-finite / non-SPD at theta0"))
 
 
 @tf.function(reduce_retracing=True)
-def sample_gamma_given_n_phi_market(
+def gibbs_gamma(
     njt_t: tf.Tensor,
     phi_t: tf.Tensor,
     T0_sq: tf.Tensor,
