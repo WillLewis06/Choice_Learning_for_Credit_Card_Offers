@@ -1,17 +1,3 @@
-# market_shock_estimators/lu_shrinkage.py
-#
-# Clean Lu (2025) shrinkage sampler (two-normal spike-and-slab, paper-aligned):
-#   - Estimator-style API: fit() + get_results().
-#   - Log densities delegated to LuPosteriorTF.
-#   - MH mechanics via tmh_step (Laplace independence MH) and rw_mh_step.
-#
-# Blocking (minimal, Lu-aligned on point 1):
-#   - Global: (beta_p, beta_w) via TMH; r via RW-MH.
-#   - Market t: E_bar_t via RW-MH;
-#               njt_t (full J vector) via TMH;
-#               gamma_t via conditional Bernoulli (Gibbs);
-#               phi_t via Gibbs.
-#
 from __future__ import annotations
 
 # tmp debugging
@@ -20,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_diagnostics import LuShrinkageDiagnostics
@@ -33,6 +18,10 @@ from market_shock_estimators.lu_updates import (
     update_phi,
 )
 from market_shock_estimators.lu_tuning import tune_shrinkage
+from market_shock_estimators.lu_validate_input import (
+    init_validate_input,
+    fit_validate_input,
+)
 
 
 class LuShrinkageEstimator:
@@ -64,9 +53,6 @@ class LuShrinkageEstimator:
         n_draws: int,
         seed: int,
     ):
-        self.success: bool = False
-        self._results: dict | None = None
-
         # -----------------------------
         # Data
         # -----------------------------
@@ -75,14 +61,14 @@ class LuShrinkageEstimator:
         self.qjt = tf.convert_to_tensor(qjt, dtype=tf.float64)  # (T,J)
         self.q0t = tf.convert_to_tensor(q0t, dtype=tf.float64)  # (T,)
 
-        if self.pjt.shape.rank != 2:
-            raise ValueError("pjt must be rank-2 with shape (T,J).")
-        if self.wjt.shape != self.pjt.shape:
-            raise ValueError("wjt must have same shape as pjt.")
-        if self.qjt.shape != self.pjt.shape:
-            raise ValueError("qjt must have same shape as pjt.")
-        if self.q0t.shape.rank != 1 or int(self.q0t.shape[0]) != int(self.pjt.shape[0]):
-            raise ValueError("q0t must be shape (T,) matching pjt first dimension.")
+        init_validate_input(
+            pjt=self.pjt,
+            wjt=self.wjt,
+            qjt=self.qjt,
+            q0t=self.q0t,
+            n_draws=int(n_draws),
+            seed=int(seed),
+        )
 
         self.T = int(self.pjt.shape[0])
         self.J = int(self.pjt.shape[1])
@@ -165,22 +151,25 @@ class LuShrinkageEstimator:
         """
         Run MCMC and store posterior-mean summaries internally.
         """
-        if n_iter <= 0:
-            raise ValueError("n_iter must be positive.")
 
-        if pilot_length <= 0:
-            raise ValueError("pilot_length must be positive.")
+        fit_validate_input(
+            n_iter=n_iter,
+            pilot_length=pilot_length,
+            ridge=ridge,
+            target_low=target_low,
+            target_high=target_high,
+            max_rounds=max_rounds,
+            factor_rw=factor_rw,
+            factor_tmh=factor_tmh,
+        )
 
-        # Tuning
         self.pilot_length = pilot_length
         self.ridge = ridge
-
-        # Tuning hyperparameters (owned by orchestration)
-        self.target_low = float(target_low)
-        self.target_high = float(target_high)
-        self.max_rounds = int(max_rounds)
-        self.factor_rw = float(factor_rw)
-        self.factor_tmh = float(factor_tmh)
+        self.target_low = target_low
+        self.target_high = target_high
+        self.max_rounds = max_rounds
+        self.factor_rw = factor_rw
+        self.factor_tmh = factor_tmh
 
         k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
         # tmp for faster debugging
@@ -198,8 +187,6 @@ class LuShrinkageEstimator:
             ridge=ridge,
             diag=diag,
         )
-
-        self.success = True
 
     def get_results(self) -> dict:
         """
@@ -224,7 +211,6 @@ class LuShrinkageEstimator:
         gamma_mean = (sum_gamma / saved_f).numpy()
 
         return {
-            "success": True,
             "beta_p_hat": float(beta_mean[0]),
             "beta_w_hat": float(beta_mean[1]),
             "sigma_hat": sigma_mean,

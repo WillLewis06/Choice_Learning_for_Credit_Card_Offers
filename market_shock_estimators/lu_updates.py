@@ -1,15 +1,3 @@
-# market_shock_estimators/lu_shrinkage_updates.py
-#
-# Pure (stateless) update functions for the Lu (2025) shrinkage sampler.
-#
-# These functions:
-#   - take current tensors + posterior + rng + step sizes
-#   - return updated tensors (+ acceptance info where available)
-#   - do not mutate any class state
-#
-# Designed to be called from both lu_shrinkage.py (sampler) and
-# lu_shrinkage_tuning.py (pilot tuning), avoiding circular imports.
-#
 from __future__ import annotations
 
 import tensorflow as tf

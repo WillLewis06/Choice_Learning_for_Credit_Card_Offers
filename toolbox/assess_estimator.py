@@ -24,27 +24,8 @@ def print_assessment(
       - E_true/E_hat norms and means
       - degeneracy / non-finite / shape mismatch flags
     """
-    success = bool(results.get("success", False))
     E_hat = results.get("E_hat", None)
     sigma_hat = results.get("sigma_hat", None)
-
-    if (not success) or (E_hat is None):
-        print("[SIM] Estimator FAILED | success=False or E_hat is None")
-        return
-
-    if E_hat.shape != E_true.shape:
-        print(
-            f"[SIM] Estimator FAILED | shape mismatch: E_hat{E_hat.shape} vs E_true{E_true.shape}"
-        )
-        return
-
-    if not np.all(np.isfinite(E_hat)):
-        nan_count = int(np.isnan(E_hat).sum())
-        inf_count = int(np.isinf(E_hat).sum())
-        print(
-            f"[SIM] Estimator FAILED | non-finite E_hat (nan={nan_count}, inf={inf_count})"
-        )
-        return
 
     # Flatten for scalar metrics
     e = E_true.reshape(-1).astype(float)

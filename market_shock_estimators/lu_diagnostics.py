@@ -13,9 +13,8 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
 
     TF-compatible: uses tf.print (no .numpy(), no Python floats).
     """
-
-    beta_p = tf.identity(shrink.beta_p)
-    beta_w = tf.identity(shrink.beta_w)
+    beta_p = shrink.beta_p
+    beta_w = shrink.beta_w
     sigma = tf.exp(shrink.r)
 
     E_bar_norm = tf.norm(shrink.E_bar)

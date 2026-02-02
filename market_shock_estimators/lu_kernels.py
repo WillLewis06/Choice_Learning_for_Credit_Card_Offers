@@ -1,9 +1,8 @@
-# market_shock_estimators/lu_shrinkage_kernels.py
 from __future__ import annotations
-
 from typing import Callable, Tuple
-
 import tensorflow as tf
+
+from market_shock_estimators.lu_validate_input import tmh_step_validate_input_tf
 
 
 @tf.function(reduce_retracing=True)
@@ -65,7 +64,7 @@ def tmh_step(
       - theta0 is rank-1 (shape (d,)) and tf.float64
       - logp_fn(theta) returns a scalar tf.float64
     """
-    tf.debugging.assert_rank(theta0, 1)
+    tmh_step_validate_input_tf(theta0=theta0, k=k, ridge=ridge)
 
     d = tf.shape(theta0)[0]
     I = tf.eye(d, dtype=tf.float64)
