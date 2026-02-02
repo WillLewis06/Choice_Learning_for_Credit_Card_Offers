@@ -5,7 +5,7 @@ from typing import Callable, Tuple
 
 import tensorflow as tf
 
-from market_shock_estimators.lu_shrinkage_updates import (
+from market_shock_estimators.lu_updates import (
     update_E_bar,
     update_beta,
     update_njt,
@@ -37,7 +37,6 @@ def _leading_none_shape_invariant(shape: tf.TensorShape) -> tf.TensorShape:
 
 
 def tune_k(
-    *,
     theta0: tf.Tensor,
     step_fn: Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]],
     k0: tf.Tensor,
@@ -47,7 +46,7 @@ def tune_k(
     max_rounds: int,
     factor: float,
     name: str,
-) -> Tuple[tf.Tensor, float, tf.Tensor]:
+) -> tf.Tensor:
     """
     Generic step-size tuner with one-line per-round diagnostics.
 
@@ -135,7 +134,7 @@ def tune_k(
         if action == "ok":
             break
 
-    return k, last_acc_rate, last_theta
+    return k
 
 
 def tune_shrinkage(shrink):
@@ -249,7 +248,7 @@ def tune_shrinkage(shrink):
         )
         return r_new, tf.cast(accepted, tf.float64)
 
-    k_r_tuned, _, _ = tune_k(
+    k_r_tuned = tune_k(
         theta0=r0,
         step_fn=step_r,
         k0=k_r0,
@@ -286,7 +285,7 @@ def tune_shrinkage(shrink):
         return theta_new, tf.cast(accepted, tf.float64)
 
     beta_vec0 = tf.stack([beta_p0, beta_w0], axis=0)
-    k_beta_tuned, _, _ = tune_k(
+    k_beta_tuned = tune_k(
         theta0=beta_vec0,
         step_fn=step_beta,
         k0=k_beta0,
@@ -321,7 +320,7 @@ def tune_shrinkage(shrink):
         acc_inc = tf.reduce_mean(tf.cast(accepted_vec, tf.float64))
         return E_bar_new, acc_inc
 
-    k_E_bar_tuned, _, _ = tune_k(
+    k_E_bar_tuned = tune_k(
         theta0=E_bar0,
         step_fn=step_E_bar,
         k0=k_E_bar0,
@@ -356,7 +355,7 @@ def tune_shrinkage(shrink):
         acc_inc = acc_sum / tf.maximum(T_t, tf.constant(1.0, tf.float64))
         return njt_new, acc_inc
 
-    k_njt_tuned, _, _ = tune_k(
+    k_njt_tuned = tune_k(
         theta0=njt0,
         step_fn=step_njt,
         k0=k_njt0,

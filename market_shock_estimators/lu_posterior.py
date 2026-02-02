@@ -34,7 +34,6 @@ class LuPosteriorTF:
 
     def __init__(
         self,
-        *,
         n_draws: int,
         seed: int,
         # Priors: beta_p, beta_w (independent normals)
@@ -96,7 +95,6 @@ class LuPosteriorTF:
 
     def _mean_utility_jt(
         self,
-        *,
         pjt_t,
         wjt_t,
         beta_p,
@@ -107,13 +105,9 @@ class LuPosteriorTF:
         """
         delta_t (J,) = beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
         """
-        beta_p = tf.cast(beta_p, self.dtype)
-        beta_w = tf.cast(beta_w, self.dtype)
-        E_bar_t = tf.cast(E_bar_t, self.dtype)
-
         return beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
 
-    def _choice_probs_t(self, *, pjt_t, delta_t, r):
+    def _choice_probs_t(self, pjt_t, delta_t, r):
         """
         Price-only RC shares for one market.
 
@@ -126,7 +120,6 @@ class LuPosteriorTF:
           sjt_t: (J,)
           s0t : scalar
         """
-        r = tf.cast(r, self.dtype)
 
         sigma = tf.exp(r)  # scalar
         scaled_v = sigma * self.v_draws  # (R,)
@@ -157,7 +150,6 @@ class LuPosteriorTF:
     @tf.function(reduce_retracing=True)
     def market_loglik(
         self,
-        *,
         qjt_t,
         q0t_t,
         pjt_t,
@@ -172,8 +164,6 @@ class LuPosteriorTF:
         Per-market log likelihood contribution (up to multinomial constant):
           q0t*log s0t + sum_j qjt*log sjt
         """
-        qjt_t = tf.cast(qjt_t, self.dtype)  # (J,)
-        q0t_t = tf.cast(q0t_t, self.dtype)  # scalar
 
         delta_t = self._mean_utility_jt(
             pjt_t=pjt_t,
@@ -195,7 +185,6 @@ class LuPosteriorTF:
     @tf.function(reduce_retracing=True)
     def loglik_vec(
         self,
-        *,
         qjt,
         q0t,
         pjt,
@@ -216,12 +205,6 @@ class LuPosteriorTF:
         Returns:
           ll_t: (T,)
         """
-        qjt = tf.convert_to_tensor(qjt, dtype=self.dtype)
-        q0t = tf.convert_to_tensor(q0t, dtype=self.dtype)
-        pjt = tf.convert_to_tensor(pjt, dtype=self.dtype)
-        wjt = tf.convert_to_tensor(wjt, dtype=self.dtype)
-        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)
-        njt = tf.convert_to_tensor(njt, dtype=self.dtype)
 
         T = tf.shape(pjt)[0]
 
@@ -244,14 +227,11 @@ class LuPosteriorTF:
     # Priors
     # ------------------------------------------------------------------
 
-    def logprior_global(self, *, beta_p, beta_w, r) -> tf.Tensor:
+    def logprior_global(self, beta_p, beta_w, r) -> tf.Tensor:
         """
         Global prior contribution (scalar):
           log p(beta_p) + log p(beta_w) + log p(r)
         """
-        beta_p = tf.cast(beta_p, self.dtype)
-        beta_w = tf.cast(beta_w, self.dtype)
-        r = tf.cast(r, self.dtype)
 
         lp_beta_p = (
             -0.5 * tf.math.log(self.two_pi * self.beta_p_var)
@@ -269,7 +249,6 @@ class LuPosteriorTF:
 
     def logprior_market_vec(
         self,
-        *,
         E_bar,
         njt,
         gamma,
@@ -292,10 +271,6 @@ class LuPosteriorTF:
         Returns:
           lp_t : (T,)
         """
-        E_bar = tf.convert_to_tensor(E_bar, dtype=self.dtype)  # (T,)
-        njt = tf.convert_to_tensor(njt, dtype=self.dtype)  # (T,J)
-        gamma = tf.cast(gamma, self.dtype)  # (T,J)
-        phi = tf.cast(phi, self.dtype)  # (T,)
 
         # ---- E_bar_t ~ N(E_bar_mean, E_bar_var)
         lp_E = (
@@ -335,7 +310,6 @@ class LuPosteriorTF:
     @tf.function(reduce_retracing=True)
     def logpost_vec(
         self,
-        *,
         qjt,
         q0t,
         pjt,
@@ -372,7 +346,6 @@ class LuPosteriorTF:
 
     def logpost(
         self,
-        *,
         qjt,
         q0t,
         pjt,

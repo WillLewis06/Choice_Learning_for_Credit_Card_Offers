@@ -23,8 +23,8 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from market_shock_estimators.lu_posterior import LuPosteriorTF
-from market_shock_estimators.lu_shrinkage_diagnostics import LuShrinkageDiagnostics
-from market_shock_estimators.lu_shrinkage_updates import (
+from market_shock_estimators.lu_diagnostics import LuShrinkageDiagnostics
+from market_shock_estimators.lu_updates import (
     update_beta,
     update_r,
     update_E_bar,
@@ -32,7 +32,7 @@ from market_shock_estimators.lu_shrinkage_updates import (
     update_gamma,
     update_phi,
 )
-from market_shock_estimators.lu_shrinkage_tuning import tune_shrinkage
+from market_shock_estimators.lu_tuning import tune_shrinkage
 
 
 class LuShrinkageEstimator:

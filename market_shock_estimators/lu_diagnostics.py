@@ -4,7 +4,6 @@ import tensorflow as tf
 
 
 def round4(x: tf.Tensor) -> tf.Tensor:
-    x = tf.convert_to_tensor(x)
     return tf.strings.as_string(x, precision=4, scientific=False)
 
 
@@ -102,7 +101,6 @@ class LuShrinkageDiagnostics:
           - accumulate current draw into running sums
           - print progress line
         """
-        it = tf.convert_to_tensor(it, dtype=tf.int32)
         self._accumulate_draw(shrink)
         report_iteration_progress(shrink, it)
 

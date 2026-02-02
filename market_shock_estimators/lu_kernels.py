@@ -12,7 +12,7 @@ def rw_mh_step(
     logp_fn: Callable[[tf.Tensor], tf.Tensor],
     k: tf.Tensor,
     rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+) -> Tuple[tf.Tensor, tf.Tensor]:
     """
     Random-walk MH step (batched).
 
@@ -41,7 +41,7 @@ def rw_mh_step(
 
     theta_new = tf.where(accepted, theta_prop, theta0)
 
-    return theta_new, accepted, log_alpha
+    return theta_new, accepted
 
 
 @tf.function(reduce_retracing=True)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import tensorflow as tf
 
-from market_shock_estimators.lu_shrinkage_kernels import (
+from market_shock_estimators.lu_kernels import (
     gibbs_phi,
     rw_mh_step,
     sample_gamma_given_n_phi_market,
@@ -24,7 +24,6 @@ from market_shock_estimators.lu_shrinkage_kernels import (
 
 @tf.function(reduce_retracing=True)
 def update_beta(
-    *,
     posterior,
     rng: tf.random.Generator,
     qjt: tf.Tensor,
@@ -75,7 +74,6 @@ def update_beta(
 
 @tf.function(reduce_retracing=True)
 def update_r(
-    *,
     posterior,
     rng: tf.random.Generator,
     qjt: tf.Tensor,
@@ -110,13 +108,12 @@ def update_r(
         lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_val)
         return ll + lp
 
-    r_new, accepted, _ = rw_mh_step(theta0=r, logp_fn=logp_r, k=k_r, rng=rng)
+    r_new, accepted = rw_mh_step(theta0=r, logp_fn=logp_r, k=k_r, rng=rng)
     return r_new, accepted
 
 
 @tf.function(reduce_retracing=True)
 def update_E_bar(
-    *,
     posterior,
     rng: tf.random.Generator,
     qjt: tf.Tensor,
@@ -153,7 +150,7 @@ def update_E_bar(
             phi=phi,
         )
 
-    E_bar_new, accepted, _ = rw_mh_step(
+    E_bar_new, accepted = rw_mh_step(
         theta0=E_bar, logp_fn=logp_E_bar_vec, k=k_E_bar, rng=rng
     )
     return E_bar_new, accepted
@@ -161,7 +158,6 @@ def update_E_bar(
 
 @tf.function(reduce_retracing=True)
 def update_njt(
-    *,
     posterior,
     rng: tf.random.Generator,
     qjt: tf.Tensor,
@@ -182,10 +178,6 @@ def update_njt(
     One sweep over markets updating each njt_t (J,) via TMH (sequential market loop).
     Returns (njt_new, acc_sum) where acc_sum is a float64 scalar count of accepted markets.
     """
-    njt = tf.convert_to_tensor(njt, tf.float64)  # (T,J)
-    E_bar = tf.convert_to_tensor(E_bar, tf.float64)  # (T,)
-    gamma = tf.convert_to_tensor(gamma, tf.float64)  # (T,J)
-    phi = tf.convert_to_tensor(phi, tf.float64)  # (T,)
 
     T_t = tf.shape(njt)[0]
     ta_n = tf.TensorArray(tf.float64, size=T_t).unstack(njt)
@@ -250,7 +242,6 @@ def update_njt(
 
 @tf.function(reduce_retracing=True)
 def update_gamma(
-    *,
     posterior,
     rng: tf.random.Generator,
     njt: tf.Tensor,
@@ -274,7 +265,6 @@ def update_gamma(
 
 @tf.function(reduce_retracing=True)
 def update_phi(
-    *,
     posterior,
     rng: tf.random.Generator,
     gamma: tf.Tensor,
