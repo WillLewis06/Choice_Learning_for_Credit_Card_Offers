@@ -24,11 +24,13 @@ import tensorflow_probability as tfp
 
 from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_shrinkage_diagnostics import LuShrinkageDiagnostics
-from market_shock_estimators.lu_shrinkage_kernels import (
-    tmh_step,
-    rw_mh_step,
-    gibbs_phi,
-    sample_gamma_given_n_phi_market,
+from market_shock_estimators.lu_shrinkage_updates import (
+    update_beta,
+    update_r,
+    update_E_bar,
+    update_njt,
+    update_gamma,
+    update_phi,
 )
 from market_shock_estimators.lu_shrinkage_tuning import tune_shrinkage
 
@@ -269,224 +271,97 @@ class LuShrinkageEstimator:
 
     @tf.function(reduce_retracing=True)
     def _mcmc_iteration_step(self, it, k_beta, k_njt, k_r, k_E_bar, ridge):
-        self._update_beta(k_beta, ridge)
-        self._update_r(k_r)
-        self._update_E_bar(k_E_bar)
-        self._update_njt(k_njt, ridge)
-        self._update_gamma()
-        self._update_phi()
-        self._diag.step(self, it)
-
-    # ------------------------------------------------------------------
-    # Variable updates (All markets batched)
-    # ------------------------------------------------------------------
-
-    @tf.function(reduce_retracing=True)
-    def _update_beta(self, k_beta: tf.Tensor, ridge: tf.Tensor) -> None:
-        beta0 = tf.stack([self.beta_p, self.beta_w], axis=0)
-
-        def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
-            beta_p = theta_vec[0]
-            beta_w = theta_vec[1]
-            ll_t = self.posterior.loglik_vec(
-                qjt=self.qjt,
-                q0t=self.q0t,
-                pjt=self.pjt,
-                wjt=self.wjt,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=self.r,
-                E_bar=self.E_bar,
-                njt=self.njt,
-            )
-            ll = tf.reduce_sum(ll_t)
-
-            # Global prior includes r as well; r is fixed in this update so that term is constant.
-            lp = self.posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=self.r)
-            return ll + lp
-
-        beta_new, _ = tmh_step(
-            theta0=beta0,
-            logp_fn=logp_beta,
+        # (beta_p, beta_w)
+        beta_p_new, beta_w_new, _ = update_beta(
+            posterior=self.posterior,
+            rng=self.rng,
+            qjt=self.qjt,
+            q0t=self.q0t,
+            pjt=self.pjt,
+            wjt=self.wjt,
+            beta_p=self.beta_p,
+            beta_w=self.beta_w,
+            r=self.r,
+            E_bar=self.E_bar,
+            njt=self.njt,
+            k_beta=k_beta,
             ridge=ridge,
-            rng=self.rng,
-            k=k_beta,
         )
-        self.beta_p.assign(beta_new[0])
-        self.beta_w.assign(beta_new[1])
+        self.beta_p.assign(beta_p_new)
+        self.beta_w.assign(beta_w_new)
 
-    @tf.function(reduce_retracing=True)
-    def _update_r(self, k_r: tf.Tensor) -> None:
-        def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-            ll_t = self.posterior.loglik_vec(
-                qjt=self.qjt,
-                q0t=self.q0t,
-                pjt=self.pjt,
-                wjt=self.wjt,
-                beta_p=self.beta_p,
-                beta_w=self.beta_w,
-                r=r_val,
-                E_bar=self.E_bar,
-                njt=self.njt,
-            )
-            ll = tf.reduce_sum(ll_t)
-
-            # Global prior includes beta terms too; beta is fixed here so those terms are constant.
-            lp = self.posterior.logprior_global(
-                beta_p=self.beta_p, beta_w=self.beta_w, r=r_val
-            )
-            return ll + lp
-
-        r_new, _, _ = rw_mh_step(
-            theta0=self.r,
-            logp_fn=logp_r,
-            k=k_r,
+        # r
+        r_new, _ = update_r(
+            posterior=self.posterior,
             rng=self.rng,
+            qjt=self.qjt,
+            q0t=self.q0t,
+            pjt=self.pjt,
+            wjt=self.wjt,
+            beta_p=self.beta_p,
+            beta_w=self.beta_w,
+            r=self.r,
+            E_bar=self.E_bar,
+            njt=self.njt,
+            k_r=k_r,
         )
         self.r.assign(r_new)
 
-    @tf.function(reduce_retracing=True)
-    def _update_E_bar(self, k_E_bar: tf.Tensor) -> None:
-        """
-        Update E_bar (all markets) via RW-MH, batched across markets.
-
-        Uses rw_mh_step with a per-market log posterior vector, so each market's
-        accept/reject is independent (conditional on the global state).
-        """
-
-        def logp_E_bar_vec(E_bar_val: tf.Tensor) -> tf.Tensor:
-            # Returns (T,) where entry t is market t log posterior contribution.
-
-            return self.posterior.logpost_vec(
-                qjt=self.qjt,
-                q0t=self.q0t,
-                pjt=self.pjt,
-                wjt=self.wjt,
-                beta_p=self.beta_p,
-                beta_w=self.beta_w,
-                r=self.r,
-                E_bar=E_bar_val,
-                njt=self.njt,
-                gamma=self.gamma,
-                phi=self.phi,
-            )
-
-        E_bar_new, _, _ = rw_mh_step(
-            theta0=self.E_bar,
-            logp_fn=logp_E_bar_vec,
-            k=k_E_bar,
+        # E_bar (vector)
+        E_bar_new, _ = update_E_bar(
+            posterior=self.posterior,
             rng=self.rng,
+            qjt=self.qjt,
+            q0t=self.q0t,
+            pjt=self.pjt,
+            wjt=self.wjt,
+            beta_p=self.beta_p,
+            beta_w=self.beta_w,
+            r=self.r,
+            E_bar=self.E_bar,
+            njt=self.njt,
+            gamma=self.gamma,
+            phi=self.phi,
+            k_E_bar=k_E_bar,
         )
-
         self.E_bar.assign(E_bar_new)
 
-    @tf.function(reduce_retracing=True)
-    def _update_njt(self, k_njt: tf.Tensor, ridge: tf.Tensor) -> None:
-        """
-        Update njt for all markets.
-
-        Implementation choice: keep a market loop inside this function (sequential),
-        because TMH is per-market and uses a stateful RNG.
-        """
-
-        # Snapshot current njt as tensors for loop-carried updates
-        njt0 = self.njt.read_value()  # (T,J)
-        E_bar0 = self.E_bar.read_value()  # (T,)
-        gamma0 = self.gamma.read_value()  # (T,J)
-        phi0 = self.phi.read_value()  # (T,)
-
-        T_t = tf.shape(self.pjt)[0]
-
-        ta_n = tf.TensorArray(tf.float64, size=T_t).unstack(njt0)
-
-        def cond(t, ta_n_in):
-            return t < T_t
-
-        def body(t, ta_n_in):
-            # data slices (market t)
-            qjt_t = self.qjt[t]
-            q0t_t = self.q0t[t]
-            pjt_t = self.pjt[t]
-            wjt_t = self.wjt[t]
-
-            # state slices (market t)
-            E_bar_t = E_bar0[t]
-            njt_t = ta_n_in.read(t)
-            gamma_t = gamma0[t]
-            phi_t = phi0[t]
-
-            def logp_njt_t(njt_t_val: tf.Tensor) -> tf.Tensor:
-                ll = self.posterior.market_loglik(
-                    qjt_t=qjt_t,
-                    q0t_t=q0t_t,
-                    pjt_t=pjt_t,
-                    wjt_t=wjt_t,
-                    beta_p=self.beta_p,
-                    beta_w=self.beta_w,
-                    r=self.r,
-                    E_bar_t=E_bar_t,
-                    njt_t=njt_t_val,
-                )
-                lp_1 = self.posterior.logprior_market_vec(
-                    E_bar=tf.reshape(E_bar_t, (1,)),
-                    njt=tf.expand_dims(njt_t_val, axis=0),
-                    gamma=tf.expand_dims(gamma_t, axis=0),
-                    phi=tf.reshape(phi_t, (1,)),
-                )
-                return ll + lp_1[0]
-
-            njt_new, _ = tmh_step(
-                theta0=njt_t,
-                logp_fn=logp_njt_t,
-                ridge=ridge,
-                rng=self.rng,
-                k=k_njt,
-            )
-
-            ta_n_out = ta_n_in.write(t, njt_new)
-            return t + 1, ta_n_out
-
-        t0 = tf.constant(0, dtype=tf.int32)
-        _, ta_n = tf.while_loop(
-            cond,
-            body,
-            loop_vars=(t0, ta_n),
-            parallel_iterations=1,
-        )
-
-        # Commit once
-        self.njt.assign(ta_n.stack())
-
-    @tf.function(reduce_retracing=True)
-    def _update_gamma(self) -> None:
-        """
-        Update gamma for all markets given current njt and phi.
-
-        Vectorized Gibbs step across (T,J).
-        """
-        gamma_new = sample_gamma_given_n_phi_market(
-            njt_t=self.njt,  # (T,J)
-            phi_t=self.phi[:, None],  # broadcast to (T,1) -> (T,J)
-            T0_sq=self.posterior.T0_sq,
-            T1_sq=self.posterior.T1_sq,
-            log_T0_sq=self.posterior.log_T0_sq,
-            log_T1_sq=self.posterior.log_T1_sq,
+        # njt (market sweep)
+        njt_new, _ = update_njt(
+            posterior=self.posterior,
             rng=self.rng,
+            qjt=self.qjt,
+            q0t=self.q0t,
+            pjt=self.pjt,
+            wjt=self.wjt,
+            beta_p=self.beta_p,
+            beta_w=self.beta_w,
+            r=self.r,
+            E_bar=self.E_bar,
+            njt=self.njt,
+            gamma=self.gamma,
+            phi=self.phi,
+            k_njt=k_njt,
+            ridge=ridge,
         )
+        self.njt.assign(njt_new)
 
+        # gamma
+        gamma_new = update_gamma(
+            posterior=self.posterior,
+            rng=self.rng,
+            njt=self.njt,
+            phi=self.phi,
+        )
         self.gamma.assign(gamma_new)
 
-    @tf.function(reduce_retracing=True)
-    def _update_phi(self) -> None:
-        """
-        Update phi for all markets given current gamma via batched Gibbs.
-
-        phi_t | gamma_t ~ Beta(a_phi + sum_j gamma_tj, b_phi + J - sum_j gamma_tj)
-        """
-        phi_new = gibbs_phi(
-            gamma=self.gamma,  # (T,J)
-            a_phi=self.posterior.a_phi,  # scalar
-            b_phi=self.posterior.b_phi,  # scalar
+        # phi
+        phi_new = update_phi(
+            posterior=self.posterior,
             rng=self.rng,
+            gamma=self.gamma,
         )
         self.phi.assign(phi_new)
+
+        # diagnostics
+        self._diag.step(self, it)
