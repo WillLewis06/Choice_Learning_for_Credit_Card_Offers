@@ -4,304 +4,331 @@ import pytest
 from datasets.dgp import (
     generate_market_conditions,
     BasicLuChoiceModel,
+    _generate_market_shares,
     generate_market,
 )
 
 
-def run_pipeline(T, J, N, dgp_type, seed, beta_p=-1.0, beta_w=0.5, sigma=1.5):
-    """
-    Mirror simulation_run.py (Lu Section 4 DGP):
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _assert_all_finite(*arrays) -> None:
+    for a in arrays:
+        assert np.all(np.isfinite(a)), "Found non-finite values."
 
-      1) generate_market_conditions(T,J,dgp_type,seed)
-      2) pjt = alpha + 0.3*wjt + ujt
-      3) BasicLuChoiceModel(..., seed) draws heterogeneous beta_p_i
-      4) uijt = model.utilities(...)
-      5) (sjt, s0t, qjt, q0t) = generate_market(uijt, N=N, seed=seed)
-    """
-    wjt, E_bar_t, njt, Ejt, ujt, alpha = generate_market_conditions(
-        T=T, J=J, dgp_type=dgp_type, seed=seed
-    )
-    pjt = alpha + 0.3 * wjt + ujt
 
-    model = BasicLuChoiceModel(
-        N=N, beta_p=beta_p, beta_w=beta_w, sigma=sigma, seed=seed
+def _assert_in_unit_interval(x: np.ndarray, *, atol: float = 0.0) -> None:
+    assert np.all(x >= -atol), f"Values below 0 (min={x.min()})."
+    assert np.all(x <= 1.0 + atol), f"Values above 1 (max={x.max()})."
+
+
+def _assert_prob_simplex(
+    sjt: np.ndarray, s0t: np.ndarray, *, atol: float = 1e-12
+) -> None:
+    _assert_all_finite(sjt, s0t)
+    _assert_in_unit_interval(sjt, atol=atol)
+    _assert_in_unit_interval(s0t, atol=atol)
+
+    err = np.max(np.abs(s0t + sjt.sum(axis=1) - 1.0))
+    assert (
+        err <= atol
+    ), f"Share identity violated (max abs err={err:.3e}, atol={atol:.3e})."
+
+
+def _mean_abs_error(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.mean(np.abs(a - b)))
+
+
+def _make_problem(*, T: int = 5, J: int = 8, N_sim: int = 1000) -> tuple[int, int, int]:
+    return int(T), int(J), int(N_sim)
+
+
+# -----------------------------------------------------------------------------
+# generate_market_conditions
+# -----------------------------------------------------------------------------
+def test_generate_market_conditions_invalid_dgp_type_raises():
+    with pytest.raises(ValueError):
+        generate_market_conditions(T=3, J=4, dgp_type=0, seed=123)
+    with pytest.raises(ValueError):
+        generate_market_conditions(T=3, J=4, dgp_type=5, seed=123)
+
+
+@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
+def test_generate_market_conditions_shapes_and_finite(dgp_type):
+    T, J, _ = _make_problem(T=7, J=11, N_sim=10)
+    wjt, Ejt, ujt, alpha = generate_market_conditions(
+        T=T, J=J, dgp_type=dgp_type, seed=123
     )
+
+    assert wjt.shape == (T, J)
+    assert Ejt.shape == (T, J)
+    assert ujt.shape == (T, J)
+    assert alpha.shape == (T, J)
+
+    _assert_all_finite(wjt, Ejt, ujt, alpha)
+
+
+@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
+def test_generate_market_conditions_wjt_support(dgp_type):
+    T, J, _ = _make_problem(T=7, J=11, N_sim=10)
+    wjt, Ejt, ujt, alpha = generate_market_conditions(
+        T=T, J=J, dgp_type=dgp_type, seed=123
+    )
+
+    assert np.min(wjt) >= 1.0
+    assert np.max(wjt) <= 2.0
+    _assert_all_finite(Ejt, ujt, alpha)
+
+
+@pytest.mark.parametrize("dgp_type", [1, 2])
+def test_generate_market_conditions_njt_structure_sparse_dgp12(dgp_type):
+    """
+    For DGP 1/2:
+      - E_bar_t is fixed at -1, so njt = Ejt - E_bar_t = Ejt + 1
+      - n_active = int(0.4*J)
+      - for j < n_active: njt[t,j] = +1 if j even else -1
+      - for j >= n_active: njt[t,j] = 0
+    """
+    T, J, _ = _make_problem(T=10, J=15, N_sim=10)
+    wjt, Ejt, ujt, alpha = generate_market_conditions(
+        T=T, J=J, dgp_type=dgp_type, seed=123
+    )
+
+    njt = Ejt + 1.0
+    n_active = int(0.4 * J)
+
+    for t in range(T):
+        active = njt[t, :n_active]
+        inactive = njt[t, n_active:]
+
+        expected_active = np.array(
+            [1.0 if (j % 2 == 0) else -1.0 for j in range(n_active)],
+            dtype=float,
+        )
+
+        assert np.array_equal(active, expected_active)
+        assert np.array_equal(inactive, np.zeros(J - n_active, dtype=float))
+
+    _assert_all_finite(wjt, ujt, alpha)
+
+
+@pytest.mark.parametrize("dgp_type", [1, 3])
+def test_generate_market_conditions_alpha_rules_dgp1_and_dgp3(dgp_type):
+    T, J, _ = _make_problem(T=6, J=12, N_sim=10)
+    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=dgp_type, seed=123)
+    assert np.array_equal(alpha, np.zeros((T, J), dtype=float))
+
+    # Sanity: njt exists (via Ejt + 1), but alpha is still zero
+    njt = Ejt + 1.0
+    _assert_all_finite(njt)
+
+
+def test_generate_market_conditions_alpha_rules_dgp2():
+    T, J, _ = _make_problem(T=6, J=15, N_sim=10)
+    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=2, seed=123)
+    njt = Ejt + 1.0  # since E_bar_t = -1
+
+    expected = np.zeros((T, J), dtype=float)
+    expected[njt == 1.0] = 0.3
+    expected[njt == -1.0] = -0.3
+
+    assert np.array_equal(alpha, expected)
+
+
+def test_generate_market_conditions_alpha_rules_dgp4():
+    T, J, _ = _make_problem(T=6, J=12, N_sim=10)
+    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=4, seed=123)
+    njt = Ejt + 1.0  # since E_bar_t = -1
+
+    thr = 1.0 / 3.0
+    expected = np.zeros((T, J), dtype=float)
+    expected[njt >= thr] = 0.3
+    expected[njt <= -thr] = -0.3
+
+    assert np.array_equal(alpha, expected)
+
+
+# -----------------------------------------------------------------------------
+# BasicLuChoiceModel.utilities
+# -----------------------------------------------------------------------------
+def test_utilities_rejects_bad_rank_inputs():
+    model = BasicLuChoiceModel(N=10, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
+
+    pjt = np.zeros((3, 4), dtype=float)
+    wjt = np.zeros((3, 4), dtype=float)
+    Ejt = np.zeros((3, 4), dtype=float)
+
+    with pytest.raises(ValueError):
+        model.utilities(pjt=pjt[0], wjt=wjt, Ejt=Ejt)  # 1D pjt
+    with pytest.raises(ValueError):
+        model.utilities(pjt=pjt, wjt=wjt[..., None], Ejt=Ejt)  # 3D wjt
+    with pytest.raises(ValueError):
+        model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt[..., None])  # 3D Ejt
+
+
+def test_utilities_rejects_mismatched_shapes():
+    model = BasicLuChoiceModel(N=10, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
+
+    pjt = np.zeros((3, 4), dtype=float)
+    wjt = np.zeros((3, 5), dtype=float)
+    Ejt = np.zeros((3, 4), dtype=float)
+
+    with pytest.raises(ValueError):
+        model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
+
+
+def test_utilities_output_shape():
+    T, J, N_sim = _make_problem(T=4, J=6, N_sim=17)
+    model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
+
+    pjt = np.zeros((T, J), dtype=float)
+    wjt = np.ones((T, J), dtype=float)
+    Ejt = np.zeros((T, J), dtype=float)
+
+    uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
+    assert uijt.shape == (T, N_sim, J)
+    _assert_all_finite(uijt)
+
+
+def test_utilities_sigma_zero_constant_across_consumers():
+    T, J, N_sim = _make_problem(T=4, J=6, N_sim=25)
+    model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=0.0, seed=123)
+
+    pjt = np.random.normal(size=(T, J))
+    wjt = np.random.uniform(1.0, 2.0, size=(T, J))
+    Ejt = np.random.normal(size=(T, J))
+
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=seed)
-
-    return {
-        "wjt": wjt,
-        "E_bar_t": E_bar_t,
-        "njt": njt,
-        "Ejt": Ejt,
-        "ujt": ujt,
-        "alpha": alpha,
-        "pjt": pjt,
-        "uijt": uijt,
-        "sjt": sjt,
-        "s0t": s0t,
-        "qjt": qjt,
-        "q0t": q0t,
-        "N": int(N),
-    }
+    base = uijt[:, 0, :]
+    for i in range(1, N_sim):
+        assert np.allclose(uijt[:, i, :], base, atol=0.0, rtol=0.0)
 
 
-# ---------------------------------------------------------------------
-# 1) Basic shape + validity
-# ---------------------------------------------------------------------
-@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
-def test_shapes(dgp_type):
-    T, J, N = 25, 15, 200
-    out = run_pipeline(T=T, J=J, N=N, dgp_type=dgp_type, seed=123)
+def test_utilities_reduces_when_beta_w_zero_and_Ejt_zero():
+    T, J, N_sim = _make_problem(T=3, J=5, N_sim=12)
+    model = BasicLuChoiceModel(N=N_sim, beta_p=-2.0, beta_w=0.0, sigma=1.3, seed=123)
 
-    assert out["wjt"].shape == (T, J)
-    assert out["E_bar_t"].shape == (T,)
-    assert out["njt"].shape == (T, J)
-    assert out["Ejt"].shape == (T, J)
-    assert out["ujt"].shape == (T, J)
-    assert out["alpha"].shape == (T, J)
-    assert out["pjt"].shape == (T, J)
-    assert out["uijt"].shape == (T, N, J)
-    assert out["sjt"].shape == (T, J)
-    assert out["s0t"].shape == (T,)
-    assert out["qjt"].shape == (T, J)
-    assert out["q0t"].shape == (T,)
+    pjt = np.random.normal(size=(T, J))
+    wjt = np.random.uniform(1.0, 2.0, size=(T, J))
+    Ejt = np.zeros((T, J), dtype=float)
+
+    uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
+
+    expected = np.zeros_like(uijt)
+    for t in range(T):
+        expected[t] = model.beta_p_i[:, None] * pjt[t][None, :]
+
+    assert np.allclose(uijt, expected)
 
 
-@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
-def test_share_validity_and_identity(dgp_type):
-    T, J, N = 25, 15, 200
-    out = run_pipeline(T=T, J=J, N=N, dgp_type=dgp_type, seed=123)
-
-    sjt = out["sjt"]
-    s0t = out["s0t"]
-
-    assert np.all(np.isfinite(sjt))
-    assert np.all(np.isfinite(s0t))
-
-    # Shares must be in [0,1]
-    assert np.all(sjt >= 0.0)
-    assert np.all(sjt <= 1.0)
-    assert np.all(s0t >= 0.0)
-    assert np.all(s0t <= 1.0)
-
-    # Share identity: s0t + sum_j sjt == 1
-    share_err = np.max(np.abs(s0t + sjt.sum(axis=1) - 1.0))
-    assert share_err < 1e-12, f"Share identity violated: max error={share_err:.3e}"
+# -----------------------------------------------------------------------------
+# _generate_market_shares
+# -----------------------------------------------------------------------------
+def test_generate_market_shares_rejects_non_3d_uijt():
+    with pytest.raises(ValueError):
+        _generate_market_shares(np.zeros((3, 4), dtype=float))
 
 
-@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
-def test_count_validity_and_identity(dgp_type):
-    T, J, N = 25, 15, 200
-    out = run_pipeline(T=T, J=J, N=N, dgp_type=dgp_type, seed=123)
+def test_generate_market_shares_simplex_and_bounds():
+    T, J, N_sim = _make_problem(T=4, J=7, N_sim=50)
+    uijt = np.random.normal(size=(T, N_sim, J))
 
-    qjt = out["qjt"]
-    q0t = out["q0t"]
+    sjt, s0t = _generate_market_shares(uijt)
+    assert sjt.shape == (T, J)
+    assert s0t.shape == (T,)
+    _assert_prob_simplex(sjt, s0t, atol=1e-12)
+
+
+def test_generate_market_shares_extreme_negative_utilities_outside_near_one():
+    T, J, N_sim = _make_problem(T=3, J=5, N_sim=20)
+    uijt = -50.0 * np.ones((T, N_sim, J), dtype=float)
+
+    sjt, s0t = _generate_market_shares(uijt)
+    _assert_prob_simplex(sjt, s0t, atol=1e-12)
+
+    assert np.all(s0t > 1.0 - 1e-10)
+    assert np.all(sjt < 1e-10)
+
+
+def test_generate_market_shares_extreme_positive_utilities_outside_near_zero():
+    T, J, N_sim = _make_problem(T=3, J=5, N_sim=20)
+    uijt = 50.0 * np.ones((T, N_sim, J), dtype=float)
+
+    sjt, s0t = _generate_market_shares(uijt)
+    _assert_prob_simplex(sjt, s0t, atol=1e-12)
+
+    assert np.all(s0t < 1e-10)
+    assert np.all(np.abs(sjt.sum(axis=1) - 1.0) < 1e-10)
+
+
+def test_generate_market_shares_monotone_under_additive_shift():
+    T, J, N_sim = _make_problem(T=4, J=6, N_sim=100)
+    uijt = np.random.normal(size=(T, N_sim, J))
+
+    sjt0, s0t0 = _generate_market_shares(uijt)
+    sjt1, s0t1 = _generate_market_shares(uijt + 1.0)
+
+    assert np.all(s0t1 < s0t0)
+    assert np.all(sjt1.sum(axis=1) > sjt0.sum(axis=1))
+
+    _assert_prob_simplex(sjt0, s0t0, atol=1e-12)
+    _assert_prob_simplex(sjt1, s0t1, atol=1e-12)
+
+
+# -----------------------------------------------------------------------------
+# generate_market
+# -----------------------------------------------------------------------------
+def test_generate_market_rejects_non_3d_uijt():
+    with pytest.raises(ValueError):
+        generate_market(uijt=np.zeros((3, 4), dtype=float), N=100, seed=123)
+
+
+def test_generate_market_count_identity_and_shapes():
+    T, J, N_sim = _make_problem(T=5, J=8, N_sim=500)
+    N = 2000
+
+    uijt = np.random.normal(size=(T, N_sim, J))
+
+    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=123)
+
+    assert sjt.shape == (T, J)
+    assert s0t.shape == (T,)
+    assert qjt.shape == (T, J)
+    assert q0t.shape == (T,)
 
     assert np.issubdtype(qjt.dtype, np.integer)
     assert np.issubdtype(q0t.dtype, np.integer)
-
     assert np.all(qjt >= 0)
     assert np.all(q0t >= 0)
 
-    # Multinomial accounting per market: q0t + sum_j qjt == N
     totals = q0t + qjt.sum(axis=1)
     assert np.all(
         totals == N
     ), f"Count identity violated: min={totals.min()}, max={totals.max()}, N={N}"
 
+    _assert_prob_simplex(sjt, s0t, atol=1e-12)
 
-# ---------------------------------------------------------------------
-# 2) Sparse vs dense njt structure (matches dgp.py exactly)
-# ---------------------------------------------------------------------
-@pytest.mark.parametrize("dgp_type", [1, 2])
-def test_sparse_njt_exact_pattern(dgp_type):
+
+def test_generate_market_q_over_N_approximates_sjt_large_N():
     """
-    For DGP 1/2, njt is deterministic:
-      - n_active = int(0.4*J)
-      - for j < n_active: njt[t,j] = +1 if j even else -1
-      - for j >= n_active: njt[t,j] = 0
+    For large N, multinomial counts qjt should concentrate around expected shares sjt.
+
+    This is intentionally loose and averages across all T*J cells to reduce variance.
     """
-    T, J, N = 10, 15, 50
-    out = run_pipeline(T=T, J=J, N=N, dgp_type=dgp_type, seed=123)
-    njt = out["njt"]
+    T, J, N_sim = _make_problem(T=6, J=10, N_sim=2000)
+    N = 20000
 
-    n_active = int(0.4 * J)
-    for t in range(T):
-        expected_active = np.array(
-            [1.0 if j % 2 == 0 else -1.0 for j in range(n_active)]
-        )
-        assert np.array_equal(njt[t, :n_active], expected_active)
-        assert np.array_equal(njt[t, n_active:], np.zeros(J - n_active))
+    wjt, Ejt, ujt, alpha = generate_market_conditions(T=T, J=J, dgp_type=4, seed=123)
+    pjt = alpha + 0.3 * wjt + ujt
 
+    model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=1.5, seed=123)
+    uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-@pytest.mark.parametrize("dgp_type", [3, 4])
-def test_dense_njt_not_sparse(dgp_type):
-    """
-    For DGP 3/4, njt is drawn from Normal(0, 1/3), so it should not contain many exact zeros.
-    We test that the fraction of (near-)zeros is small.
-    """
-    T, J, N = 25, 25, 50
-    out = run_pipeline(T=T, J=J, N=N, dgp_type=dgp_type, seed=123)
-    njt = out["njt"]
+    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=123)
 
-    near_zero = np.mean(np.abs(njt) < 1e-12)
-    assert (
-        near_zero < 1e-3
-    ), f"Unexpected near-zero mass for dense njt: frac={near_zero:.3e}"
+    mae_inside = _mean_abs_error(qjt / float(N), sjt)
+    mae_outside = _mean_abs_error(q0t / float(N), s0t)
 
-
-# ---------------------------------------------------------------------
-# 3) Endogeneity on/off signal in price equation
-# ---------------------------------------------------------------------
-def _corr_flat(a, b):
-    a = np.asarray(a).ravel()
-    b = np.asarray(b).ravel()
-    return np.corrcoef(a, b)[0, 1]
-
-
-def test_endogeneity_signal_relative_strength():
-    """
-    In dgp.py:
-      - DGP 1/3: alpha == 0 => pjt = 0.3*wjt + ujt (no designed link to Ejt)
-      - DGP 2/4: alpha depends on njt, and Ejt = -1 + njt => designed correlation between pjt and Ejt
-
-    Use a relative comparison (endogenous corr > exogenous corr + margin) to reduce flakiness.
-    """
-    T, J, N = 50, 30, 100
-    seed = 123
-
-    out1 = run_pipeline(T=T, J=J, N=N, dgp_type=1, seed=seed)
-    out2 = run_pipeline(T=T, J=J, N=N, dgp_type=2, seed=seed)
-    out3 = run_pipeline(T=T, J=J, N=N, dgp_type=3, seed=seed)
-    out4 = run_pipeline(T=T, J=J, N=N, dgp_type=4, seed=seed)
-
-    c1 = _corr_flat(out1["pjt"], out1["Ejt"])
-    c2 = _corr_flat(out2["pjt"], out2["Ejt"])
-    c3 = _corr_flat(out3["pjt"], out3["Ejt"])
-    c4 = _corr_flat(out4["pjt"], out4["Ejt"])
-
-    assert (
-        c2 > c1 + 0.05
-    ), f"DGP2 endogeneity not stronger than DGP1: corr2={c2:.3f}, corr1={c1:.3f}"
-    assert (
-        c4 > c3 + 0.05
-    ), f"DGP4 endogeneity not stronger than DGP3: corr4={c4:.3f}, corr3={c3:.3f}"
-
-
-# ---------------------------------------------------------------------
-# 5) Utility/share monotonicity sanity checks
-# ---------------------------------------------------------------------
-def test_beta_p_more_negative_reduces_inside_shares():
-    """
-    Holding (wjt, Ejt, alpha, ujt) fixed via seed,
-    making beta_p more negative should reduce mean inside shares.
-    """
-    T, J, N = 25, 15, 400
-    seed = 123
-    dgp_type = 3
-
-    out_lo = run_pipeline(
-        T=T, J=J, N=N, dgp_type=dgp_type, seed=seed, beta_p=-0.5, sigma=1.5
-    )
-    out_hi = run_pipeline(
-        T=T, J=J, N=N, dgp_type=dgp_type, seed=seed, beta_p=-2.0, sigma=1.5
-    )
-
-    mean_inside_lo = out_lo["sjt"].sum(axis=1).mean()
-    mean_inside_hi = out_hi["sjt"].sum(axis=1).mean()
-
-    assert mean_inside_hi < mean_inside_lo, (
-        f"Expected more negative beta_p to reduce inside shares. "
-        f"Got mean_inside(beta_p=-2.0)={mean_inside_hi:.6f}, "
-        f"mean_inside(beta_p=-0.5)={mean_inside_lo:.6f}"
-    )
-
-
-def test_sigma_increases_heterogeneity_in_shares():
-    """
-    With sigma=0, all consumers share the same beta_p, so within-market shares are less dispersed.
-    With sigma>0, heterogeneity in beta_p increases dispersion in predicted shares.
-    """
-    T, J, N = 25, 15, 800
-    seed = 123
-    dgp_type = 3
-
-    out0 = run_pipeline(
-        T=T, J=J, N=N, dgp_type=dgp_type, seed=seed, beta_p=-1.0, sigma=0.0
-    )
-    out1 = run_pipeline(
-        T=T, J=J, N=N, dgp_type=dgp_type, seed=seed, beta_p=-1.0, sigma=1.5
-    )
-
-    disp0 = out0["sjt"].std(axis=1).mean()
-    disp1 = out1["sjt"].std(axis=1).mean()
-
-    assert (
-        disp1 > disp0
-    ), f"Expected higher dispersion with sigma>0. Got disp1={disp1:.6f}, disp0={disp0:.6f}"
-
-
-# ---------------------------------------------------------------------
-# 6) Direct unit tests for generate_market (replaces generate_market_shares tests)
-# ---------------------------------------------------------------------
-def test_generate_market_rejects_bad_shape():
-    with pytest.raises(ValueError):
-        generate_market(np.zeros((2, 3)), N=100, seed=0)  # not (T,N,J)
-
-
-def test_generate_market_extreme_negative_utilities_outside_dominates():
-    # Very negative inside utilities => inside probs ~ 0 => s0 ~ 1
-    T, N_sim, J = 3, 50, 10
-    N = 200
-    uijt = -1000.0 * np.ones((T, N_sim, J))
-    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=0)
-
-    assert np.all(sjt >= 0.0)
-    assert np.all(s0t <= 1.0)
-    assert np.all(
-        s0t > 1.0 - 1e-10
-    ), f"Expected outside share ~1, got min(s0t)={s0t.min():.12f}"
-
-    # Underflow makes inside probs exactly 0 here, so multinomial draw is deterministic.
-    assert np.all(qjt == 0)
-    assert np.all(q0t == N)
-
-
-def test_generate_market_extreme_positive_utilities_inside_dominates():
-    # Very positive inside utilities => outside prob ~ 0 => s0 ~ 0
-    T, N_sim, J = 3, 50, 10
-    N = 200
-    uijt = 1000.0 * np.ones((T, N_sim, J))
-    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=0)
-
-    assert np.all(s0t >= 0.0)
-    assert np.all(
-        s0t < 1e-10
-    ), f"Expected outside share ~0, got max(s0t)={s0t.max():.12f}"
-
-    # Underflow makes outside prob exactly 0 here, so multinomial draw is deterministic.
-    assert np.all(q0t == 0)
-    assert np.all(qjt.sum(axis=1) == N)
-
-
-def test_generate_market_additive_shift_increases_inside_share():
-    # Adding a constant to all inside utilities should increase inside shares (reduce outside).
-    T, N_sim, J = 3, 200, 10
-    N = 500
-    rng = np.random.default_rng(0)
-    base = rng.normal(size=(T, N_sim, J))
-
-    sjt0, s0t0, _, _ = generate_market(uijt=base, N=N, seed=0)
-    sjt1, s0t1, _, _ = generate_market(uijt=base + 1.0, N=N, seed=0)
-
-    inside0 = sjt0.sum(axis=1)
-    inside1 = sjt1.sum(axis=1)
-
-    assert np.all(
-        inside1 > inside0
-    ), "Expected inside share to increase after positive utility shift."
-    assert np.all(
-        s0t1 < s0t0
-    ), "Expected outside share to decrease after positive utility shift."
+    assert mae_inside < 0.02, f"MAE(qjt/N, sjt) too large: {mae_inside:.4f}"
+    assert mae_outside < 0.02, f"MAE(q0t/N, s0t) too large: {mae_outside:.4f}"
