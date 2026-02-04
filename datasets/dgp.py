@@ -1,73 +1,68 @@
+"""
+Synthetic data generation for Lu-style random-coefficient logit experiments.
+
+This module provides:
+  - Market primitives (wjt, Ejt, ujt, alpha) under several DGP variants.
+  - A simple random-coefficient logit simulator (normal heterogeneity in price).
+  - Aggregation from simulated utilities to expected shares and realized counts.
+"""
+
 import numpy as np
 
 
 def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
-    """
-    Generate market/product primitives for Lu–Shimizu (2025), Section 4.1.
+    """Generate market primitives and a price-endogeneity shifter.
 
-    Notation mapping to the paper:
-      wjt    : exogenous characteristic w_jt ~ U(1,2)
-      E_bar_t: market intercept xi_bar*_t, fixed at -1
-      njt    : eta*_jt (market-product deviations)
-      Ejt    : xi*_jt = xi_bar*_t + eta*_jt
-      ujt    : cost shock u_jt ~ N(0, 0.7^2)
-      alpha  : alpha*_jt (endogeneity shifter in price equation)
+    The demand shock is constructed as:
+      Ejt = E_bar_t + n_jt, with E_bar_t fixed at -1 for all markets.
 
-    DGP designs (paper):
-      DGP1: sparse eta, exogenous price (alpha=0)
-      DGP2: sparse eta, endogenous price (alpha depends on eta)
-      DGP3: non-sparse eta ~ N(0,(1/3)^2), exogenous price (alpha=0)
-      DGP4: non-sparse eta, endogenous price (alpha depends on eta threshold)
+    DGP variants:
+      1) Sparse n_jt, exogenous prices (alpha = 0)
+      2) Sparse n_jt, endogenous prices (alpha depends on sign of n_jt)
+      3) Dense n_jt ~ Normal(0, (1/3)^2), exogenous prices (alpha = 0)
+      4) Dense n_jt, endogenous prices (alpha depends on thresholded n_jt)
 
     Args:
-      T, J     : number of markets and products
-      dgp_type : 1..4
-      seed     : integer seed (function owns its RNG)
+        T: Number of markets.
+        J: Number of products.
+        dgp_type: Integer in {1, 2, 3, 4}.
+        seed: RNG seed.
 
     Returns:
-      wjt     : (T,J)
-      E_bar_t : (T,)
-      njt     : (T,J)
-      Ejt     : (T,J)
-      ujt     : (T,J)
-      alpha   : (T,J)
+        wjt: Exogenous characteristic, shape (T, J), Uniform(1, 2).
+        Ejt: Demand shock, shape (T, J).
+        ujt: Cost shock, shape (T, J), Normal(0, 0.7^2).
+        alpha: Price endogeneity shifter, shape (T, J).
     """
     if dgp_type not in (1, 2, 3, 4):
         raise ValueError("dgp_type must be 1, 2, 3, or 4")
 
     rng = np.random.default_rng(int(seed))
 
-    # Exogenous product characteristic: wjt ~ U(1,2)
+    # Product characteristic and baseline market component of the shock.
     wjt = rng.uniform(1.0, 2.0, size=(T, J))
-
-    # Market-level intercept: xi_bar*_t fixed at -1 for all t
     E_bar_t = -1.0 * np.ones(T, dtype=float)
 
-    # Market-product deviations: eta*_jt
-    if dgp_type in (1, 2):  # sparse eta (deterministic pattern)
+    # Market-product shock: sparse (deterministic pattern) or dense (Gaussian).
+    if dgp_type in (1, 2):
         njt = np.zeros((T, J), dtype=float)
         n_active = int(0.4 * J)
         for t in range(T):
             for j in range(n_active):
-                # With 0-based indexing: j=0 -> +1, j=1 -> -1, ...
                 njt[t, j] = 1.0 if (j % 2 == 0) else -1.0
-    else:  # non-sparse eta ~ N(0, (1/3)^2)
+    else:
         njt = rng.normal(0.0, 1.0 / 3.0, size=(T, J))
 
-    # Unobserved demand shock: xi*_jt = xi_bar*_t + eta*_jt
+    # Total demand shock and cost shock used in the pricing rule.
     Ejt = E_bar_t[:, None] + njt
-
-    # Cost shock in price equation: ujt ~ N(0, 0.7^2)
     ujt = rng.normal(0.0, 0.7, size=(T, J))
 
-    # Endogeneity shifter alpha*_jt (depends on DGP)
+    # alpha creates correlation between prices and the demand shock for endogenous-price DGPs.
     alpha = np.zeros((T, J), dtype=float)
     if dgp_type == 2:
-        # DGP2: alpha*_jt = 0.3 if eta=1, -0.3 if eta=-1, 0 otherwise
         alpha[njt == 1.0] = 0.3
         alpha[njt == -1.0] = -0.3
     elif dgp_type == 4:
-        # DGP4: alpha*_jt = 0.3 if eta>=1/3, -0.3 if eta<=-1/3, 0 otherwise
         thr = 1.0 / 3.0
         alpha[njt >= thr] = 0.3
         alpha[njt <= -thr] = -0.3
@@ -76,14 +71,7 @@ def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
 
 
 class BasicLuChoiceModel:
-    """
-    Simulation-side RC logit choice model used in Lu–Shimizu Section 4.1:
-
-      u_ijt = beta_{p,i} * p_jt + beta_w * w_jt + xi_jt
-      beta_{p,i} ~ N(beta_p, sigma^2)
-
-    eps_ijt is implicit (logit choice probabilities).
-    """
+    """Random-coefficient logit with normal heterogeneity in price coefficient."""
 
     def __init__(
         self,
@@ -93,6 +81,15 @@ class BasicLuChoiceModel:
         sigma: float,
         seed: int,
     ):
+        """Initialize simulated consumers via beta_{p,i} draws.
+
+        Args:
+            N: Number of simulated consumers.
+            beta_p: Mean price coefficient.
+            beta_w: Coefficient on wjt.
+            sigma: Std. dev. of price coefficient heterogeneity.
+            seed: RNG seed.
+        """
         self.N = int(N)
         self.beta_w = float(beta_w)
 
@@ -102,100 +99,108 @@ class BasicLuChoiceModel:
     def utilities(
         self, pjt: np.ndarray, wjt: np.ndarray, Ejt: np.ndarray
     ) -> np.ndarray:
-        """
-        Compute systematic utilities (excluding Gumbel eps).
+        """Compute systematic utilities for each market, consumer, and product.
+
+        Utility used here:
+          u_{i,j,t} = beta_{p,i} * p_{j,t} + beta_w * w_{j,t} + E_{j,t}
 
         Args:
-          pjt : (T,J)
-          wjt : (T,J)
-          Ejt : (T,J)
+            pjt: Prices, shape (T, J).
+            wjt: Characteristics, shape (T, J).
+            Ejt: Demand shocks, shape (T, J).
 
         Returns:
-          uijt : (T, N, J)
+            uijt: Systematic utilities, shape (T, N, J).
         """
         pjt = np.asarray(pjt, dtype=float)
         wjt = np.asarray(wjt, dtype=float)
         Ejt = np.asarray(Ejt, dtype=float)
 
         if pjt.ndim != 2 or wjt.ndim != 2 or Ejt.ndim != 2:
-            raise ValueError("pjt, wjt, Ejt must be 2D arrays of shape (T,J).")
+            raise ValueError("pjt, wjt, Ejt must be 2D arrays of shape (T, J).")
         if pjt.shape != wjt.shape or pjt.shape != Ejt.shape:
-            raise ValueError("pjt, wjt, Ejt must have the same shape (T,J).")
+            raise ValueError("pjt, wjt, Ejt must have the same shape (T, J).")
 
         T, J = pjt.shape
         uijt = np.zeros((T, self.N, J), dtype=float)
+
+        # Market loop keeps memory usage predictable and mirrors the model structure.
         for t in range(T):
             uijt[t] = (
                 self.beta_p_i[:, None] * pjt[t][None, :]
                 + self.beta_w * wjt[t][None, :]
                 + Ejt[t][None, :]
             )
+
         return uijt
 
 
 def _generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert systematic utilities into expected shares by averaging logit choice
-    probabilities across simulated consumers.
+    """Compute expected inside and outside shares from simulated utilities.
+
+    This computes, for each market t:
+      s_{j,t} = E_i[ exp(u_{i,j,t}) / (1 + sum_k exp(u_{i,k,t})) ]
+      s_{0,t} = E_i[ 1 / (1 + sum_k exp(u_{i,k,t})) ]
 
     Args:
-      uijt : (T, N, J)
+        uijt: Systematic utilities, shape (T, N, J).
 
     Returns:
-      sjt  : (T, J)
-      s0t  : (T,)
+        sjt: Expected inside shares, shape (T, J).
+        s0t: Expected outside shares, shape (T,).
     """
     uijt = np.asarray(uijt, dtype=float)
     if uijt.ndim != 3:
-        raise ValueError("uijt must have shape (T, N, J)")
+        raise ValueError("uijt must have shape (T, N, J).")
 
-    # Stabilize softmax with outside option utility normalized to 0.
-    m_inside = np.max(uijt, axis=2, keepdims=True)  # (T, N, 1)
-    m = np.maximum(0.0, m_inside)  # include outside option in max
+    # Log-sum-exp stabilization per (t, i) to reduce overflow in exp(u).
+    m_inside = np.max(uijt, axis=2, keepdims=True)
+    m = np.maximum(0.0, m_inside)
 
-    exp_u = np.exp(uijt - m)  # (T, N, J)
-    exp_out = np.exp(-m[..., 0])  # (T, N)
+    exp_u = np.exp(uijt - m)
+    exp_out = np.exp(-m[..., 0])
+    denom = exp_out + np.sum(exp_u, axis=2)
 
-    denom = exp_out + np.sum(exp_u, axis=2)  # (T, N)
+    probs = exp_u / denom[..., None]
+    out_prob = exp_out / denom
 
-    probs = exp_u / denom[..., None]  # (T, N, J)
-    out_prob = exp_out / denom  # (T, N)
-
-    sjt = np.mean(probs, axis=1)  # (T, J)
-    s0t = np.mean(out_prob, axis=1)  # (T,)
-
+    sjt = np.mean(probs, axis=1)
+    s0t = np.mean(out_prob, axis=1)
     return sjt, s0t
 
 
 def generate_market(
     uijt: np.ndarray, N: int, seed: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate expected shares and multinomial counts from simulated utilities.
+    """Generate expected shares and realized multinomial counts for each market.
+
+    The counts correspond to N independent consumers choosing among:
+      {outside option} ∪ {J inside goods},
+    where choice probabilities are computed from uijt.
 
     Args:
-      uijt : (T, N_sim, J)
-      N    : number of consumers (multinomial trials)
-      seed : integer seed (function owns its RNG)
+        uijt: Systematic utilities, shape (T, N_sim, J).
+        N: Number of consumers per market for multinomial sampling.
+        seed: RNG seed.
 
     Returns:
-      sjt : (T,J) expected shares
-      s0t : (T,) expected outside share
-      qjt : (T,J) multinomial counts for inside goods
-      q0t : (T,) multinomial counts for outside good
+        sjt: Expected inside shares, shape (T, J).
+        s0t: Expected outside shares, shape (T,).
+        qjt: Realized inside counts, shape (T, J).
+        q0t: Realized outside counts, shape (T,).
     """
     uijt = np.asarray(uijt, dtype=float)
     if uijt.ndim != 3:
         raise ValueError("uijt must have shape (T, N_sim, J).")
 
     rng = np.random.default_rng(int(seed))
-
     sjt, s0t = _generate_market_shares(uijt)
 
     T, J = sjt.shape
     qjt = np.zeros((T, J), dtype=int)
     q0t = np.zeros(T, dtype=int)
 
+    # Market-by-market multinomial draw of counts given expected shares.
     for t in range(T):
         probs = np.concatenate([[s0t[t]], sjt[t]])
         probs = probs / probs.sum()

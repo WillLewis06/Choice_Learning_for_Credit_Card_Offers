@@ -1,4 +1,19 @@
+"""
+Input validation for the Lu shrinkage estimator.
+
+This module centralizes all shape, dtype, and basic value checks used by:
+  - LuShrinkageEstimator.__init__ and .fit (Python-side validation),
+  - tuning utilities (Python-side validation),
+  - TMH kernel calls (TF-graph-safe validation usable inside tf.function).
+
+Design:
+  - Python-side validation is strict and raises early with clear messages.
+  - TF-side validation uses tf.debugging asserts so it can run inside compiled
+    graphs without breaking tracing.
+"""
+
 from __future__ import annotations
+
 import tensorflow as tf
 
 # -----------------------------------------------------------------------------
@@ -7,21 +22,24 @@ import tensorflow as tf
 
 
 def _require(cond: bool, msg: str) -> None:
+    """Raise ValueError if cond is False."""
     if not cond:
         raise ValueError(msg)
 
 
 def _require_type(x, types, msg: str) -> None:
+    """Raise TypeError if x is not an instance of types."""
     if not isinstance(x, types):
         raise TypeError(msg)
 
 
 def _is_float_like(x) -> bool:
-    # strict: require Python float/int (no numpy scalars unless you choose to add them)
+    """Return True for Python float/int values (excluding bool)."""
     return isinstance(x, (float, int)) and not isinstance(x, bool)
 
 
 def _require_tensor_rank(x: tf.Tensor, rank: int, name: str) -> None:
+    """Require a static tensor rank (Python-side)."""
     _require(
         x.shape.rank == rank,
         f"{name} must have rank {rank}; got rank {x.shape.rank}.",
@@ -29,25 +47,30 @@ def _require_tensor_rank(x: tf.Tensor, rank: int, name: str) -> None:
 
 
 def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
+    """Require x to be a tf.Tensor with dtype tf.float64."""
     _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
     _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
 
 
 def _require_float64_variable(x, name: str) -> None:
+    """Require x to be a tf.Variable with dtype tf.float64."""
     _require_type(x, tf.Variable, f"{name} must be a tf.Variable (no backward compat).")
     _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
 
 
 def _require_positive_int(x: int, name: str) -> None:
+    """Require x to be a positive Python int."""
     _require_type(x, int, f"{name} must be an int.")
     _require(x > 0, f"{name} must be > 0; got {x}.")
 
 
 def _require_float(x: float, name: str) -> None:
+    """Require x to be a Python float/int (excluding bool)."""
     _require(_is_float_like(x), f"{name} must be a float or int; got {type(x)}.")
 
 
 def _require_prob_band(low: float, high: float, low_name: str, high_name: str) -> None:
+    """Require 0 <= low <= high <= 1 for acceptance-rate targets."""
     _require_float(low, low_name)
     _require_float(high, high_name)
     _require(0.0 <= float(low) <= 1.0, f"{low_name} must be in [0,1]; got {low}.")
@@ -71,14 +94,13 @@ def init_validate_input(
     n_draws: int,
     seed: int,
 ) -> None:
-    """
-    Validation contract for LuShrinkageEstimator.__init__.
+    """Validate LuShrinkageEstimator.__init__ inputs.
 
-    Strict (no coercion):
-      - pjt, wjt, qjt: tf.float64 tensors, rank-2, identical shape (T,J) with T,J known.
-      - q0t: tf.float64 tensor, rank-1 shape (T,) with same T as pjt.
+    Strict contract:
+      - pjt, wjt, qjt: tf.float64, rank-2, identical static shape (T, J).
+      - q0t: tf.float64, rank-1, static shape (T,) matching pjt.shape[0].
       - n_draws: int > 0
-      - seed: int (any value allowed)
+      - seed: int
     """
     _require_float64_tensor(pjt, "pjt")
     _require_float64_tensor(wjt, "wjt")
@@ -99,7 +121,7 @@ def init_validate_input(
         f"qjt must have same shape as pjt; got {qjt.shape} vs {pjt.shape}.",
     )
 
-    # Require static T/J for simplicity (no backward compatibility).
+    # Require static (T, J) so downstream code can allocate variables once.
     _require(
         pjt.shape[0] is not None and pjt.shape[1] is not None,
         f"pjt must have static shape (T,J); got {pjt.shape}.",
@@ -126,10 +148,9 @@ def fit_validate_input(
     factor_rw: float,
     factor_tmh: float,
 ) -> None:
-    """
-    Validation contract for LuShrinkageEstimator.fit.
+    """Validate LuShrinkageEstimator.fit controls.
 
-    Strict (no coercion):
+    Strict contract:
       - n_iter, pilot_length, max_rounds: int > 0
       - ridge: float >= 0
       - target band: 0 <= target_low <= target_high <= 1
@@ -159,19 +180,24 @@ def tune_k_validate_input(
     factor: float,
     name: str,
 ) -> None:
-    """
-    Validation contract for tune_k.
+    """Validate tune_k controls.
 
-    Strict (no coercion):
-      - theta0: tf.float64 tensor (rank unrestricted; depends on step_fn)
+    Strict contract:
       - k0: scalar tf.float64 > 0
       - pilot_length, max_rounds: int > 0
       - factor: float > 1
-      - target band: 0 <= low <= high <= 1
-      - name: str (for logging only)
+      - target band: 0 <= target_low <= target_high <= 1
+      - name: str (used for logging only)
     """
     _require_float64_tensor(k0, "k0")
     _require_tensor_rank(k0, 0, "k0")
+
+    # Keep the strict check aligned with the docstring: require k0 > 0.
+    _require(
+        float(k0.numpy()) > 0.0,
+        f"k0 must be > 0; got {float(k0.numpy())}.",
+    )
+
     _require_positive_int(pilot_length, "pilot_length")
     _require_positive_int(max_rounds, "max_rounds")
 
@@ -184,16 +210,18 @@ def tune_k_validate_input(
 
 
 def tune_shrinkage_validate_input(shrink) -> None:
-    """
-    Validation contract for tune_shrinkage(shrink).
+    """Validate that `shrink` exposes the attributes required by tuning.
 
+    This is a structural check: `tune_shrinkage` relies on a specific estimator
+    interface (data tensors, state variables, posterior, RNG, and tuning knobs).
 
-    Strict:
-      - shrink must expose the exact attributes required by tuning.
-      - tuning control attributes must satisfy basic type/value constraints.
-      - state fields used with .read_value() must be tf.Variable (no backward compat).
+    It enforces:
+      - required attributes exist,
+      - tuning knobs have valid types/values,
+      - tensors have expected dtypes and ranks,
+      - state objects are tf.Variable where .read_value() is used.
 
-    Note: this is Python-side; do not call it from inside tf.function.
+    This function is Python-side only; do not call it inside tf.function.
     """
     required = [
         "pilot_length",
@@ -221,7 +249,7 @@ def tune_shrinkage_validate_input(shrink) -> None:
     missing = [name for name in required if not hasattr(shrink, name)]
     _require(not missing, "tune_shrinkage missing attributes: " + ", ".join(missing))
 
-    # Validate the scalar tuning controls (strict).
+    # Validate scalar tuning controls.
     pilot_length = shrink.pilot_length
     max_rounds = shrink.max_rounds
     ridge = shrink.ridge
@@ -245,8 +273,6 @@ def tune_shrinkage_validate_input(shrink) -> None:
     _require_float(factor_tmh, "factor_tmh")
     _require(float(factor_rw) > 1.0, f"factor_rw must be > 1; got {factor_rw}.")
     _require(float(factor_tmh) > 1.0, f"factor_tmh must be > 1; got {factor_tmh}.")
-
-    # Require the key data tensors exist and are tf.float64 with expected ranks.
 
     # Data tensors (must be tf.Tensor, float64).
     for name, rank in [("qjt", 2), ("pjt", 2), ("wjt", 2), ("q0t", 1)]:
@@ -280,16 +306,15 @@ def tmh_step_validate_input_tf(
     k: tf.Tensor,
     ridge: tf.Tensor,
 ) -> None:
-    """
-    TF-graph-safe validation for tmh_step inputs.
-
-    Intended usage: call inside the same @tf.function that calls tmh_step.
+    """Validate TMH inputs inside a compiled TF graph.
 
     Enforced:
-      - theta0 is rank-1 tf.float64
-      - k is scalar tf.float64 and k > 0
-      - ridge is scalar tf.float64 and ridge >= 0
-      - all are finite
+      - theta0: rank-1 tf.float64 tensor with finite entries
+      - k: scalar tf.float64, finite, and k > 0
+      - ridge: scalar tf.float64, finite, and ridge >= 0
+
+    The TMH step relies on gradients/Hessians and linear algebra; these checks
+    catch invalid inputs early and provide clear error messages.
     """
     tf.debugging.assert_type(theta0, tf.float64)
     tf.debugging.assert_rank(theta0, 1)

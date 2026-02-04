@@ -1,38 +1,43 @@
 """
-Berry (1994) market-share inversion (contraction mapping) for random-coefficients logit.
+Berry (1994) market-share inversion (contraction mapping) for RC logit.
 
-Purpose
--------
-Recover mean utilities δ_jt from observed market shares, conditional on a fixed
-heterogeneity parameter σ.
+This module implements the single-purpose inversion step used in BLP-style
+estimators: recover mean utilities `delta` that rationalize observed market
+shares given a fixed heterogeneity parameter `sigma`.
 
-This file implements ONLY the inversion step used inside:
-- standard BLP
-- Lu–Shimizu
+Scope:
+  - Invert shares -> delta for one market or many markets.
+  - Simulate predicted shares under a price-only random coefficient.
+  - Validate basic per-market inputs.
 
-It does not estimate σ, β, or apply shrinkage.
+Not in scope:
+  - Estimating sigma or linear parameters (e.g. beta).
+  - GMM moments, IV, or any shrinkage logic.
 """
+
+from __future__ import annotations
 
 import numpy as np
 
 Array = np.ndarray
 
 
-# ---------------------------------------------------------------------
-# 1. Sanity check
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1) Validation (single market)
+# -----------------------------------------------------------------------------
+
+
 def check_market_inputs(s_obs: Array, s0: float, p: Array) -> None:
-    """
-    Validate inputs for a single market.
+    """Validate inputs for a single-market inversion.
 
-    Requirements:
-      - s_obs and p are 1D arrays of equal length J
-      - s_obs[j] > 0 for all j
-      - s0 > 0
-      - sum_j s_obs[j] + s0 == 1 (up to numerical tolerance)
-      - all values finite
+    Required structure:
+      - s_obs and p are 1D arrays of equal length J.
+      - s_obs[j] > 0 for all j and s0 > 0.
+      - sum(s_obs) + s0 == 1 (up to tolerance).
+      - all values are finite.
 
-    Raises ValueError on failure.
+    Raises:
+        ValueError: If any requirement is violated.
     """
     s_obs = np.asarray(s_obs, dtype=float)
     p = np.asarray(p, dtype=float)
@@ -54,42 +59,62 @@ def check_market_inputs(s_obs: Array, s0: float, p: Array) -> None:
     if s0 <= 0.0:
         raise ValueError("Outside share s0 must be strictly positive.")
 
+    # A tight tolerance is appropriate here because these are computed shares.
     if not np.isclose(float(s_obs.sum()) + float(s0), 1.0, atol=1e-10):
         raise ValueError("Inside shares plus outside share must sum to 1.")
 
 
-# ---------------------------------------------------------------------
-# 2. Share simulation
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 2) Predicted shares (single market)
+# -----------------------------------------------------------------------------
+
+
 def simulate_shares(delta: Array, p: Array, sigma: float, v_draws: Array) -> Array:
-    """
-    Simulate market shares under random coefficients logit for one market.
+    """Simulate inside-good shares for one market under RC logit.
 
-    Utility for draw r:
-        u_j(r) = δ_j + σ * v_r * p_j
+    Model (price-only random coefficient):
+      utility for draw r:
+        u_j(r) = delta[j] + sigma * v_draws[r] * p[j]
+      outside option utility is 0.
 
-    Outside option utility normalized to 0.
+    Computation:
+      - compute draw-specific logit shares
+      - return the mean share across simulation draws
 
-    Returns mean shares across draws.
+    Args:
+        delta: Mean utilities, shape (J,).
+        p: Prices, shape (J,).
+        sigma: Heterogeneity scale on price, scalar.
+        v_draws: Simulation draws, shape (R,).
+
+    Returns:
+        s_hat: Predicted inside-good shares, shape (J,).
     """
     delta = np.asarray(delta, dtype=float)
     p = np.asarray(p, dtype=float)
     v = np.asarray(v_draws, dtype=float)
 
+    # Utilities per draw: U[r, j] = delta[j] + (sigma * v[r]) * p[j].
     U = delta[None, :] + (sigma * v)[:, None] * p[None, :]
 
-    m = U.max(axis=1, keepdims=True)  # (R,1)
-    U = U - m  # stabilize inside utilities
+    # Numerically-stable logit: shift utilities by per-draw max.
+    m = U.max(axis=1, keepdims=True)  # (R, 1)
+    U = U - m
 
-    expU = np.exp(U)
-    denom = np.exp(-m[:, 0]) + expU.sum(axis=1)  # outside term must be exp(0 - m)
+    expU = np.exp(U)  # (R, J)
 
+    # Outside option has utility 0, so its term is exp(0 - m[r]).
+    denom = np.exp(-m[:, 0]) + expU.sum(axis=1)  # (R,)
+
+    # Average shares across draws.
     return (expU / denom[:, None]).mean(axis=0)
 
 
-# ---------------------------------------------------------------------
-# 3. Single-market inversion
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 3) Berry contraction (single market)
+# -----------------------------------------------------------------------------
+
+
 def invert_market(
     s_obs: Array,
     s0: float,
@@ -100,23 +125,44 @@ def invert_market(
     *,
     damping: float = 1.0,
     tol: float = 1e-8,
-    share_tol=1e-10,
+    share_tol: float = 1e-10,
     max_iter: int = 10_000,
 ) -> tuple[Array, int]:
-    """
-    Recover δ for one market using Berry contraction.
+    """Invert one market's observed shares to recover `delta`.
+
+    This implements the Berry contraction mapping. For a fixed (sigma, v_draws),
+    define s_hat(delta) as the predicted shares from `simulate_shares`.
 
     Initialization:
-        δ^(0) = log(s_obs) - log(s0)
-        (or use delta_init if provided)
+      - default: delta = log(s_obs) - log(s0)
+      - or use delta_init if provided (warm start)
 
     Update:
-        δ_new = δ + damping * (log(s_obs) - log(s_hat))
+      delta_new = delta + damping * (log(s_obs) - log(s_hat))
+
+    Stopping criteria (either condition):
+      - max |s_hat - s_obs| < share_tol
+      - max |delta_new - delta| < tol
+
+    Args:
+        s_obs: Observed inside-good shares, shape (J,).
+        s0: Observed outside share, scalar.
+        p: Prices, shape (J,).
+        sigma: Heterogeneity scale, scalar.
+        v_draws: Simulation draws, shape (R,).
+        delta_init: Optional initial delta, shape (J,).
+        damping: Step size in (0, 1], used for stability when needed.
+        tol: Stopping tolerance on delta changes.
+        share_tol: Stopping tolerance on share differences.
+        max_iter: Maximum contraction iterations.
 
     Returns:
-      - (delta, iterations)
+        delta: Recovered mean utilities, shape (J,).
+        iterations: Number of contraction iterations used.
 
-    Raises RuntimeError if convergence fails.
+    Raises:
+        ValueError: On invalid inputs.
+        RuntimeError: If predicted shares become invalid or convergence fails.
     """
     check_market_inputs(s_obs, s0, p)
 
@@ -129,6 +175,7 @@ def invert_market(
         raise ValueError("damping must be in (0, 1].")
     damping = float(damping)
 
+    # Choose the initial delta.
     if delta_init is not None:
         delta = np.asarray(delta_init, dtype=float)
         if delta.ndim != 1 or delta.shape[0] != s_obs.shape[0]:
@@ -136,20 +183,26 @@ def invert_market(
         if not np.all(np.isfinite(delta)):
             raise ValueError("delta_init contains NaN or inf.")
     else:
+        # Standard logit inversion starting point.
         delta = np.log(s_obs) - np.log(s0)
 
+    # Contraction iterations.
     for it in range(1, max_iter + 1):
         s_hat = simulate_shares(delta, p, sigma, v_draws)
 
+        # Shares must remain positive and finite for logs below.
         if np.any(s_hat <= 0.0) or not np.all(np.isfinite(s_hat)):
             raise RuntimeError("Predicted shares became invalid during inversion.")
 
+        # Optional early stop on share-space difference.
         if np.max(np.abs(s_hat - s_obs)) < share_tol:
             return delta, it
 
+        # Guard against log(0) in the update.
         s_hat = np.maximum(s_hat, eps)
         delta_new = delta + damping * (np.log(s_obs) - np.log(s_hat))
 
+        # Standard stop on delta-space difference.
         if np.max(np.abs(delta_new - delta)) < tol:
             return delta_new, it
 
@@ -158,9 +211,11 @@ def invert_market(
     raise RuntimeError("Berry inversion failed to converge.")
 
 
-# ---------------------------------------------------------------------
-# 4. Multi-market inversion
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 4) Multi-market wrapper
+# -----------------------------------------------------------------------------
+
+
 def invert_all_markets(
     sjt: Array,
     s0t: Array,
@@ -174,19 +229,29 @@ def invert_all_markets(
     share_tol: float = 1e-10,
     max_iter: int = 10_000,
 ) -> Array:
-    """
-    Invert all markets sequentially.
+    """Invert all markets sequentially.
 
-    Inputs:
-      - sjt, pjt: arrays of shape (T, J)
-      - s0t: outside shares, shape (T,)
-      - sigma: scalar
-      - v_draws: simulation draws
-      - delta_init: optional warm start array of shape (T, J)
-      - damping: contraction damping in (0, 1]
+    This is a convenience wrapper around `invert_market`. It loops over markets
+    t=0..T-1 and returns a (T, J) delta array.
+
+    Args:
+        sjt: Observed inside shares, shape (T, J).
+        s0t: Observed outside shares, shape (T,).
+        pjt: Prices, shape (T, J).
+        sigma: Heterogeneity scale, scalar.
+        v_draws: Simulation draws, shape (R,).
+        delta_init: Optional warm start, shape (T, J).
+        damping: Contraction damping in (0, 1].
+        tol: Stopping tolerance on delta changes (per market).
+        share_tol: Stopping tolerance on share differences (per market).
+        max_iter: Max contraction iterations (per market).
 
     Returns:
-      - delta array of shape (T, J)
+        delta: Mean utilities, shape (T, J).
+
+    Raises:
+        ValueError: If array shapes are inconsistent.
+        RuntimeError: If any market inversion fails to converge.
     """
     sjt = np.asarray(sjt, dtype=float)
     pjt = np.asarray(pjt, dtype=float)
@@ -212,8 +277,8 @@ def invert_all_markets(
             raise ValueError("delta_init contains NaN or inf.")
 
     for t in range(T):
-
-        delta_t, iters = invert_market(
+        # Invert each market independently. Warm starts can be passed market-by-market.
+        delta_t, _ = invert_market(
             s_obs=sjt[t],
             s0=float(s0t[t]),
             p=pjt[t],
@@ -225,7 +290,6 @@ def invert_all_markets(
             share_tol=share_tol,
             max_iter=max_iter,
         )
-
         delta[t] = delta_t
 
     return delta

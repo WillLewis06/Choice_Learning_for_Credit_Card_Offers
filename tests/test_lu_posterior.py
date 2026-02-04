@@ -1,43 +1,12 @@
 import numpy as np
-import pytest
 import tensorflow as tf
 
-from market_shock_estimators.lu_posterior import LuPosteriorTF
+from conftest import assert_all_finite_tf, assert_prob_simplex_tf
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Local helpers (not in conftest; specific to permutation tests / closed forms)
 # -----------------------------------------------------------------------------
-def _assert_all_finite(*tensors) -> None:
-    for x in tensors:
-        x = tf.convert_to_tensor(x)
-        ok = tf.reduce_all(tf.math.is_finite(x))
-        assert bool(ok.numpy()), "Found non-finite values."
-
-
-def _assert_prob_simplex(
-    sjt_t: tf.Tensor, s0t: tf.Tensor, *, atol: float = 1e-12
-) -> None:
-    sjt_t = tf.convert_to_tensor(sjt_t)
-    s0t = tf.convert_to_tensor(s0t)
-
-    assert sjt_t.shape.rank == 1
-    assert s0t.shape.rank == 0
-
-    _assert_all_finite(sjt_t, s0t)
-
-    sjt_np = sjt_t.numpy()
-    s0_np = float(s0t.numpy())
-
-    assert np.min(sjt_np) >= -atol
-    assert np.max(sjt_np) <= 1.0 + atol
-    assert s0_np >= -atol
-    assert s0_np <= 1.0 + atol
-
-    err = abs(s0_np + float(np.sum(sjt_np)) - 1.0)
-    assert err <= atol, f"Simplex identity violated (err={err:.3e}, atol={atol:.3e})."
-
-
 def _normal_logpdf(x, mean, var, two_pi) -> tf.Tensor:
     x = tf.convert_to_tensor(x, dtype=tf.float64)
     mean = tf.convert_to_tensor(mean, dtype=tf.float64)
@@ -47,56 +16,11 @@ def _normal_logpdf(x, mean, var, two_pi) -> tf.Tensor:
 
 
 def _permute_vec(x: tf.Tensor, perm: tf.Tensor) -> tf.Tensor:
-    x = tf.convert_to_tensor(x)
-    return tf.gather(x, perm, axis=0)
+    return tf.gather(tf.convert_to_tensor(x), perm, axis=0)
 
 
 def _permute_TJ(x: tf.Tensor, perm: tf.Tensor) -> tf.Tensor:
-    x = tf.convert_to_tensor(x)
-    return tf.gather(x, perm, axis=1)
-
-
-# -----------------------------------------------------------------------------
-# Fixtures
-# -----------------------------------------------------------------------------
-@pytest.fixture
-def posterior():
-    # Small n_draws keeps tests fast; seed irrelevant for invariants
-    return LuPosteriorTF(n_draws=25, seed=123, dtype=tf.float64)
-
-
-@pytest.fixture
-def tiny_inputs():
-    """
-    Small consistent batched inputs for T=2, J=3.
-    """
-    T, J = 2, 3
-    pjt = tf.constant([[1.0, 1.2, 0.8], [0.9, 1.1, 1.3]], dtype=tf.float64)
-    wjt = tf.constant([[0.5, 0.7, 0.6], [0.4, 0.9, 0.3]], dtype=tf.float64)
-
-    # counts
-    qjt = tf.constant([[10.0, 5.0, 2.0], [3.0, 7.0, 1.0]], dtype=tf.float64)
-    q0t = tf.constant([20.0, 15.0], dtype=tf.float64)
-
-    # latent states
-    E_bar = tf.constant([0.1, -0.2], dtype=tf.float64)
-    njt = tf.constant([[0.0, 0.2, -0.1], [0.05, -0.02, 0.0]], dtype=tf.float64)
-
-    gamma = tf.constant([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=tf.float64)
-    phi = tf.constant([0.6, 0.4], dtype=tf.float64)
-
-    return {
-        "T": T,
-        "J": J,
-        "pjt": pjt,
-        "wjt": wjt,
-        "qjt": qjt,
-        "q0t": q0t,
-        "E_bar": E_bar,
-        "njt": njt,
-        "gamma": gamma,
-        "phi": phi,
-    }
+    return tf.gather(tf.convert_to_tensor(x), perm, axis=1)
 
 
 # -----------------------------------------------------------------------------
@@ -152,7 +76,7 @@ def test_choice_probs_t_shapes_simplex_bounds(posterior):
     sjt_t, s0t = posterior._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
     assert tuple(sjt_t.shape) == (J,)
     assert s0t.shape == ()
-    _assert_prob_simplex(sjt_t, s0t, atol=1e-12)
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
 
 
 def test_choice_probs_t_extreme_negative_delta_outside_near_one(posterior):
@@ -162,7 +86,7 @@ def test_choice_probs_t_extreme_negative_delta_outside_near_one(posterior):
     r = tf.constant(0.0, dtype=tf.float64)
 
     sjt_t, s0t = posterior._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
-    _assert_prob_simplex(sjt_t, s0t, atol=1e-12)
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
 
     assert float(s0t.numpy()) > 1.0 - 1e-10
     assert np.max(sjt_t.numpy()) < 1e-10
@@ -175,7 +99,7 @@ def test_choice_probs_t_extreme_positive_delta_outside_near_zero(posterior):
     r = tf.constant(0.0, dtype=tf.float64)
 
     sjt_t, s0t = posterior._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
-    _assert_prob_simplex(sjt_t, s0t, atol=1e-12)
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
 
     assert float(s0t.numpy()) < 1e-10
     assert abs(float(tf.reduce_sum(sjt_t).numpy()) - 1.0) < 1e-10
@@ -193,8 +117,8 @@ def test_choice_probs_t_monotone_under_inside_shift(posterior):
     assert float(s01.numpy()) < float(s00.numpy())
     assert float(tf.reduce_sum(sjt1).numpy()) > float(tf.reduce_sum(sjt0).numpy())
 
-    _assert_prob_simplex(sjt0, s00, atol=1e-12)
-    _assert_prob_simplex(sjt1, s01, atol=1e-12)
+    assert_prob_simplex_tf(sjt0, s00, atol=1e-12)
+    assert_prob_simplex_tf(sjt1, s01, atol=1e-12)
 
 
 # -----------------------------------------------------------------------------
@@ -218,7 +142,7 @@ def test_market_loglik_finite_reasonable_inputs(posterior, tiny_inputs):
         njt_t=tiny_inputs["njt"][t],
     )
     assert ll.shape == ()
-    _assert_all_finite(ll)
+    assert_all_finite_tf(ll)
 
 
 def test_market_loglik_outside_only_identity(posterior):
@@ -320,9 +244,8 @@ def test_loglik_vec_shape_and_matches_market_loglik_stack(posterior, tiny_inputs
         njt=tiny_inputs["njt"],
     )
     assert tuple(ll_vec.shape) == (tiny_inputs["T"],)
-    _assert_all_finite(ll_vec)
+    assert_all_finite_tf(ll_vec)
 
-    # Stack of market_loglik
     stacked = []
     for t in range(tiny_inputs["T"]):
         stacked.append(
@@ -372,17 +295,14 @@ def test_logprior_global_symmetry_around_mean(posterior):
     beta_w_m = posterior.beta_w_mean
     r_m = posterior.r_mean
 
-    # Symmetry in beta_p
     lp1 = posterior.logprior_global(beta_p=beta_p_m + d, beta_w=beta_w_m, r=r_m)
     lp2 = posterior.logprior_global(beta_p=beta_p_m - d, beta_w=beta_w_m, r=r_m)
     assert np.allclose(lp1.numpy(), lp2.numpy(), atol=1e-12)
 
-    # Symmetry in beta_w
     lp1 = posterior.logprior_global(beta_p=beta_p_m, beta_w=beta_w_m + d, r=r_m)
     lp2 = posterior.logprior_global(beta_p=beta_p_m, beta_w=beta_w_m - d, r=r_m)
     assert np.allclose(lp1.numpy(), lp2.numpy(), atol=1e-12)
 
-    # Symmetry in r
     lp1 = posterior.logprior_global(beta_p=beta_p_m, beta_w=beta_w_m, r=r_m + d)
     lp2 = posterior.logprior_global(beta_p=beta_p_m, beta_w=beta_w_m, r=r_m - d)
     assert np.allclose(lp1.numpy(), lp2.numpy(), atol=1e-12)
@@ -396,11 +316,10 @@ def test_logprior_market_vec_shapes_and_finite(posterior, tiny_inputs):
         phi=tiny_inputs["phi"],
     )
     assert tuple(lp_t.shape) == (tiny_inputs["T"],)
-    _assert_all_finite(lp_t)
+    assert_all_finite_tf(lp_t)
 
 
 def test_logprior_market_vec_phi_clipping_at_endpoints(posterior, tiny_inputs):
-    # Use endpoints exactly; function clips internally.
     phi = tf.constant([0.0, 1.0], dtype=tf.float64)
     lp_t = posterior.logprior_market_vec(
         E_bar=tiny_inputs["E_bar"],
@@ -408,19 +327,14 @@ def test_logprior_market_vec_phi_clipping_at_endpoints(posterior, tiny_inputs):
         gamma=tiny_inputs["gamma"],
         phi=phi,
     )
-    _assert_all_finite(lp_t)
+    assert_all_finite_tf(lp_t)
 
 
 def test_logprior_market_vec_bernoulli_term_counts(posterior):
-    """
-    Isolate Bernoulli contribution by holding E_bar, njt, phi fixed and varying gamma.
-    Compare market-wise difference against J*(log(phi)-log(1-phi)).
-    """
     T, J = 2, 5
     E_bar = tf.zeros((T,), dtype=tf.float64)
     njt = tf.zeros((T, J), dtype=tf.float64)
 
-    # Market 0: all ones, Market 1: all zeros
     gamma = tf.concat(
         [tf.ones((1, J), tf.float64), tf.zeros((1, J), tf.float64)], axis=0
     )
@@ -428,44 +342,29 @@ def test_logprior_market_vec_bernoulli_term_counts(posterior):
 
     lp = posterior.logprior_market_vec(E_bar=E_bar, njt=njt, gamma=gamma, phi=phi)
 
-    # Since everything else matches, difference should be Bernoulli-only.
-
     phi_val = 0.7
     bern_diff = float(J) * (np.log(phi_val) - np.log(1.0 - phi_val))
 
-    # n-prior contributes even when njt == 0 because of the -0.5*log(var) term
     t1 = float(posterior.T1_sq.numpy())
     t0 = float(posterior.T0_sq.numpy())
     n_diff = -0.5 * float(J) * (np.log(t1) - np.log(t0))
 
     expected_diff = bern_diff + n_diff
-
     actual_diff = float((lp[0] - lp[1]).numpy())
     assert abs(actual_diff - expected_diff) < 1e-10
 
 
 def test_logprior_market_vec_gamma_selects_variance(posterior):
-    """
-    With large |n|, Normal logpdf is higher (less negative) under larger variance.
-    """
     T, J = 2, 6
     E_bar = tf.zeros((T,), dtype=tf.float64)
-
-    # Large magnitude n
     njt = tf.ones((T, J), dtype=tf.float64) * 2.0
 
-    # Market 0: gamma=1 selects T1_sq; Market 1: gamma=0 selects T0_sq
     gamma = tf.concat(
         [tf.ones((1, J), tf.float64), tf.zeros((1, J), tf.float64)], axis=0
     )
-
-    # Fix phi so Bernoulli differs; remove Bernoulli analytically via difference adjustment.
-    phi_val = 0.5
-    phi = tf.constant([phi_val, phi_val], dtype=tf.float64)
+    phi = tf.constant([0.5, 0.5], dtype=tf.float64)
 
     lp = posterior.logprior_market_vec(E_bar=E_bar, njt=njt, gamma=gamma, phi=phi)
-
-    # Market 0 should have higher lp due to larger variance for njt
     assert float(lp[0].numpy()) > float(lp[1].numpy())
 
 
@@ -556,10 +455,6 @@ def test_logpost_equals_sum_logpost_vec_plus_logprior_global(posterior, tiny_inp
 # 6) Numerical edge cases
 # -----------------------------------------------------------------------------
 def test_market_loglik_finite_when_shares_extremely_small_due_to_clipping(posterior):
-    """
-    Force one product to have extremely low utility to push its share near 0;
-    ensure loglik stays finite via clipping.
-    """
     J = 3
     qjt_t = tf.constant([10.0, 10.0, 10.0], dtype=tf.float64)
     q0t_t = tf.constant(10.0, dtype=tf.float64)
@@ -572,7 +467,6 @@ def test_market_loglik_finite_when_shares_extremely_small_due_to_clipping(poster
     r = tf.constant(0.0, dtype=tf.float64)
     E_bar_t = tf.constant(0.0, dtype=tf.float64)
 
-    # Make product 0 extremely unattractive
     njt_t = tf.constant([-100.0, 0.0, 0.0], dtype=tf.float64)
 
     ll = posterior.market_loglik(
@@ -586,7 +480,7 @@ def test_market_loglik_finite_when_shares_extremely_small_due_to_clipping(poster
         E_bar_t=E_bar_t,
         njt_t=njt_t,
     )
-    _assert_all_finite(ll)
+    assert_all_finite_tf(ll)
 
 
 def test_choice_probs_t_finite_for_large_r_moderate_prices(posterior):
@@ -594,11 +488,9 @@ def test_choice_probs_t_finite_for_large_r_moderate_prices(posterior):
     pjt_t = tf.constant([0.5, 0.8, 0.6, 0.7, 0.9], dtype=tf.float64)
     delta_t = tf.constant([0.0, 0.1, -0.1, 0.05, -0.05], dtype=tf.float64)
 
-    # Large r => sigma = exp(r) large, but keep prices moderate to avoid overflow.
     r = tf.constant(5.0, dtype=tf.float64)
-
     sjt_t, s0t = posterior._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
-    _assert_prob_simplex(sjt_t, s0t, atol=1e-12)
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
 
 
 # -----------------------------------------------------------------------------
@@ -637,7 +529,10 @@ def test_mean_utility_equivariant_under_product_permutation(posterior, tiny_inpu
     )
 
     assert np.allclose(
-        delta_perm_inputs.numpy(), _permute_vec(delta, perm).numpy(), atol=0.0, rtol=0.0
+        delta_perm_inputs.numpy(),
+        _permute_vec(delta, perm).numpy(),
+        atol=0.0,
+        rtol=0.0,
     )
 
 

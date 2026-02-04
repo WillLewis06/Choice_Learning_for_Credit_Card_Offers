@@ -1,47 +1,57 @@
+"""
+Lu shrinkage estimator (MCMC sampler).
+
+This module defines `LuShrinkageEstimator`, a self-contained sampler that:
+  - holds the observed market data (pjt, wjt, qjt, q0t),
+  - owns the current MCMC state (tf.Variables),
+  - tunes proposal scales once using a pilot run,
+  - runs an MCMC loop and accumulates posterior means via diagnostics.
+
+The heavy-lifting for each parameter-block update lives in `lu_updates.py`.
+This file focuses on orchestration and a minimal public API:
+  - fit(...)
+  - get_results()
+"""
+
 from __future__ import annotations
 
-# tmp debugging
 import json
 from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
 
-from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_diagnostics import LuShrinkageDiagnostics
-from market_shock_estimators.lu_updates import (
-    update_beta,
-    update_r,
-    update_E_bar,
-    update_njt,
-    update_gamma,
-    update_phi,
-)
+from market_shock_estimators.lu_posterior import LuPosteriorTF
 from market_shock_estimators.lu_tuning import tune_shrinkage
+from market_shock_estimators.lu_updates import (
+    update_E_bar,
+    update_beta,
+    update_gamma,
+    update_njt,
+    update_phi,
+    update_r,
+)
 from market_shock_estimators.lu_validate_input import (
-    init_validate_input,
     fit_validate_input,
+    init_validate_input,
 )
 
 
 class LuShrinkageEstimator:
-    """
-    Lu (2025) shrinkage estimator MCMC sampler (Section 4 simulation target).
+    """MCMC sampler for the Lu shrinkage model (simulation target).
 
-    Public API:
-      - fit(...)
-      - get_results()
+    Observed data (fixed):
+      - pjt, wjt, qjt, q0t
 
-    State variables (paper-aligned):
-      Global:
-        beta_p, beta_w, r
-      Market-level:
-        E_bar_t, njt[t,j]
-      Sparsity/hyper:
-        gamma[t,j] in {0,1}, phi[t] in (0,1)
+    Latent structure (sampled):
+      - Global: beta_p, beta_w, r
+      - Market-level: E_bar[t]
+      - Market-product: njt[t, j]
+      - Sparsity: gamma[t, j] in {0,1}, phi[t] in (0,1)
 
-    Data:
-      pjt, wjt, qjt, q0t
+    The sampler updates these blocks in a fixed order each iteration and uses
+    `LuShrinkageDiagnostics` to accumulate running sums for posterior means.
     """
 
     def __init__(
@@ -53,8 +63,13 @@ class LuShrinkageEstimator:
         n_draws: int,
         seed: int,
     ):
+        """Construct the estimator and initialize state.
+
+        This converts input arrays to TF tensors, validates shapes/dtypes, creates
+        the `LuPosteriorTF` helper, and initializes all latent state variables.
+        """
         # -----------------------------
-        # Data
+        # Observed market data (fixed)
         # -----------------------------
         self.pjt = tf.convert_to_tensor(pjt, dtype=tf.float64)  # (T,J)
         self.wjt = tf.convert_to_tensor(wjt, dtype=tf.float64)  # (T,J)
@@ -74,44 +89,51 @@ class LuShrinkageEstimator:
         self.J = int(self.pjt.shape[1])
 
         # -----------------------------
-        # Posterior object
+        # Posterior helper (likelihood + priors)
         # -----------------------------
         self.posterior = LuPosteriorTF(n_draws=int(n_draws), seed=int(seed))
 
         # -----------------------------
-        # RNG
+        # RNG owned by the sampler
         # -----------------------------
         self.rng = tf.random.Generator.from_seed(int(seed))
 
         # -----------------------------
-        # Initialize state
+        # Latent state (tf.Variables mutated in-place)
         # -----------------------------
         self.beta_p = tf.Variable(0.0, dtype=tf.float64, trainable=False)
         self.beta_w = tf.Variable(0.0, dtype=tf.float64, trainable=False)
         self.r = tf.Variable(0.0, dtype=tf.float64, trainable=False)  # log(sigma)
 
+        # Initialize E_bar at its prior mean (broadcast across markets).
         self.E_bar = tf.Variable(
             tf.fill([self.T], self.posterior.E_bar_mean),
             trainable=False,
         )
 
+        # Initialize spikes/slab shocks and indicators at zero.
         self.njt = tf.Variable(
-            tf.zeros([self.T, self.J], dtype=tf.float64), trainable=False
+            tf.zeros([self.T, self.J], dtype=tf.float64),
+            trainable=False,
         )
         self.gamma = tf.Variable(
-            tf.zeros([self.T, self.J], dtype=tf.float64), trainable=False
+            tf.zeros([self.T, self.J], dtype=tf.float64),
+            trainable=False,
         )
 
+        # Initialize phi to the Beta prior mean a/(a+b), broadcast across markets.
         phi0 = self.posterior.a_phi / (self.posterior.a_phi + self.posterior.b_phi)
         self.phi = tf.Variable(tf.fill([self.T], phi0), trainable=False)
 
-        # set in _run_mcmc_loop (python-owned), used inside compiled iteration step
+        # Diagnostics handle is created at fit-time and is used inside the compiled step.
         self._diag: LuShrinkageDiagnostics | None = None
 
     # ------------------------------------------------------------------
-    # Public API
+    # Optional local cache for tuned proposal scales
     # ------------------------------------------------------------------
-    def _debug_save_k(self, k_r, k_E_bar, k_beta, k_njt):
+
+    def _debug_save_k(self, k_r, k_E_bar, k_beta, k_njt) -> None:
+        """Persist tuned proposal scales to a local json file."""
         path = Path("./_debug_cache/lu_shrinkage_k.json")
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -127,6 +149,7 @@ class LuShrinkageEstimator:
         )
 
     def _debug_load_k(self):
+        """Load tuned proposal scales from a local json file."""
         path = Path("./_debug_cache/lu_shrinkage_k.json")
         d = json.loads(path.read_text())
 
@@ -136,6 +159,10 @@ class LuShrinkageEstimator:
             tf.constant(d["k_beta"], dtype=tf.float64),
             tf.constant(d["k_njt"], dtype=tf.float64),
         )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -148,10 +175,7 @@ class LuShrinkageEstimator:
         factor_rw: float,
         factor_tmh: float,
     ) -> None:
-        """
-        Run MCMC and store posterior-mean summaries internally.
-        """
-
+        """Tune proposal scales, run MCMC, and accumulate posterior means."""
         fit_validate_input(
             n_iter=n_iter,
             pilot_length=pilot_length,
@@ -163,6 +187,8 @@ class LuShrinkageEstimator:
             factor_tmh=factor_tmh,
         )
 
+        # Store tuning configuration on the instance so `tune_shrinkage(self)` can
+        # read a consistent set of settings.
         self.pilot_length = pilot_length
         self.ridge = ridge
         self.target_low = target_low
@@ -171,11 +197,14 @@ class LuShrinkageEstimator:
         self.factor_rw = factor_rw
         self.factor_tmh = factor_tmh
 
+        # Tune each proposal scale (k_*) using a short pilot run.
         k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
-        # tmp for faster debugging
+
+        # Optional: persist tuned k values to skip tuning on repeated runs.
         self._debug_save_k(k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned)
         # k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = self._debug_load_k()
 
+        # Diagnostics accumulates running sums used to compute posterior means.
         diag = LuShrinkageDiagnostics(T=self.T, J=self.J)
 
         self._run_mcmc_loop(
@@ -189,24 +218,30 @@ class LuShrinkageEstimator:
         )
 
     def get_results(self) -> dict:
-        """
-        Return the minimal posterior-mean quantities needed by assess_estimator.py.
+        """Return posterior-mean summaries from the accumulated running sums.
 
-        Notes
-        -----
-        - This computes posterior means on-demand from the diagnostics running sums.
-        - It assumes `fit()` has been run and `self._diag` is populated.
+        The diagnostics object stores running sums for each parameter block.
+        This method converts those into posterior means and returns the minimal
+        result dictionary used by downstream evaluation code.
         """
+        if self._diag is None:
+            raise ValueError("get_results() called before fit().")
+
         saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
             self._diag.get_sums()
         )
         saved_f = tf.cast(saved, tf.float64)
 
+        # Global parameters
         beta_mean = (sum_beta / saved_f).numpy()
         sigma_mean = float((sum_sigma / saved_f).numpy())
-        E_bar_mean = (sum_E_bar / saved_f).numpy()
-        njt_mean = (sum_njt / saved_f).numpy()
-        E_mean = E_bar_mean[:, None] + njt_mean
+
+        # Latent shocks
+        E_bar_mean = (sum_E_bar / saved_f).numpy()  # (T,)
+        njt_mean = (sum_njt / saved_f).numpy()  # (T,J)
+        E_mean = E_bar_mean[:, None] + njt_mean  # (T,J)
+
+        # Sparsity indicators and inclusion rates
         phi_mean = (sum_phi / saved_f).numpy()
         gamma_mean = (sum_gamma / saved_f).numpy()
 
@@ -236,11 +271,12 @@ class LuShrinkageEstimator:
         ridge: float,
         diag: LuShrinkageDiagnostics,
     ) -> None:
+        """Run the Python-owned iteration loop and mutate sampler state.
+
+        The outer loop is kept in Python for simplicity. Each iteration calls a
+        compiled step function that updates the TF variables in-place.
         """
-        Owns the full MCMC loop, mutating sampler state (tf.Variables) and
-        accumulating posterior draw sums.
-        """
-        self._diag = diag  # python-owned handle, used inside compiled step
+        self._diag = diag
 
         ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
 
@@ -257,7 +293,22 @@ class LuShrinkageEstimator:
 
     @tf.function(reduce_retracing=True)
     def _mcmc_iteration_step(self, it, k_beta, k_njt, k_r, k_E_bar, ridge):
-        # (beta_p, beta_w)
+        """Run one full MCMC iteration and record diagnostics.
+
+        Update order:
+          1) (beta_p, beta_w)   TMH
+          2) r                 RW-MH
+          3) E_bar             elementwise RW-MH across markets
+          4) njt               TMH sweep over markets (J-dimensional per market)
+          5) gamma             Gibbs
+          6) phi               Gibbs
+
+        The final line calls diagnostics to accumulate this draw and report
+        progress.
+        """
+        # -----------------------------
+        # Global coefficients: (beta_p, beta_w)
+        # -----------------------------
         beta_p_new, beta_w_new, _ = update_beta(
             posterior=self.posterior,
             rng=self.rng,
@@ -276,7 +327,9 @@ class LuShrinkageEstimator:
         self.beta_p.assign(beta_p_new)
         self.beta_w.assign(beta_w_new)
 
-        # r
+        # -----------------------------
+        # log(sigma): r
+        # -----------------------------
         r_new, _ = update_r(
             posterior=self.posterior,
             rng=self.rng,
@@ -293,7 +346,9 @@ class LuShrinkageEstimator:
         )
         self.r.assign(r_new)
 
-        # E_bar (vector)
+        # -----------------------------
+        # Market shock: E_bar (vector over markets)
+        # -----------------------------
         E_bar_new, _ = update_E_bar(
             posterior=self.posterior,
             rng=self.rng,
@@ -312,7 +367,9 @@ class LuShrinkageEstimator:
         )
         self.E_bar.assign(E_bar_new)
 
-        # njt (market sweep)
+        # -----------------------------
+        # Market-product shocks: njt (market-by-market TMH sweep)
+        # -----------------------------
         njt_new, _ = update_njt(
             posterior=self.posterior,
             rng=self.rng,
@@ -332,7 +389,9 @@ class LuShrinkageEstimator:
         )
         self.njt.assign(njt_new)
 
-        # gamma
+        # -----------------------------
+        # Sparsity indicators: gamma
+        # -----------------------------
         gamma_new = update_gamma(
             posterior=self.posterior,
             rng=self.rng,
@@ -341,7 +400,9 @@ class LuShrinkageEstimator:
         )
         self.gamma.assign(gamma_new)
 
-        # phi
+        # -----------------------------
+        # Inclusion rates: phi
+        # -----------------------------
         phi_new = update_phi(
             posterior=self.posterior,
             rng=self.rng,
@@ -349,5 +410,7 @@ class LuShrinkageEstimator:
         )
         self.phi.assign(phi_new)
 
-        # diagnostics
+        # -----------------------------
+        # Accumulate posterior means and print progress
+        # -----------------------------
         self._diag.step(self, it)

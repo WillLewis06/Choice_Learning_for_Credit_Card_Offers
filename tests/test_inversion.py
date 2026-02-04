@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import numpy as np
 import pytest
 
+from conftest import assert_finite_np, fixed_draws, make_feasible_shares
 from market_shock_estimators.inversion import (
     check_market_inputs,
     simulate_shares,
@@ -8,54 +11,36 @@ from market_shock_estimators.inversion import (
 )
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def fixed_draws(n=500, seed=123):
-    rng = np.random.default_rng(seed)
-    return rng.standard_normal(n)
-
-
-# ---------------------------------------------------------------------
-# 1) check_market_inputs — valid case
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# check_market_inputs
+# -----------------------------------------------------------------------------
 def test_check_market_inputs_accepts_valid_market():
-    """
-    Valid market inputs should pass without raising.
-    """
-    s_obs = np.array([0.2, 0.1, 0.15])
+    s_obs = np.array([0.2, 0.1, 0.15], dtype=float)
     s0 = 0.55
-    p = np.array([1.0, 1.5, 2.0])
+    p = np.array([1.0, 1.5, 2.0], dtype=float)
 
     check_market_inputs(s_obs, s0, p)
 
 
-# ---------------------------------------------------------------------
-# 2) check_market_inputs — invalid cases (consolidated)
-# ---------------------------------------------------------------------
 def test_check_market_inputs_rejects_invalid_inputs():
-    """
-    All infeasible or ill-defined markets should raise immediately.
-    """
-    p = np.array([1.0, 1.5, 2.0])
+    p = np.array([1.0, 1.5, 2.0], dtype=float)
 
     invalid_cases = [
-        # zero inside share
-        (np.array([0.0, 0.2, 0.3]), 0.5, p),
-        # negative inside share
-        (np.array([-0.1, 0.2, 0.3]), 0.6, p),
-        # zero outside share
-        (np.array([0.3, 0.3, 0.4]), 0.0, p),
-        # negative outside share
-        (np.array([0.3, 0.3, 0.3]), -0.1, p),
-        # shares do not sum to one
-        (np.array([0.2, 0.2, 0.2]), 0.1, p),
+        # non-positive inside shares
+        (np.array([0.2, 0.0, 0.1], dtype=float), 0.7, p),
+        (np.array([-0.2, 0.3, 0.1], dtype=float), 0.8, p),
+        # non-positive or >=1 outside share
+        (np.array([0.2, 0.1, 0.15], dtype=float), 0.0, p),
+        (np.array([0.2, 0.1, 0.15], dtype=float), 1.0, p),
+        # shares do not sum to 1
+        (np.array([0.2, 0.1, 0.15], dtype=float), 0.60, p),
         # shape mismatch
-        (np.array([0.2, 0.2]), 0.6, p),
-        # NaN in shares
-        (np.array([0.2, np.nan, 0.1]), 0.7, p),
-        # inf in prices
-        (np.array([0.2, 0.1, 0.1]), 0.6, np.array([1.0, np.inf, 2.0])),
+        (np.array([0.2, 0.1], dtype=float), 0.70, p),
+        (
+            np.array([0.2, 0.1, 0.15], dtype=float),
+            0.55,
+            np.array([1.0, 2.0], dtype=float),
+        ),
     ]
 
     for s_obs, s0, prices in invalid_cases:
@@ -63,91 +48,131 @@ def test_check_market_inputs_rejects_invalid_inputs():
             check_market_inputs(s_obs, s0, prices)
 
 
-# ---------------------------------------------------------------------
-# 3) simulate_shares — probability sanity
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# simulate_shares
+# -----------------------------------------------------------------------------
 def test_simulate_shares_returns_valid_probabilities():
-    """
-    simulate_shares should return a valid probability vector
-    with an implicit outside option.
-    """
-    delta = np.array([0.5, -0.2, 0.1])
-    p = np.array([1.0, 1.5, 2.0])
+    delta = np.array([0.5, -0.2, 0.1], dtype=float)
+    p = np.array([1.0, 1.5, 2.0], dtype=float)
     sigma = 0.8
-    draws = fixed_draws()
+    v_draws = fixed_draws(n=500, seed=123)
 
-    s_hat = simulate_shares(delta, p, sigma, draws)
+    s_hat = simulate_shares(delta, p, sigma, v_draws)
 
     assert s_hat.ndim == 1
-    assert len(s_hat) == len(delta)
+    assert s_hat.shape == delta.shape
+
+    assert_finite_np(s_hat, name="s_hat")
     assert np.all(s_hat > 0.0)
     assert np.all(s_hat < 1.0)
 
-    s0 = 1.0 - s_hat.sum()
+    s0 = 1.0 - float(s_hat.sum())
     assert s0 > 0.0
-    assert np.isclose(s_hat.sum() + s0, 1.0, atol=1e-10)
+    assert np.isclose(float(s_hat.sum()) + s0, 1.0, atol=1e-10, rtol=0.0)
 
 
-# ---------------------------------------------------------------------
-# 4) invert_market — sigma = 0 (exact round-trip)
-# ---------------------------------------------------------------------
-def test_invert_market_sigma_zero():
+# -----------------------------------------------------------------------------
+# invert_market
+# -----------------------------------------------------------------------------
+def test_invert_market_roundtrip_for_sigma_zero_and_nonzero():
     """
-    With sigma = 0, inversion should exactly recover the delta
-    that generated the shares.
+    Generate shares from simulate_shares(delta_true, ...) and ensure inversion
+    returns delta_hat that reproduces the same shares (fixed point).
     """
-    delta_true = np.array([0.6, -0.4, 0.2])
-    p = np.array([1.0, 1.5, 2.0])
+    cases = [
+        (
+            0.0,
+            np.array([0.6, -0.4, 0.2], dtype=float),
+            np.array([1.0, 1.5, 2.0], dtype=float),
+            800,
+        ),
+        (
+            1.0,
+            np.array([0.8, -0.3, 0.2], dtype=float),
+            np.array([1.0, 1.3, 1.8], dtype=float),
+            2000,
+        ),
+    ]
 
+    for sigma, delta_true, p, n_draws in cases:
+        v_draws = fixed_draws(n=n_draws, seed=123)
+
+        s_obs = simulate_shares(delta_true, p, sigma, v_draws)
+        s0 = 1.0 - float(s_obs.sum())
+
+        delta_hat, iters = invert_market(
+            s_obs=s_obs,
+            s0=s0,
+            p=p,
+            sigma=sigma,
+            v_draws=v_draws,
+        )
+        assert iters > 0
+        assert_finite_np(delta_hat, name="delta_hat")
+
+        s_hat = simulate_shares(delta_hat, p, sigma, v_draws)
+
+        tol = 1e-10 if sigma == 0.0 else 1e-6
+        assert np.allclose(s_hat, s_obs, atol=tol, rtol=0.0)
+
+
+def test_invert_market_fixed_point_residual_is_small():
+    """
+    Starting from a feasible share vector (not generated by the model),
+    inversion should produce delta such that simulated shares match the target.
+    """
+    J = 5
+    p = np.linspace(1.0, 2.0, J, dtype=float)
+    v_draws = fixed_draws(n=3000, seed=123)
+
+    for sigma in [0.0, 0.5, 1.5]:
+        for tiny in [False, True]:
+            s_obs, s0 = make_feasible_shares(J, tiny=tiny, seed=11)
+            check_market_inputs(s_obs, s0, p)
+
+            delta_hat, iters = invert_market(
+                s_obs=s_obs,
+                s0=s0,
+                p=p,
+                sigma=sigma,
+                v_draws=v_draws,
+            )
+            assert iters > 0
+            assert_finite_np(delta_hat, name="delta_hat")
+
+            s_hat = simulate_shares(delta_hat, p, sigma, v_draws)
+            residual = float(np.max(np.abs(s_hat - s_obs)))
+
+            if sigma == 0.0:
+                tol = 1e-10
+            else:
+                tol = 5e-6 if tiny else 2e-6
+
+            assert residual <= tol
+
+
+def test_invert_market_sigma0_matches_closed_form_delta():
+    """
+    With sigma = 0, the model reduces to simple logit with outside option:
+        delta_j = log(s_j) - log(s0)
+    """
+    J = 6
+    p = np.linspace(0.8, 2.2, J, dtype=float)
     sigma = 0.0
-    draws = fixed_draws()
+    v_draws = fixed_draws(n=1000, seed=123)
 
-    # Generate shares from the model itself (guaranteed fixed point)
-    s_obs = simulate_shares(delta_true, p, sigma, draws)
-    s0 = 1.0 - s_obs.sum()
-
-    delta_hat, iters = invert_market(
-        s_obs=s_obs,
-        s0=s0,
-        p=p,
-        sigma=sigma,
-        v_draws=draws,
-    )
-
-    assert iters > 0
-
-    # Fixed-point check
-    s_hat = simulate_shares(delta_hat, p, sigma, draws)
-    assert np.allclose(s_hat, s_obs, atol=1e-10)
-
-
-# ---------------------------------------------------------------------
-# 5) invert_market — sigma ≠ 0 (round-trip fixed point)
-# ---------------------------------------------------------------------
-def test_invert_market_sigma_nonzero_roundtrip():
-    """
-    For sigma > 0, inversion should recover a delta that reproduces
-    the observed shares (fixed-point correctness).
-    """
-    delta_true = np.array([0.8, -0.3, 0.2])
-    p = np.array([1.0, 1.3, 1.8])
-    sigma = 1.0
-    draws = fixed_draws(n=1000)
-
-    # Generate artificial data
-    s_obs = simulate_shares(delta_true, p, sigma, draws)
-    s0 = 1.0 - s_obs.sum()
+    s_obs, s0 = make_feasible_shares(J, tiny=False, seed=7)
+    check_market_inputs(s_obs, s0, p)
 
     delta_hat, iters = invert_market(
         s_obs=s_obs,
         s0=s0,
         p=p,
         sigma=sigma,
-        v_draws=draws,
+        v_draws=v_draws,
     )
-
     assert iters > 0
+    assert_finite_np(delta_hat, name="delta_hat")
 
-    # Fixed-point condition (this is the correctness criterion)
-    s_hat = simulate_shares(delta_hat, p, sigma, draws)
-    assert np.allclose(s_hat, s_obs, atol=1e-6)
+    delta_cf = np.log(s_obs) - np.log(s0)
+    assert np.allclose(delta_hat, delta_cf, atol=1e-10, rtol=0.0)

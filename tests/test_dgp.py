@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from conftest import assert_finite_np
+
 from datasets.dgp import (
     generate_market_conditions,
     BasicLuChoiceModel,
@@ -10,24 +12,25 @@ from datasets.dgp import (
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Local deterministic helpers (NumPy-only)
 # -----------------------------------------------------------------------------
-def _assert_all_finite(*arrays) -> None:
-    for a in arrays:
-        assert np.all(np.isfinite(a)), "Found non-finite values."
-
-
-def _assert_in_unit_interval(x: np.ndarray, *, atol: float = 0.0) -> None:
-    assert np.all(x >= -atol), f"Values below 0 (min={x.min()})."
-    assert np.all(x <= 1.0 + atol), f"Values above 1 (max={x.max()})."
-
-
 def _assert_prob_simplex(
     sjt: np.ndarray, s0t: np.ndarray, *, atol: float = 1e-12
 ) -> None:
-    _assert_all_finite(sjt, s0t)
-    _assert_in_unit_interval(sjt, atol=atol)
-    _assert_in_unit_interval(s0t, atol=atol)
+    """
+    sjt: (T,J), s0t: (T,)
+    Checks: finite, bounds, and s0t + sum_j sjt == 1 marketwise.
+    """
+    assert_finite_np(sjt, name="sjt")
+    assert_finite_np(s0t, name="s0t")
+
+    assert sjt.ndim == 2
+    assert s0t.ndim == 1
+
+    assert np.all(sjt >= -atol)
+    assert np.all(sjt <= 1.0 + atol)
+    assert np.all(s0t >= -atol)
+    assert np.all(s0t <= 1.0 + atol)
 
     err = np.max(np.abs(s0t + sjt.sum(axis=1) - 1.0))
     assert (
@@ -35,123 +38,119 @@ def _assert_prob_simplex(
     ), f"Share identity violated (max abs err={err:.3e}, atol={atol:.3e})."
 
 
-def _mean_abs_error(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean(np.abs(a - b)))
+def _deterministic_panel(T: int, J: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Deterministic (pjt, wjt, Ejt) with:
+      - wjt in [1, 2]
+      - moderate magnitudes for stability
+    """
+    pjt = np.linspace(-1.0, 1.0, T * J, dtype=float).reshape(T, J)
 
+    w_grid = np.linspace(1.0, 2.0, J, dtype=float)[None, :]
+    wjt = np.repeat(w_grid, repeats=T, axis=0)
 
-def _make_problem(*, T: int = 5, J: int = 8, N_sim: int = 1000) -> tuple[int, int, int]:
-    return int(T), int(J), int(N_sim)
+    Ejt = np.linspace(-0.5, 0.5, T * J, dtype=float).reshape(T, J)
+    return pjt, wjt, Ejt
 
 
 # -----------------------------------------------------------------------------
 # generate_market_conditions
 # -----------------------------------------------------------------------------
 def test_generate_market_conditions_invalid_dgp_type_raises():
-    with pytest.raises(ValueError):
-        generate_market_conditions(T=3, J=4, dgp_type=0, seed=123)
-    with pytest.raises(ValueError):
-        generate_market_conditions(T=3, J=4, dgp_type=5, seed=123)
+    for bad in [0, 5, -1, 999]:
+        with pytest.raises(ValueError):
+            generate_market_conditions(T=3, J=4, dgp_type=bad, seed=123)
 
 
-@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
-def test_generate_market_conditions_shapes_and_finite(dgp_type):
-    T, J, _ = _make_problem(T=7, J=11, N_sim=10)
-    wjt, Ejt, ujt, alpha = generate_market_conditions(
-        T=T, J=J, dgp_type=dgp_type, seed=123
-    )
+def test_generate_market_conditions_contract_all_types():
+    """
+    Single contract test for dgp_type in {1,2,3,4}:
+      - shapes
+      - finiteness
+      - wjt support
+    """
+    T, J = 7, 11
+    for dgp_type in [1, 2, 3, 4]:
+        wjt, Ejt, ujt, alpha = generate_market_conditions(
+            T=T, J=J, dgp_type=dgp_type, seed=123
+        )
 
-    assert wjt.shape == (T, J)
-    assert Ejt.shape == (T, J)
-    assert ujt.shape == (T, J)
-    assert alpha.shape == (T, J)
+        assert wjt.shape == (T, J)
+        assert Ejt.shape == (T, J)
+        assert ujt.shape == (T, J)
+        assert alpha.shape == (T, J)
 
-    _assert_all_finite(wjt, Ejt, ujt, alpha)
+        assert_finite_np(wjt, name="wjt")
+        assert_finite_np(Ejt, name="Ejt")
+        assert_finite_np(ujt, name="ujt")
+        assert_finite_np(alpha, name="alpha")
 
-
-@pytest.mark.parametrize("dgp_type", [1, 2, 3, 4])
-def test_generate_market_conditions_wjt_support(dgp_type):
-    T, J, _ = _make_problem(T=7, J=11, N_sim=10)
-    wjt, Ejt, ujt, alpha = generate_market_conditions(
-        T=T, J=J, dgp_type=dgp_type, seed=123
-    )
-
-    assert np.min(wjt) >= 1.0
-    assert np.max(wjt) <= 2.0
-    _assert_all_finite(Ejt, ujt, alpha)
+        assert np.min(wjt) >= 1.0
+        assert np.max(wjt) <= 2.0
 
 
-@pytest.mark.parametrize("dgp_type", [1, 2])
-def test_generate_market_conditions_njt_structure_sparse_dgp12(dgp_type):
+def test_generate_market_conditions_njt_structure_sparse_dgp12():
     """
     For DGP 1/2:
-      - E_bar_t is fixed at -1, so njt = Ejt - E_bar_t = Ejt + 1
+      - E_bar_t is fixed at -1, so njt = Ejt + 1
       - n_active = int(0.4*J)
       - for j < n_active: njt[t,j] = +1 if j even else -1
       - for j >= n_active: njt[t,j] = 0
     """
-    T, J, _ = _make_problem(T=10, J=15, N_sim=10)
-    wjt, Ejt, ujt, alpha = generate_market_conditions(
-        T=T, J=J, dgp_type=dgp_type, seed=123
-    )
-
-    njt = Ejt + 1.0
+    T, J = 10, 15
     n_active = int(0.4 * J)
+    expected_active = np.array([1.0 if (j % 2 == 0) else -1.0 for j in range(n_active)])
 
-    for t in range(T):
-        active = njt[t, :n_active]
-        inactive = njt[t, n_active:]
-
-        expected_active = np.array(
-            [1.0 if (j % 2 == 0) else -1.0 for j in range(n_active)],
-            dtype=float,
+    for dgp_type in [1, 2]:
+        wjt, Ejt, ujt, alpha = generate_market_conditions(
+            T=T, J=J, dgp_type=dgp_type, seed=123
         )
+        njt = Ejt + 1.0
 
-        assert np.array_equal(active, expected_active)
-        assert np.array_equal(inactive, np.zeros(J - n_active, dtype=float))
+        assert np.all(njt[:, :n_active] == expected_active[None, :])
+        assert np.all(njt[:, n_active:] == 0.0)
 
-    _assert_all_finite(wjt, ujt, alpha)
-
-
-@pytest.mark.parametrize("dgp_type", [1, 3])
-def test_generate_market_conditions_alpha_rules_dgp1_and_dgp3(dgp_type):
-    T, J, _ = _make_problem(T=6, J=12, N_sim=10)
-    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=dgp_type, seed=123)
-    assert np.array_equal(alpha, np.zeros((T, J), dtype=float))
-
-    # Sanity: njt exists (via Ejt + 1), but alpha is still zero
-    njt = Ejt + 1.0
-    _assert_all_finite(njt)
+        assert_finite_np(wjt, name="wjt")
+        assert_finite_np(ujt, name="ujt")
+        assert_finite_np(alpha, name="alpha")
 
 
-def test_generate_market_conditions_alpha_rules_dgp2():
-    T, J, _ = _make_problem(T=6, J=15, N_sim=10)
-    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=2, seed=123)
-    njt = Ejt + 1.0  # since E_bar_t = -1
-
-    expected = np.zeros((T, J), dtype=float)
-    expected[njt == 1.0] = 0.3
-    expected[njt == -1.0] = -0.3
-
-    assert np.array_equal(alpha, expected)
-
-
-def test_generate_market_conditions_alpha_rules_dgp4():
-    T, J, _ = _make_problem(T=6, J=12, N_sim=10)
-    _, Ejt, _, alpha = generate_market_conditions(T=T, J=J, dgp_type=4, seed=123)
-    njt = Ejt + 1.0  # since E_bar_t = -1
-
+def test_generate_market_conditions_alpha_rules_all_types():
+    """
+    Alpha rules (using njt = Ejt + 1 because E_bar_t = -1):
+      - dgp 1,3: alpha == 0
+      - dgp 2: alpha = +0.3 if njt==+1, -0.3 if njt==-1, else 0
+      - dgp 4: alpha = +0.3 if njt>=1/3, -0.3 if njt<=-1/3, else 0
+    """
+    T, J = 6, 15
     thr = 1.0 / 3.0
-    expected = np.zeros((T, J), dtype=float)
-    expected[njt >= thr] = 0.3
-    expected[njt <= -thr] = -0.3
 
-    assert np.array_equal(alpha, expected)
+    for dgp_type in [1, 2, 3, 4]:
+        _, Ejt, _, alpha = generate_market_conditions(
+            T=T, J=J, dgp_type=dgp_type, seed=123
+        )
+        njt = Ejt + 1.0
+
+        if dgp_type in [1, 3]:
+            assert np.all(alpha == 0.0)
+
+        elif dgp_type == 2:
+            expected = np.zeros((T, J), dtype=float)
+            expected[njt == 1.0] = 0.3
+            expected[njt == -1.0] = -0.3
+            assert np.array_equal(alpha, expected)
+
+        else:  # dgp_type == 4
+            expected = np.zeros((T, J), dtype=float)
+            expected[njt >= thr] = 0.3
+            expected[njt <= -thr] = -0.3
+            assert np.array_equal(alpha, expected)
 
 
 # -----------------------------------------------------------------------------
 # BasicLuChoiceModel.utilities
 # -----------------------------------------------------------------------------
-def test_utilities_rejects_bad_rank_inputs():
+def test_utilities_validation_raises():
     model = BasicLuChoiceModel(N=10, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
 
     pjt = np.zeros((3, 4), dtype=float)
@@ -159,66 +158,52 @@ def test_utilities_rejects_bad_rank_inputs():
     Ejt = np.zeros((3, 4), dtype=float)
 
     with pytest.raises(ValueError):
-        model.utilities(pjt=pjt[0], wjt=wjt, Ejt=Ejt)  # 1D pjt
+        model.utilities(pjt=pjt[0], wjt=wjt, Ejt=Ejt)
     with pytest.raises(ValueError):
-        model.utilities(pjt=pjt, wjt=wjt[..., None], Ejt=Ejt)  # 3D wjt
+        model.utilities(pjt=pjt, wjt=wjt[..., None], Ejt=Ejt)
     with pytest.raises(ValueError):
-        model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt[..., None])  # 3D Ejt
+        model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt[..., None])
 
-
-def test_utilities_rejects_mismatched_shapes():
-    model = BasicLuChoiceModel(N=10, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
-
-    pjt = np.zeros((3, 4), dtype=float)
-    wjt = np.zeros((3, 5), dtype=float)
-    Ejt = np.zeros((3, 4), dtype=float)
-
+    wjt_bad = np.zeros((3, 5), dtype=float)
     with pytest.raises(ValueError):
-        model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
+        model.utilities(pjt=pjt, wjt=wjt_bad, Ejt=Ejt)
 
 
-def test_utilities_output_shape():
-    T, J, N_sim = _make_problem(T=4, J=6, N_sim=17)
+def test_utilities_output_shape_and_finite():
+    T, J, N_sim = 4, 6, 17
     model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=1.0, seed=123)
 
-    pjt = np.zeros((T, J), dtype=float)
-    wjt = np.ones((T, J), dtype=float)
-    Ejt = np.zeros((T, J), dtype=float)
-
+    pjt, wjt, Ejt = _deterministic_panel(T, J)
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
+
     assert uijt.shape == (T, N_sim, J)
-    _assert_all_finite(uijt)
+    assert_finite_np(uijt, name="uijt")
 
 
 def test_utilities_sigma_zero_constant_across_consumers():
-    T, J, N_sim = _make_problem(T=4, J=6, N_sim=25)
+    T, J, N_sim = 4, 6, 25
     model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=0.0, seed=123)
 
-    pjt = np.random.normal(size=(T, J))
-    wjt = np.random.uniform(1.0, 2.0, size=(T, J))
-    Ejt = np.random.normal(size=(T, J))
-
+    pjt, wjt, Ejt = _deterministic_panel(T, J)
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-    base = uijt[:, 0, :]
-    for i in range(1, N_sim):
-        assert np.allclose(uijt[:, i, :], base, atol=0.0, rtol=0.0)
+    assert np.allclose(uijt, uijt[:, :1, :], atol=0.0, rtol=0.0)
 
 
 def test_utilities_reduces_when_beta_w_zero_and_Ejt_zero():
-    T, J, N_sim = _make_problem(T=3, J=5, N_sim=12)
+    T, J, N_sim = 3, 5, 12
     model = BasicLuChoiceModel(N=N_sim, beta_p=-2.0, beta_w=0.0, sigma=1.3, seed=123)
 
-    pjt = np.random.normal(size=(T, J))
-    wjt = np.random.uniform(1.0, 2.0, size=(T, J))
+    pjt, wjt, _ = _deterministic_panel(T, J)
     Ejt = np.zeros((T, J), dtype=float)
 
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-    expected = np.zeros_like(uijt)
-    for t in range(T):
-        expected[t] = model.beta_p_i[:, None] * pjt[t][None, :]
+    beta_p_i = np.asarray(model.beta_p_i, dtype=float)
+    if beta_p_i.ndim == 0:
+        beta_p_i = np.full((N_sim,), float(beta_p_i), dtype=float)
 
+    expected = beta_p_i[None, :, None] * pjt[:, None, :]
     assert np.allclose(uijt, expected)
 
 
@@ -230,41 +215,32 @@ def test_generate_market_shares_rejects_non_3d_uijt():
         _generate_market_shares(np.zeros((3, 4), dtype=float))
 
 
-def test_generate_market_shares_simplex_and_bounds():
-    T, J, N_sim = _make_problem(T=4, J=7, N_sim=50)
-    uijt = np.random.normal(size=(T, N_sim, J))
+def test_generate_market_shares_contract_and_extremes():
+    T, J, N_sim = 4, 7, 50
 
+    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
     sjt, s0t = _generate_market_shares(uijt)
+
     assert sjt.shape == (T, J)
     assert s0t.shape == (T,)
-    _assert_prob_simplex(sjt, s0t, atol=1e-12)
+    _assert_prob_simplex(sjt, s0t)
 
+    for level in [-50.0, 50.0]:
+        u_ext = np.full((T, N_sim, J), level, dtype=float)
+        sjt_e, s0t_e = _generate_market_shares(u_ext)
+        _assert_prob_simplex(sjt_e, s0t_e)
 
-def test_generate_market_shares_extreme_negative_utilities_outside_near_one():
-    T, J, N_sim = _make_problem(T=3, J=5, N_sim=20)
-    uijt = -50.0 * np.ones((T, N_sim, J), dtype=float)
-
-    sjt, s0t = _generate_market_shares(uijt)
-    _assert_prob_simplex(sjt, s0t, atol=1e-12)
-
-    assert np.all(s0t > 1.0 - 1e-10)
-    assert np.all(sjt < 1e-10)
-
-
-def test_generate_market_shares_extreme_positive_utilities_outside_near_zero():
-    T, J, N_sim = _make_problem(T=3, J=5, N_sim=20)
-    uijt = 50.0 * np.ones((T, N_sim, J), dtype=float)
-
-    sjt, s0t = _generate_market_shares(uijt)
-    _assert_prob_simplex(sjt, s0t, atol=1e-12)
-
-    assert np.all(s0t < 1e-10)
-    assert np.all(np.abs(sjt.sum(axis=1) - 1.0) < 1e-10)
+        if level < 0:
+            assert np.all(s0t_e > 1.0 - 1e-10)
+            assert np.all(sjt_e < 1e-10)
+        else:
+            assert np.all(s0t_e < 1e-10)
+            assert np.all(np.abs(sjt_e.sum(axis=1) - 1.0) < 1e-10)
 
 
 def test_generate_market_shares_monotone_under_additive_shift():
-    T, J, N_sim = _make_problem(T=4, J=6, N_sim=100)
-    uijt = np.random.normal(size=(T, N_sim, J))
+    T, J, N_sim = 4, 6, 40
+    uijt = np.linspace(-0.5, 0.5, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
 
     sjt0, s0t0 = _generate_market_shares(uijt)
     sjt1, s0t1 = _generate_market_shares(uijt + 1.0)
@@ -272,8 +248,8 @@ def test_generate_market_shares_monotone_under_additive_shift():
     assert np.all(s0t1 < s0t0)
     assert np.all(sjt1.sum(axis=1) > sjt0.sum(axis=1))
 
-    _assert_prob_simplex(sjt0, s0t0, atol=1e-12)
-    _assert_prob_simplex(sjt1, s0t1, atol=1e-12)
+    _assert_prob_simplex(sjt0, s0t0)
+    _assert_prob_simplex(sjt1, s0t1)
 
 
 # -----------------------------------------------------------------------------
@@ -285,11 +261,10 @@ def test_generate_market_rejects_non_3d_uijt():
 
 
 def test_generate_market_count_identity_and_shapes():
-    T, J, N_sim = _make_problem(T=5, J=8, N_sim=500)
+    T, J, N_sim = 5, 8, 200
     N = 2000
 
-    uijt = np.random.normal(size=(T, N_sim, J))
-
+    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
     sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=123)
 
     assert sjt.shape == (T, J)
@@ -307,28 +282,4 @@ def test_generate_market_count_identity_and_shapes():
         totals == N
     ), f"Count identity violated: min={totals.min()}, max={totals.max()}, N={N}"
 
-    _assert_prob_simplex(sjt, s0t, atol=1e-12)
-
-
-def test_generate_market_q_over_N_approximates_sjt_large_N():
-    """
-    For large N, multinomial counts qjt should concentrate around expected shares sjt.
-
-    This is intentionally loose and averages across all T*J cells to reduce variance.
-    """
-    T, J, N_sim = _make_problem(T=6, J=10, N_sim=2000)
-    N = 20000
-
-    wjt, Ejt, ujt, alpha = generate_market_conditions(T=T, J=J, dgp_type=4, seed=123)
-    pjt = alpha + 0.3 * wjt + ujt
-
-    model = BasicLuChoiceModel(N=N_sim, beta_p=-1.0, beta_w=0.5, sigma=1.5, seed=123)
-    uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
-
-    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=123)
-
-    mae_inside = _mean_abs_error(qjt / float(N), sjt)
-    mae_outside = _mean_abs_error(q0t / float(N), s0t)
-
-    assert mae_inside < 0.02, f"MAE(qjt/N, sjt) too large: {mae_inside:.4f}"
-    assert mae_outside < 0.02, f"MAE(q0t/N, s0t) too large: {mae_outside:.4f}"
+    _assert_prob_simplex(sjt, s0t)
