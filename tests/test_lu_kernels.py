@@ -9,7 +9,7 @@ from conftest import (
     assert_in_open_unit_interval_tf,
 )
 
-from market_shock_estimators.lu_kernels import (
+from toolbox.mcmc_kernels import (
     rw_mh_step,
     tmh_step,
     gibbs_gamma,

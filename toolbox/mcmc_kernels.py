@@ -15,7 +15,7 @@ from typing import Callable, Tuple
 
 import tensorflow as tf
 
-from market_shock_estimators.choice_learn.choice_learn_validate_input import (
+from toolbox.kernels_input_validation import (
     tmh_step_validate_input_tf,
 )
 

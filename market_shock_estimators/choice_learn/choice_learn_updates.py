@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import tensorflow as tf
 
-from market_shock_estimators.choice_learn.choice_learn_kernels import (
+from toolbox.mcmc_kernels import (
     gibbs_gamma,
     gibbs_phi,
     rw_mh_step,

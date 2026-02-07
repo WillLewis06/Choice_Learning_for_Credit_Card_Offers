@@ -23,9 +23,10 @@ import math
 import numpy as np
 import tensorflow as tf
 
-from datasets.choice_learn_market_shocks_dgp import (
+from datasets.cl_with_shocks_dgp import (
     generate_choice_learn_market_shocks_dgp,
 )
+from datasets.ching_dgp import generate_dgp
 from models.featurebased import BaseFeatureBasedDeepHalo
 from market_shock_estimators.choice_learn.choice_learn_shrinkage import (
     ChoiceLearnShrinkageEstimator,
@@ -38,12 +39,14 @@ from market_shock_estimators.choice_learn.choice_learn_shrinkage import (
 
 # DGP
 seed = 123
-num_products = 100
-num_groups = 15
+num_products = 15
+num_groups = 5
 num_markets = 10
 
-N_base = 20_000  # baseline phase: single multinomial draw
-N_shock = 10_000  # shock phase: per-market multinomial draws (generated but unused in phase 1)
+N_base = 2_000  # baseline phase: single multinomial draw
+N_shock = (
+    1_000  # shock phase: per-market multinomial draws (generated but unused in phase 1)
+)
 
 x_sd = 1.0
 coef_sd = 1.0
@@ -59,20 +62,20 @@ sd_u = 0.5
 
 # Baseline model (Zhang)
 depth = 10
-width = 500
-heads = 25
+width = 100
+heads = 8
 
 # Training
-epochs = 20
-batch_size = 32
+epochs = 5
+batch_size = 64
 learning_rate = 1e-3
-shuffle_buffer = 10_000
+shuffle_buffer = 1_000
 
 # Evaluation
 # Shrinkage (Phase 2)
 # MCMC
 shrink_seed = 0
-shrink_n_iter = 100
+shrink_n_iter = 10
 
 # Tuning
 shrink_pilot_length = 20
@@ -413,128 +416,111 @@ def main() -> None:
     else:
         rmse_prob_all_post_vs_oracle = float("nan")
 
-    # ---- Phase 2 recovery diagnostics ----
-    # Primary recovery target: combined shock surface s[t,j] = E_bar[t] + n[t,j]
-    s_true = E_bar_true[:, None] + njt_true
-    s_hat = E_bar_hat[:, None] + njt_hat
-    s_rmse = rmse(s_hat, s_true)
-    s_corr = corr(s_hat, s_true)
-
-    # Decomposed components reported under a centering convention
-    E_true_c, n_true_c = center_market(E_bar_true, njt_true)
-    E_hat_c, n_hat_c = center_market(E_bar_hat, njt_hat)
-    E_rmse = rmse(E_hat_c, E_true_c)
-    E_corr = corr(E_hat_c, E_true_c)
-    n_rmse = rmse(n_hat_c, n_true_c)
-    n_corr = corr(n_hat_c, n_true_c)
-
-    # ---- Sparsity / inclusion diagnostics ----
-    # Ground truth "active" defined by non-trivial injected product shock.
-    active_true = np.abs(njt_true) > 1e-12
-    active_pred = gamma_hat > 0.5
-
-    tp = int(np.sum(active_true & active_pred))
-    fp = int(np.sum((~active_true) & active_pred))
-    fn = int(np.sum(active_true & (~active_pred)))
-
-    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
-    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
-    f1 = (
-        float(2.0 * precision * recall / (precision + recall))
-        if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
-        else float("nan")
-    )
-
-    # Separation of posterior inclusion probabilities
-    gamma_active_mean = (
-        float(np.mean(gamma_hat[active_true])) if np.any(active_true) else float("nan")
-    )
-    gamma_inactive_mean = (
-        float(np.mean(gamma_hat[~active_true]))
-        if np.any(~active_true)
-        else float("nan")
-    )
-
-    # ---- Ranked summaries for interpretability ----
-    top_k = 5
-    idx_top_E = np.argsort(np.abs(E_hat_c))[::-1][
-        :top_k
-    ]  # markets with largest centered market-wide shift
-
-    mean_abs_n_by_j = np.mean(
-        np.abs(n_hat_c), axis=0
-    )  # product-level average abs deviation
-    idx_top_prod = np.argsort(mean_abs_n_by_j)[::-1][: min(top_k, J)]
-    active_rate_hat = np.mean((gamma_hat > 0.5), axis=0)
-
-    # ---- Print report ----
-    print("")
     print("============================================================")
-    print("RESULTS SUMMARY")
+    print("PHASE 2 SUMMARY")
+    print("============================================================")
+    print(f"  n_saved: {n_saved}")
+    print(f"  alpha_hat: {alpha_hat:.6f}")
+
+    phi_mean = float(np.mean(phi_hat))
+    phi_min = float(np.min(phi_hat))
+    phi_max = float(np.max(phi_hat))
+    print(f"  phi_hat: mean={phi_mean:.6f} | min={phi_min:.6f} | max={phi_max:.6f}")
+
+    print("")
+    print("  Predictive fit (avg per market):")
+    print(
+        f"    NLL: baseline-only={nll_base:.3f} | posterior-mean={nll_post:.3f} | oracle={nll_oracle:.3f}"
+    )
+    print(
+        f"    RMSE vs empirical inside shares: baseline-only={rmse_share_inside_base:.6f} | posterior-mean={rmse_share_inside_post:.6f}"
+    )
+
     print("============================================================")
 
-    print("")
-    print("Phase 1 (baseline logits): recovery of centered utilities")
-    print(f"  corr(delta_hat, delta_true): {baseline_logit_corr:.4f}")
-    print(f"  rmse(delta_hat, delta_true): {baseline_logit_rmse:.4f}")
+    # -----------------------------
+    # Phase 3: smoke test DGP wiring
+    # -----------------------------
 
-    print("")
-    print("Phase 2 (posterior means): key estimated quantities")
-    print(f"  n_saved (MCMC draws used for posterior means): {n_saved}")
-    print(f"  alpha_hat (global rescaling of baseline logits): {alpha_hat:.4f}")
-    print(
-        f"  phi_hat (market-level sparsity rate): mean={float(np.mean(phi_hat)):.4f} | min={float(np.min(phi_hat)):.4f} | max={float(np.max(phi_hat)):.4f}"
+    # Choose which Phase-2 product becomes the single Phase-3 product.
+    product_index = 0
+
+    # Phase-3 panel size (keep small for a quick sanity check).
+    N3 = 500
+    T3 = 50
+
+    # Phase-3 model truth (common across consumers).
+    theta3_true = {
+        "beta": 0.95,
+        "alpha": 1.0,
+        "v": 2.0,
+        "fc": 0.2,
+        "lambda_c": 0.3,
+    }
+
+    # Phase-3 state space / price process (passed explicitly; no defaults in DGP).
+    I_max3 = 10
+    P_price3 = np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float64)  # (S,S)
+    price_vals3 = np.array([1.0, 0.8], dtype=np.float64)  # (S,)
+    waste_cost3 = 1.0
+
+    # DP controls
+    dp_tol3 = 1e-10
+    dp_max_iter3 = 50_000
+
+    a_imt_3, p_state_mt_3, u_m_true_3, theta_true_3 = generate_dgp(
+        seed=seed + 999,
+        delta_true=delta_true,
+        E_bar_true=E_bar_true,
+        njt_true=njt_true,
+        product_index=product_index,
+        N=N3,
+        T=T3,
+        theta_true=theta3_true,
+        I_max=I_max3,
+        P_price=P_price3,
+        price_vals=price_vals3,
+        waste_cost=waste_cost3,
+        tol=dp_tol3,
+        max_iter=dp_max_iter3,
     )
 
-    print("")
-    print("Phase 2 predictive performance on observed phase-2 counts")
-    print("  Average per-market NLL (lower is better):")
-    print(f"    baseline-only (frozen logits):           {nll_base:.3f}")
-    print(f"    online-corrected (posterior mean):       {nll_post:.3f}")
-    print(f"    oracle (truth utilities; reference):     {nll_oracle:.3f}")
-    print("  Average RMSE vs empirical inside shares (lower is better):")
-    print(f"    baseline-only:                           {rmse_share_inside_base:.4f}")
-    print(f"    online-corrected:                        {rmse_share_inside_post:.4f}")
+    # Basic sanity prints
+    print("============================================================")
+    print("PHASE 3 DGP SMOKE TEST")
+    print("============================================================")
+    print(f"product_index: {product_index}")
     print(
-        f"    oracle (reference):                      {rmse_share_inside_oracle:.4f}"
+        f"a_imt shape: {a_imt_3.shape} | p_state_mt shape: {p_state_mt_3.shape} | u_m_true shape: {u_m_true_3.shape}"
     )
-    if eval_include_outside:
+    print(f"theta_true: {theta_true_3}")
+    print(
+        f"u_m_true: mean={float(np.mean(u_m_true_3)):.4f} | min={float(np.min(u_m_true_3)):.4f} | max={float(np.max(u_m_true_3)):.4f}"
+    )
+
+    # Purchase rate overall
+    buy_rate = float(np.mean(a_imt_3))
+    print(f"overall buy rate: {buy_rate:.4f}")
+
+    S3 = int(P_price3.shape[0])
+    total = float(np.prod(a_imt_3.shape))  # M*N*T
+
+    for s in range(S3):
+        mask = p_state_mt_3[:, None, :] == s  # (M,1,T)
+        mask_f = mask.astype(np.float64)
+
+        # Expand mask to (M,N,T) implicitly by multiplying with ones_like(a_imt_3)
+        denom = float((mask_f * np.ones_like(a_imt_3)).sum())
+        state_mass = denom / total
+
+        if denom > 0.0:
+            num = float((a_imt_3 * mask_f).sum())  # broadcasts mask_f over N
+            buy_rate_s = num / denom
+        else:
+            buy_rate_s = float("nan")
+
         print(
-            f"  RMSE vs oracle probabilities (outside+inside): {rmse_prob_all_post_vs_oracle:.4f}"
-        )
-
-    print("")
-    print("Phase 2 recovery vs ground truth (simulation scoring)")
-    print("  Primary target: combined shock surface s[t,j] = E_bar[t] + n[t,j]")
-    print(f"    rmse(s_hat, s_true): {s_rmse:.4f} | corr: {s_corr:.4f}")
-    print("  Decomposition reported under market-centering convention:")
-    print(
-        "    (E_bar absorbs mean of n within each market; n is mean-zero across products)"
-    )
-    print(f"    market-wide component E_bar: rmse={E_rmse:.4f} | corr={E_corr:.4f}")
-    print(f"    product deviations n:        rmse={n_rmse:.4f} | corr={n_corr:.4f}")
-
-    print("")
-    print("Sparsity / inclusion diagnostics (gamma_hat thresholded at 0.5)")
-    print(f"  precision={precision:.4f} | recall={recall:.4f} | f1={f1:.4f}")
-    print(f"  mean gamma_hat on true-active entries:   {gamma_active_mean:.4f}")
-    print(f"  mean gamma_hat on true-inactive entries: {gamma_inactive_mean:.4f}")
-
-    print("")
-    print("Largest estimated market-wide shifts (after centering)")
-    for r, t in enumerate(idx_top_E, start=1):
-        print(
-            f"  {r}) market {int(t)}: E_hat_centered={E_hat_c[t]:+.4f} | E_true_centered={E_true_c[t]:+.4f}"
-        )
-
-    print("")
-    print(
-        "Most affected products overall (mean abs centered product deviation across markets)"
-    )
-    for r, j in enumerate(idx_top_prod, start=1):
-        print(
-            f"  {r}) product {int(j)}: mean|n_hat_centered|={mean_abs_n_by_j[j]:.4f} "
-            f"| Pr(gamma>0.5) across markets={active_rate_hat[j]:.2f}"
+            f"state {s}: price={float(price_vals3[s]):.3f} | mass={state_mass:.3f} | buy_rate={buy_rate_s:.4f}"
         )
 
     print("============================================================")
