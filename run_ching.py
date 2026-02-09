@@ -1,83 +1,79 @@
-# run_choice_learn_market_shocks.py
-"""
-Orchestration (phase 1 baseline only, TF-native):
+# run_ching.py
+"""End-to-end orchestration for:
 
-- Generate updated DGP (fixed set, product-sparse cross-product interactions).
-- Train BaseFeatureBasedDeepHalo using a tf.data.Dataset that streams labels and
-  tiles a single fixed choice set tensor for each batch.
-- Evaluate using probability RMSE against true probabilities (and optionally
-  against empirical shares).
+- Phase 1: feature-based baseline choice model (delta_hat)
+- Phase 2: Lu-style shrinkage on market-product shocks (E_bar_hat, njt_hat, alpha_hat)
+- Stockpiling model: generate seller-observed purchases under forward-looking inventory and
+  estimate stockpiling parameters treating (per-market) utilities as fixed inputs.
 
-Phase 2 additionally runs the ChoiceLearnShrinkageEstimator on shocked counts using
-frozen baseline logits from the featurebased model.
+Notes:
+- This orchestration layer stays NumPy/Python only. Any TensorFlow conversion is handled
+  inside the stockpiling estimator.
+- Input validation and detailed diagnostics should live elsewhere; this file only prints
+  high-level milestones (plus existing Phase 1–2 diagnostics functions).
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any
 
-# Reduce TensorFlow logging noise in terminal output.
+import numpy as np
+
+# Keep TF logs quiet for upstream modules that may import TF internally.
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import math
-import numpy as np
-import tensorflow as tf
-
-from datasets.cl_with_shocks_dgp import (
-    generate_choice_learn_market_shocks_dgp,
-)
 from datasets.ching_dgp import generate_dgp
-from models.featurebased import BaseFeatureBasedDeepHalo
-from market_shock_estimators.choice_learn.choice_learn_shrinkage import (
-    ChoiceLearnShrinkageEstimator,
+from run_cl_with_shocks import (
+    print_choice_model_diagnostics,
+    print_market_shock_diagnostics,
+    run_choice_model,
+    run_market_shock_estimator,
 )
+from ching.stockpiling_estimator import StockpilingEstimator
 
 
-# -----------------------------
-# Hyperparameters (lowercase)
-# -----------------------------
+# =============================================================================
+# Phase 1: baseline choice model hyperparameters
+# =============================================================================
 
-# DGP
 seed = 123
 num_products = 15
 num_groups = 5
-num_markets = 10
+num_markets = 5
 
-N_base = 2_000  # baseline phase: single multinomial draw
-N_shock = (
-    1_000  # shock phase: per-market multinomial draws (generated but unused in phase 1)
-)
+N_base = 2_000
+N_shock = 1_000
 
 x_sd = 1.0
 coef_sd = 1.0
-
-# product-sparse interaction loadings
 p_g_active = 0.2
-g_sd = None  # if None, uses coef_sd
+g_sd = None
 
-# shocks (generated but unused in phase 1)
 sd_E = 0.5
 p_active = 0.25
 sd_u = 0.5
 
-# Baseline model (Zhang)
 depth = 10
-width = 100
+width = 64
 heads = 8
 
-# Training
 epochs = 5
 batch_size = 64
 learning_rate = 1e-3
-shuffle_buffer = 1_000
+shuffle_buffer = 10_000
 
-# Evaluation
-# Shrinkage (Phase 2)
-# MCMC
+# Diagnostics controls (used by the Phase 1–2 diagnostics printers)
+eval_include_outside = True
+eval_against_empirical = True
+
+
+# =============================================================================
+# Phase 2: market shock estimator hyperparameters
+# =============================================================================
+
 shrink_seed = 0
 shrink_n_iter = 10
-
-# Tuning
 shrink_pilot_length = 20
 shrink_max_rounds = 50
 shrink_target_low = 0.3
@@ -86,93 +82,182 @@ shrink_factor_rw = 1.2
 shrink_factor_tmh = 1.2
 shrink_ridge = 1e-6
 
-eval_include_outside = True
-eval_against_empirical = True
+
+# =============================================================================
+# Stockpiling model configuration + estimation hyperparameters
+# =============================================================================
+
+product_index = 0  # chosen product j*
+
+stock = {
+    "N": 500,
+    "T": 50,
+    "I_max": 10,
+    "theta_scalar": {
+        "beta": 0.95,
+        "alpha": 1.0,
+        "v": 2.0,
+        "fc": 0.2,
+        "lambda_c": 0.3,
+    },
+    "P_price": np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float64),
+    "price_vals": np.array([1.0, 0.8], dtype=np.float64),
+    "waste_cost": 1.0,
+    "dp": {"tol": 1e-10, "max_iter": 50_000},
+    "eps": 1e-12,
+}
+
+mcmc = {
+    "seed": 0,
+    "n_iter": 15,
+    "k": {
+        "beta": 0.2,
+        "alpha": 0.2,
+        "v": 0.2,
+        "fc": 0.2,
+        "lambda": 0.2,
+        "u_scale": 0.05,
+    },
+    "sigmas": {
+        "z_beta": 2.0,
+        "z_alpha": 2.0,
+        "z_v": 2.0,
+        "z_fc": 2.0,
+        "z_lambda": 2.0,
+        "z_u_scale": 2.0,
+    },
+}
 
 
-# -----------------------------
+# =============================================================================
 # Helpers
-# -----------------------------
+# =============================================================================
 
 
-def build_items_tensor(xj: np.ndarray) -> tf.Tensor:
-    """
-    Build the single fixed choice set tensor of shape (1, J, dx_items).
-
-    dx_items=2 with [x, x^2] per item.
-    """
-    x = tf.convert_to_tensor(np.asarray(xj, dtype=np.float32))  # (J,)
-    items = tf.stack([x, tf.square(x)], axis=-1)  # (J, 2)
-    return items[None, :, :]  # (1, J, 2)
+def _broadcast_theta_mn(
+    theta: dict[str, float], M: int, N: int
+) -> dict[str, np.ndarray]:
+    """Broadcast scalar parameters to arrays of shape (M,N)."""
+    return {k: np.full((M, N), float(v), dtype=np.float64) for k, v in theta.items()}
 
 
-def build_choice_index_tensor(qj_base: np.ndarray) -> tf.Tensor:
-    """
-    Expand inside-good counts into individual choice indices (0..J-1).
-
-    Returns choices tensor shape (N_inside,) int32.
-    """
-    q = np.asarray(qj_base, dtype=np.int64)
-    idx = np.repeat(np.arange(q.shape[0], dtype=np.int64), q)
-    return tf.convert_to_tensor(idx, dtype=tf.int32)
+def _uniform_pi_I0(I_max: int) -> np.ndarray:
+    """Uniform initial inventory belief over {0,...,I_max}."""
+    return np.full((I_max + 1,), 1.0 / (I_max + 1), dtype=np.float64)
 
 
-def make_training_dataset(
-    items_one: tf.Tensor,
-    choices: tf.Tensor,
+def run_stockpiling_dgp(
     *,
-    batch_size: int,
-    shuffle: bool,
-) -> tf.data.Dataset:
+    delta_used: np.ndarray,
+    E_bar_used: np.ndarray,
+    njt_used: np.ndarray,
+    seed_dgp: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Generate seller-observed stockpiling data using fixed utilities.
+
+    The fixed utilities are represented by (delta_used, E_bar_used, njt_used), where the
+    per-market intercept for product_index is:
+
+      u_m = delta_used[product_index] + E_bar_used[m] + njt_used[m, product_index].
+
+    Returns:
+      a_imt      (M, N, T)
+      p_state_mt (M, T)
+      u_m_true   (M,)
+      theta_true dict of (M,N) arrays
     """
-    Dataset yields (x_batch, y_batch) where:
-      y_batch: (B,)
-      x_batch: (B, J, dx) obtained by tiling items_one (1, J, dx).
-    """
-    ds = tf.data.Dataset.from_tensor_slices(choices)
-    if shuffle:
-        ds = ds.shuffle(buffer_size=shuffle_buffer, reshuffle_each_iteration=True)
-    ds = ds.batch(batch_size, drop_remainder=False)
+    delta_used = np.asarray(delta_used, dtype=np.float64)
+    E_bar_used = np.asarray(E_bar_used, dtype=np.float64)
+    njt_used = np.asarray(njt_used, dtype=np.float64)
 
-    def to_xy(y_batch: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        b = tf.shape(y_batch)[0]
-        x_batch = tf.tile(items_one, multiples=[b, 1, 1])  # (B, J, dx)
-        return x_batch, y_batch
+    M = int(E_bar_used.shape[0])
+    theta_true = _broadcast_theta_mn(stock["theta_scalar"], M, stock["N"])
 
-    ds = ds.map(to_xy, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
-
-
-def probs_with_outside_from_logits(delta_hat: np.ndarray) -> tuple[np.ndarray, float]:
-    """
-    Outside option utility fixed at 0.
-    Returns (p_inside (J,), p0).
-    """
-    u = np.asarray(delta_hat, dtype=np.float64)
-    m = max(0.0, float(np.max(u)))
-    exp_inside = np.exp(u - m)
-    exp_out = math.exp(-m)
-    denom = exp_out + float(np.sum(exp_inside))
-    return exp_inside / denom, float(exp_out / denom)
+    a_imt, p_state_mt, u_m_true, _ = generate_dgp(
+        seed=seed_dgp,
+        delta_true=delta_used,
+        E_bar_true=E_bar_used,
+        njt_true=njt_used,
+        product_index=product_index,
+        N=stock["N"],
+        T=stock["T"],
+        theta_true=theta_true,
+        I_max=stock["I_max"],
+        P_price=stock["P_price"],
+        price_vals=stock["price_vals"],
+        waste_cost=stock["waste_cost"],
+        tol=stock["dp"]["tol"],
+        max_iter=stock["dp"]["max_iter"],
+    )
+    return a_imt, p_state_mt, u_m_true, theta_true
 
 
-def rmse(a: np.ndarray, b: np.ndarray) -> float:
-    d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
-    return float(np.sqrt(np.mean(d * d)))
+def run_stockpiling_estimation(
+    *,
+    a_imt: np.ndarray,
+    p_state_mt: np.ndarray,
+    u_m: np.ndarray,
+    theta_init_from_dgp: dict[str, np.ndarray],
+) -> dict[str, object]:
+    """Estimate stockpiling parameters from seller-observed data."""
+    theta_init = {
+        "beta": theta_init_from_dgp["beta"],
+        "alpha": theta_init_from_dgp["alpha"],
+        "v": theta_init_from_dgp["v"],
+        "fc": theta_init_from_dgp["fc"],
+        "lambda_c": theta_init_from_dgp["lambda_c"],
+        "u_scale": np.ones_like(np.asarray(u_m, dtype=np.float64)),
+    }
+
+    est = StockpilingEstimator(
+        a_imt=a_imt,
+        p_state_mt=p_state_mt,
+        u_m=u_m,
+        price_vals=stock["price_vals"],
+        P_price=stock["P_price"],
+        I_max=stock["I_max"],
+        pi_I0=_uniform_pi_I0(stock["I_max"]),
+        waste_cost=stock["waste_cost"],
+        eps=stock["eps"],
+        tol=stock["dp"]["tol"],
+        max_iter=stock["dp"]["max_iter"],
+        sigmas=mcmc["sigmas"],
+        theta_init=theta_init,
+        seed=mcmc["seed"],
+    )
+    print("=== Stockpiling Estimator built ===")
+
+    k = mcmc["k"]
+    est.fit(
+        n_iter=mcmc["n_iter"],
+        k_beta=k["beta"],
+        k_alpha=k["alpha"],
+        k_v=k["v"],
+        k_fc=k["fc"],
+        k_lambda=k["lambda"],
+        k_u_scale=k["u_scale"],
+    )
+    print("=== Stockpiling Estimator fitted ===")
+
+    return est.get_results()
 
 
-# -----------------------------
+# =============================================================================
 # Main
-# -----------------------------
+# =============================================================================
 
 
-def main() -> None:
-    dgp = generate_choice_learn_market_shocks_dgp(
+def main() -> dict[str, Any]:
+    """Run Phase 1–2 utilities, then stockpiling DGP and estimation."""
+    # -------------------------------------------------------------------------
+    # Phase 1
+    # -------------------------------------------------------------------------
+    print("=== Phase 1: Baseline choice model ===")
+    out1 = run_choice_model(
         seed=seed,
-        num_markets=num_markets,
         num_products=num_products,
         num_groups=num_groups,
+        num_markets=num_markets,
         N_base=N_base,
         N_shock=N_shock,
         x_sd=x_sd,
@@ -182,348 +267,113 @@ def main() -> None:
         sd_E=sd_E,
         p_active=p_active,
         sd_u=sd_u,
-    )
-
-    xj = dgp["xj"]
-    qj_base = dgp["qj_base"]
-    q0_base = int(dgp["q0_base"])
-    p_base = np.asarray(dgp["p_base"], dtype=np.float64)
-    p0_base = float(dgp["p0_base"])
-
-    items_one = build_items_tensor(xj)  # (1, J, 2)
-    choices = build_choice_index_tensor(qj_base)  # (N_inside,)
-
-    n_inside = int(choices.shape[0])
-    if n_inside == 0:
-        raise ValueError(
-            "No inside purchases in baseline draw; increase N_base or adjust coefficients."
-        )
-
-    ds_train = make_training_dataset(
-        items_one=items_one,
-        choices=choices,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-    model = BaseFeatureBasedDeepHalo(
-        num_items=num_products,
         depth=depth,
         width=width,
         heads=heads,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        shuffle_buffer=shuffle_buffer,
     )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="acc")],
+    print("=== Baseline choice model fitted ===")
+
+    dgp = out1["dgp"]
+    delta_hat = np.asarray(out1["delta_hat"], dtype=np.float64)
+
+    print_choice_model_diagnostics(
+        delta_hat=delta_hat,
+        delta_true=dgp["delta_true"],
+        qj_base=dgp["qj_base"],
+        q0_base=int(dgp["q0_base"]),
+        p_base=dgp["p_base"],
+        p0_base=float(dgp["p0_base"]),
+        N_base=N_base,
+        eval_include_outside=eval_include_outside,
+        eval_against_empirical=eval_against_empirical,
     )
+    print("=== Phase 1 complete ===")
 
-    model.fit(ds_train, epochs=epochs, verbose=1)
-
-    # Predict logits for the fixed set once
-    delta_hat = model(items_one, training=False).numpy()[0]  # (J,)
-
-    # Probability RMSE against truth
-    p_hat, p0_hat = probs_with_outside_from_logits(delta_hat)
-
-    rmse_inside_true = rmse(p_hat, p_base)
-    if eval_include_outside:
-        rmse_all_true = rmse(np.r_[p0_hat, p_hat], np.r_[p0_base, p_base])
-    else:
-        rmse_all_true = float("nan")
-
-    # Optional: probability RMSE against empirical shares from the single multinomial draw
-    if eval_against_empirical:
-        s_hat = np.asarray(qj_base, dtype=np.float64) / float(N_base)
-        s0_hat = float(q0_base) / float(N_base)
-
-        rmse_inside_share = rmse(p_hat, s_hat)
-        if eval_include_outside:
-            rmse_all_share = rmse(np.r_[p0_hat, p_hat], np.r_[s0_hat, s_hat])
-        else:
-            rmse_all_share = float("nan")
-    else:
-        rmse_inside_share = float("nan")
-        rmse_all_share = float("nan")
-
-    print("baseline-only evaluation (tf.data)")
-    print(f"num_products: {num_products}")
-    print(f"N_base: {N_base} | N_inside: {n_inside} | N_outside: {q0_base}")
-    print(f"rmse_prob_inside_vs_true: {rmse_inside_true:.6f}")
-    if eval_include_outside:
-        print(f"rmse_prob_all_vs_true:    {rmse_all_true:.6f}")
-    if eval_against_empirical:
-        print(f"rmse_prob_inside_vs_share:{rmse_inside_share:.6f}")
-        if eval_include_outside:
-            print(f"rmse_prob_all_vs_share:   {rmse_all_share:.6f}")
-
-    # -----------------------------
-    # Phase 2: run shrinkage estimator (wiring only)
-    # -----------------------------
-
-    qjt_shock = np.asarray(dgp["qjt_shock"], dtype=np.float64)  # (T, J)
-    q0t_shock = np.asarray(dgp["q0t_shock"], dtype=np.float64)  # (T,)
-
-    T = int(qjt_shock.shape[0])
-    J = int(qjt_shock.shape[1])
-
-    # Replicate frozen baseline logits across markets to match (T, J)
-    delta_cl = np.repeat(np.asarray(delta_hat, dtype=np.float64)[None, :], T, axis=0)
-
-    shrink = ChoiceLearnShrinkageEstimator(
-        delta_cl=delta_cl,
-        qjt=qjt_shock,
-        q0t=q0t_shock,
+    # -------------------------------------------------------------------------
+    # Phase 2
+    # -------------------------------------------------------------------------
+    print("=== Phase 2: Market shock estimator ===")
+    res2 = run_market_shock_estimator(
+        delta_hat=delta_hat,
+        qjt_shock=dgp["qjt_shock"],
+        q0t_shock=dgp["q0t_shock"],
         seed=shrink_seed,
-    )
-
-    shrink.fit(
         n_iter=shrink_n_iter,
         pilot_length=shrink_pilot_length,
-        ridge=shrink_ridge,
+        max_rounds=shrink_max_rounds,
         target_low=shrink_target_low,
         target_high=shrink_target_high,
-        max_rounds=shrink_max_rounds,
         factor_rw=shrink_factor_rw,
         factor_tmh=shrink_factor_tmh,
+        ridge=shrink_ridge,
+    )
+    print("=== Market shock estimator fitted ===")
+
+    print_market_shock_diagnostics(
+        delta_hat=delta_hat,
+        dgp=dgp,
+        res=res2,
+        eval_include_outside=eval_include_outside,
+    )
+    print("=== Phase 2 complete ===")
+
+    # -------------------------------------------------------------------------
+    # Stockpiling DGP: use Phase-2 posterior means as fixed utilities.
+    # -------------------------------------------------------------------------
+    alpha_hat = float(res2["alpha_hat"])
+    E_bar_hat = np.asarray(res2["E_bar_hat"], dtype=np.float64)
+    njt_hat = np.asarray(res2["njt_hat"], dtype=np.float64)
+
+    # Feed the stockpiling DGP with (delta_used, E_bar_used, njt_used).
+    delta_used = alpha_hat * delta_hat
+
+    print("=== Stockpiling DGP: Generating seller-observed data ===")
+    a_imt, p_state_mt, u_m_true, theta_true = run_stockpiling_dgp(
+        delta_used=delta_used,
+        E_bar_used=E_bar_hat,
+        njt_used=njt_hat,
+        seed_dgp=seed + 999,
     )
 
-    res = shrink.get_results()
-
-    # -----------------------------
-    # Phase 3: results + diagnosis
-    # -----------------------------
-
-    def corr(a: np.ndarray, b: np.ndarray) -> float:
-        a = np.asarray(a, dtype=np.float64).ravel()
-        b = np.asarray(b, dtype=np.float64).ravel()
-        a = a - a.mean()
-        b = b - b.mean()
-        denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
-        if denom <= 0.0:
-            return float("nan")
-        return float(np.sum(a * b) / denom)
-
-    def probs_with_outside_from_utility(u: np.ndarray) -> tuple[np.ndarray, float]:
-        u = np.asarray(u, dtype=np.float64)
-        m = max(0.0, float(np.max(u)))
-        exp_inside = np.exp(u - m)
-        exp_out = math.exp(-m)
-        denom = exp_out + float(np.sum(exp_inside))
-        return exp_inside / denom, float(exp_out / denom)
-
-    def nll_from_counts(qj: np.ndarray, q0: float, pj: np.ndarray, p0: float) -> float:
-        # Multinomial constant omitted (does not affect model comparisons).
-        eps = 1e-15
-        pj = np.clip(np.asarray(pj, dtype=np.float64), eps, 1.0)
-        p0 = float(np.clip(p0, eps, 1.0))
-        return float(
-            -(
-                np.sum(np.asarray(qj, dtype=np.float64) * np.log(pj))
-                + float(q0) * math.log(p0)
-            )
-        )
-
-    def center_market(
-        E_bar: np.ndarray, njt: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Identification convention for reporting:
-        Move the within-market mean of n[t,:] into E_bar[t], so n[t,:] is mean-zero across products.
-        This preserves E_bar[t] + n[t,j] exactly.
-        """
-        njt = np.asarray(njt, dtype=np.float64)
-        E_bar = np.asarray(E_bar, dtype=np.float64)
-        m = njt.mean(axis=1)  # (T,)
-        E_c = E_bar + m
-        n_c = njt - m[:, None]
-        return E_c, n_c
-
-    # ---- Pull truth (for scoring) ----
-    delta_true = np.asarray(dgp["delta_true"], dtype=np.float64)  # (J,)
-    E_bar_true = np.asarray(dgp["E_bar_true"], dtype=np.float64)  # (T,)
-    njt_true = np.asarray(dgp["njt_true"], dtype=np.float64)  # (T,J)
-
-    # ---- Pull posterior means (estimates) ----
-    alpha_hat = float(res["alpha_hat"])
-    E_bar_hat = np.asarray(res["E_bar_hat"], dtype=np.float64)  # (T,)
-    njt_hat = np.asarray(res["njt_hat"], dtype=np.float64)  # (T,J)
-    gamma_hat = np.asarray(res["gamma_hat"], dtype=np.float64)  # (T,J)
-    phi_hat = np.asarray(res["phi_hat"], dtype=np.float64)  # (T,)
-    n_saved = int(res["n_saved"])
-
-    # ---- Phase 1 (baseline) diagnostics: utility recovery up to additive constant ----
-    delta_hat_c = np.asarray(delta_hat, dtype=np.float64) - float(np.mean(delta_hat))
-    delta_true_c = delta_true - float(np.mean(delta_true))
-    baseline_logit_corr = corr(delta_hat_c, delta_true_c)
-    baseline_logit_rmse = rmse(delta_hat_c, delta_true_c)
-
-    # ---- Phase 2 predictive diagnostics ----
-    # Baseline-only: uses frozen delta_cl (no online correction).
-    # Shock-adjusted: uses posterior mean utilities alpha*delta_cl + E_bar + n.
-    # Oracle: uses ground-truth utilities (reference upper bound in simulation).
-    nll_base = 0.0
-    nll_post = 0.0
-    nll_oracle = 0.0
-
-    rmse_share_inside_base = 0.0
-    rmse_share_inside_post = 0.0
-    rmse_share_inside_oracle = 0.0
-
-    rmse_prob_all_post_vs_oracle = 0.0
-
-    for t in range(T):
-        N_t = float(q0t_shock[t] + float(np.sum(qjt_shock[t])))
-
-        # Empirical phase-2 shares
-        s_emp_j = np.asarray(qjt_shock[t], dtype=np.float64) / N_t
-
-        # Baseline-only prediction
-        pb_j, pb_0 = probs_with_outside_from_utility(delta_cl[t])
-
-        # Posterior-mean corrected prediction
-        u_post_t = alpha_hat * delta_cl[t] + E_bar_hat[t] + njt_hat[t]
-        pp_j, pp_0 = probs_with_outside_from_utility(u_post_t)
-
-        # Oracle prediction (truth utilities)
-        u_true_t = delta_true + E_bar_true[t] + njt_true[t]
-        po_j, po_0 = probs_with_outside_from_utility(u_true_t)
-
-        # NLL on observed counts
-        nll_base += nll_from_counts(qjt_shock[t], q0t_shock[t], pb_j, pb_0)
-        nll_post += nll_from_counts(qjt_shock[t], q0t_shock[t], pp_j, pp_0)
-        nll_oracle += nll_from_counts(qjt_shock[t], q0t_shock[t], po_j, po_0)
-
-        # RMSE vs empirical inside shares
-        rmse_share_inside_base += rmse(pb_j, s_emp_j)
-        rmse_share_inside_post += rmse(pp_j, s_emp_j)
-        rmse_share_inside_oracle += rmse(po_j, s_emp_j)
-
-        # Probability distance to oracle probabilities (outside+inside)
-        if eval_include_outside:
-            rmse_prob_all_post_vs_oracle += rmse(np.r_[pp_0, pp_j], np.r_[po_0, po_j])
-
-    nll_base /= float(T)
-    nll_post /= float(T)
-    nll_oracle /= float(T)
-
-    rmse_share_inside_base /= float(T)
-    rmse_share_inside_post /= float(T)
-    rmse_share_inside_oracle /= float(T)
-
-    if eval_include_outside:
-        rmse_prob_all_post_vs_oracle /= float(T)
-    else:
-        rmse_prob_all_post_vs_oracle = float("nan")
-
-    print("============================================================")
-    print("PHASE 2 SUMMARY")
-    print("============================================================")
-    print(f"  n_saved: {n_saved}")
-    print(f"  alpha_hat: {alpha_hat:.6f}")
-
-    phi_mean = float(np.mean(phi_hat))
-    phi_min = float(np.min(phi_hat))
-    phi_max = float(np.max(phi_hat))
-    print(f"  phi_hat: mean={phi_mean:.6f} | min={phi_min:.6f} | max={phi_max:.6f}")
-
-    print("")
-    print("  Predictive fit (avg per market):")
+    buy_rate = float(np.mean(a_imt))
+    print("=== Stockpiling data generated ===")
     print(
-        f"    NLL: baseline-only={nll_base:.3f} | posterior-mean={nll_post:.3f} | oracle={nll_oracle:.3f}"
+        f"a_imt shape: {a_imt.shape} | p_state_mt shape: {p_state_mt.shape} | u_m shape: {u_m_true.shape}"
     )
-    print(
-        f"    RMSE vs empirical inside shares: baseline-only={rmse_share_inside_base:.6f} | posterior-mean={rmse_share_inside_post:.6f}"
-    )
-
-    print("============================================================")
-
-    # -----------------------------
-    # Phase 3: smoke test DGP wiring
-    # -----------------------------
-
-    # Choose which Phase-2 product becomes the single Phase-3 product.
-    product_index = 0
-
-    # Phase-3 panel size (keep small for a quick sanity check).
-    N3 = 500
-    T3 = 50
-
-    # Phase-3 model truth (common across consumers).
-    theta3_true = {
-        "beta": 0.95,
-        "alpha": 1.0,
-        "v": 2.0,
-        "fc": 0.2,
-        "lambda_c": 0.3,
-    }
-
-    # Phase-3 state space / price process (passed explicitly; no defaults in DGP).
-    I_max3 = 10
-    P_price3 = np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float64)  # (S,S)
-    price_vals3 = np.array([1.0, 0.8], dtype=np.float64)  # (S,)
-    waste_cost3 = 1.0
-
-    # DP controls
-    dp_tol3 = 1e-10
-    dp_max_iter3 = 50_000
-
-    a_imt_3, p_state_mt_3, u_m_true_3, theta_true_3 = generate_dgp(
-        seed=seed + 999,
-        delta_true=delta_true,
-        E_bar_true=E_bar_true,
-        njt_true=njt_true,
-        product_index=product_index,
-        N=N3,
-        T=T3,
-        theta_true=theta3_true,
-        I_max=I_max3,
-        P_price=P_price3,
-        price_vals=price_vals3,
-        waste_cost=waste_cost3,
-        tol=dp_tol3,
-        max_iter=dp_max_iter3,
-    )
-
-    # Basic sanity prints
-    print("============================================================")
-    print("PHASE 3 DGP SMOKE TEST")
-    print("============================================================")
-    print(f"product_index: {product_index}")
-    print(
-        f"a_imt shape: {a_imt_3.shape} | p_state_mt shape: {p_state_mt_3.shape} | u_m_true shape: {u_m_true_3.shape}"
-    )
-    print(f"theta_true: {theta_true_3}")
-    print(
-        f"u_m_true: mean={float(np.mean(u_m_true_3)):.4f} | min={float(np.min(u_m_true_3)):.4f} | max={float(np.max(u_m_true_3)):.4f}"
-    )
-
-    # Purchase rate overall
-    buy_rate = float(np.mean(a_imt_3))
     print(f"overall buy rate: {buy_rate:.4f}")
 
-    S3 = int(P_price3.shape[0])
-    total = float(np.prod(a_imt_3.shape))  # M*N*T
+    # -------------------------------------------------------------------------
+    # Stockpiling estimation
+    # -------------------------------------------------------------------------
+    print("=== Stockpiling estimation ===")
+    res3 = run_stockpiling_estimation(
+        a_imt=a_imt,
+        p_state_mt=p_state_mt,
+        u_m=u_m_true,
+        theta_init_from_dgp=theta_true,
+    )
 
-    for s in range(S3):
-        mask = p_state_mt_3[:, None, :] == s  # (M,1,T)
-        mask_f = mask.astype(np.float64)
+    n_saved = int(res3["n_saved"])
+    rates = res3["accept"]["rates"]
+    print(
+        "=== Stockpiling estimation complete ===\n"
+        f"saved draws: {n_saved} | accept rates: "
+        f"beta={rates['beta']:.3f}, alpha={rates['alpha']:.3f}, v={rates['v']:.3f}, "
+        f"fc={rates['fc']:.3f}, lambda={rates['lambda_c']:.3f}, u_scale={rates['u_scale']:.3f}"
+    )
 
-        # Expand mask to (M,N,T) implicitly by multiplying with ones_like(a_imt_3)
-        denom = float((mask_f * np.ones_like(a_imt_3)).sum())
-        state_mass = denom / total
-
-        if denom > 0.0:
-            num = float((a_imt_3 * mask_f).sum())  # broadcasts mask_f over N
-            buy_rate_s = num / denom
-        else:
-            buy_rate_s = float("nan")
-
-        print(
-            f"state {s}: price={float(price_vals3[s]):.3f} | mass={state_mass:.3f} | buy_rate={buy_rate_s:.4f}"
-        )
-
-    print("============================================================")
+    return {
+        "phase12": {"dgp": dgp, "delta_hat": delta_hat, "res2": res2},
+        "stockpiling": {
+            "data": {"a_imt": a_imt, "p_state_mt": p_state_mt, "u_m": u_m_true},
+            "theta_true": theta_true,
+            "res": res3,
+        },
+    }
 
 
 if __name__ == "__main__":

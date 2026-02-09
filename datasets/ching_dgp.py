@@ -16,10 +16,14 @@ Seller-observed outputs:
   - u_m_true   (M,)       fixed market intercepts for the chosen product
 
 Model conventions:
-  - latent inventory carried across markets (same consumers across market blocks)
-  - price chain starts from a random initial state, then continues across markets
+  - markets are independent
+    - consumers (latent inventories) are generated independently per market (inventory resets per market)
+    - price chain is simulated independently per market (fresh random start state per market)
+  - Ching parameters are consumer-specific within market:
+    - theta_true is a dict of arrays, each shape (M, N): beta, alpha, v, fc, lambda_c
   - waste-at-cap penalty in the DP: waste_cost * (1 - lambda_c) * 1{I == I_max}
   - EV1 shocks scale normalized to 1 -> log-sum-exp value and softmax CCPs
+  - u_scale is estimator-only (utility rescaling during estimation) and is not used in the DGP
 
 Validation is assumed to happen elsewhere.
 """
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ching.stockpiling_input_validation import validate_stockpiling_dgp_inputs
 
 # =============================================================================
 # Helpers
@@ -78,12 +83,19 @@ def simulate_consumption(
     rng: np.random.Generator,
     N: int,
     T: int,
-    lambda_c: float,
+    lambda_c_n: np.ndarray,
 ) -> np.ndarray:
     """
-    c_it ~ Bernoulli(lambda_c), shape (N,T), boolean array.
+    c_int ~ Bernoulli(lambda_c_n[i]) independently over i,t.
+
+    Inputs:
+      lambda_c_n: (N,) per-consumer consumption probability in (0,1)
+
+    Returns:
+      c_block: (N,T) boolean array
     """
-    return rng.random((N, T)) < lambda_c
+    u = rng.random((N, T))
+    return u < lambda_c_n[:, None]
 
 
 def next_inventory(
@@ -98,7 +110,7 @@ def next_inventory(
 
 
 # =============================================================================
-# DP solver (single market): returns CCP table
+# DP solver (single consumer in a single market): returns CCP table
 # =============================================================================
 
 
@@ -117,7 +129,7 @@ def solve_ccp_buy(
     max_iter: int,
 ) -> np.ndarray:
     """
-    Solve the DP for one market and return buy CCPs:
+    Solve the DP for one consumer in one market and return buy CCPs:
 
       ccp_buy[s, I] = P(a=1 | s, I)
 
@@ -187,23 +199,43 @@ def generate_dgp(
     product_index: int,
     N: int,
     T: int,
-    theta_true: dict[str, float],
+    theta_true: dict[str, np.ndarray],
     I_max: int,
     P_price: np.ndarray,
     price_vals: np.ndarray,
     waste_cost: float,
     tol: float,
     max_iter: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """
     Generate seller-observed data for the stockpiling model.
+
+    theta_true must contain consumer-specific arrays of shape (M,N) for:
+      - "beta", "alpha", "v", "fc", "lambda_c"
 
     Returns:
       a_imt      (M, N, T)
       p_state_mt (M, T)
       u_m_true   (M,)
-      theta_true (dict)
+      theta_true (dict of (M,N) arrays)
     """
+
+    validate_stockpiling_dgp_inputs(
+        delta_true=delta_true,
+        E_bar_true=E_bar_true,
+        njt_true=njt_true,
+        product_index=product_index,
+        N=N,
+        T=T,
+        theta_true=theta_true,
+        I_max=I_max,
+        P_price=P_price,
+        price_vals=price_vals,
+        waste_cost=waste_cost,
+        tol=tol,
+        max_iter=max_iter,
+    )
+
     rng = np.random.default_rng(seed)
 
     M = E_bar_true.shape[0]
@@ -211,49 +243,62 @@ def generate_dgp(
 
     u_m_true = compute_u_m(delta_true, E_bar_true, njt_true, product_index)
 
-    beta = theta_true["beta"]
-    alpha = theta_true["alpha"]
-    v = theta_true["v"]
-    fc = theta_true["fc"]
-    lambda_c = theta_true["lambda_c"]
+    beta_all = theta_true["beta"]  # (M,N)
+    alpha_all = theta_true["alpha"]  # (M,N)
+    v_all = theta_true["v"]  # (M,N)
+    fc_all = theta_true["fc"]  # (M,N)
+    lambda_all = theta_true["lambda_c"]  # (M,N)
 
     p_state_mt = np.zeros((M, T), dtype=np.int64)
     a_imt = np.zeros((M, N, T), dtype=np.int64)
 
-    # Consumers persist across markets: initialize once, carry inventory through all markets.
-    I_curr = rng.integers(0, I_max + 1, size=N, dtype=np.int64)
-
-    # Price chain starts random, then continues across markets.
-    s0 = rng.integers(0, S)
-
     for m in range(M):
-        s_t = simulate_price_states(rng, P_price, T, s0)
+        # Market-specific price chain (independent across markets).
+        start_state = int(rng.integers(0, S))
+        s_t = simulate_price_states(rng, P_price, T, start_state)
         p_state_mt[m] = s_t
-        s0 = s_t[-1]
 
-        ccp_buy = solve_ccp_buy(
-            u_m=u_m_true[m],
-            beta=beta,
-            alpha=alpha,
-            v=v,
-            fc=fc,
-            lambda_c=lambda_c,
-            I_max=I_max,
-            P_price=P_price,
-            price_vals=price_vals,
-            waste_cost=waste_cost,
-            tol=tol,
-            max_iter=max_iter,
-        )
+        # Independent consumers per market: initialize inventory fresh per market.
+        I_curr = rng.integers(0, I_max + 1, size=N, dtype=np.int64)
 
-        c_block = simulate_consumption(rng, N, T, lambda_c)
+        # Consumer-specific parameters for this market (shape (N,)).
+        beta_mn = beta_all[m]
+        alpha_mn = alpha_all[m]
+        v_mn = v_all[m]
+        fc_mn = fc_all[m]
+        lambda_c_mn = lambda_all[m]
+
+        # Solve DP/CCPs per consumer (simple and legible; not optimized).
+        ccp_buy_nsi = np.zeros((N, S, I_max + 1), dtype=np.float64)
+        for n in range(N):
+            ccp_buy_nsi[n] = solve_ccp_buy(
+                u_m=float(u_m_true[m]),
+                beta=float(beta_mn[n]),
+                alpha=float(alpha_mn[n]),
+                v=float(v_mn[n]),
+                fc=float(fc_mn[n]),
+                lambda_c=float(lambda_c_mn[n]),
+                I_max=I_max,
+                P_price=P_price,
+                price_vals=price_vals,
+                waste_cost=waste_cost,
+                tol=tol,
+                max_iter=max_iter,
+            )
+
+        # Consumer-specific consumption shocks (independent across i,t).
+        c_block = simulate_consumption(rng, N, T, lambda_c_mn.astype(np.float64))
 
         for t in range(T):
             s = s_t[t]
-            prob_buy = ccp_buy[s, I_curr]
-            a_t = rng.random(N) < prob_buy  # boolean
 
+            # prob_buy[n] = ccp_buy_nsi[n, s, I_curr[n]]
+            pi_nI = ccp_buy_nsi[:, s, :]  # (N, I)
+            prob_buy = pi_nI[np.arange(N), I_curr]  # (N,)
+
+            a_t = rng.random(N) < prob_buy  # boolean
             a_imt[m, :, t] = a_t
+
             I_curr = next_inventory(I_curr, a_t, c_block[:, t], I_max)
 
     return a_imt, p_state_mt, u_m_true, theta_true
