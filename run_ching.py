@@ -24,14 +24,14 @@ import numpy as np
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 from datasets.ching_dgp import generate_dgp
-from run_cl_with_shocks import (
+from run_zhang_with_lu import (
     print_choice_model_diagnostics,
     print_market_shock_diagnostics,
     run_choice_model,
     run_market_shock_estimator,
 )
 from ching.stockpiling_estimator import StockpilingEstimator
-
+from ching.stockpiling_evaluate import evaluate_stockpiling, format_evaluation_summary
 
 # =============================================================================
 # Phase 1: baseline choice model hyperparameters
@@ -197,17 +197,8 @@ def run_stockpiling_estimation(
     a_imt: np.ndarray,
     p_state_mt: np.ndarray,
     u_m: np.ndarray,
-    theta_init_from_dgp: dict[str, np.ndarray],
 ) -> dict[str, object]:
     """Estimate stockpiling parameters from seller-observed data."""
-    theta_init = {
-        "beta": theta_init_from_dgp["beta"],
-        "alpha": theta_init_from_dgp["alpha"],
-        "v": theta_init_from_dgp["v"],
-        "fc": theta_init_from_dgp["fc"],
-        "lambda_c": theta_init_from_dgp["lambda_c"],
-        "u_scale": np.ones_like(np.asarray(u_m, dtype=np.float64)),
-    }
 
     est = StockpilingEstimator(
         a_imt=a_imt,
@@ -222,7 +213,6 @@ def run_stockpiling_estimation(
         tol=stock["dp"]["tol"],
         max_iter=stock["dp"]["max_iter"],
         sigmas=mcmc["sigmas"],
-        theta_init=theta_init,
         seed=mcmc["seed"],
     )
     print("=== Stockpiling Estimator built ===")
@@ -354,26 +344,28 @@ def main() -> dict[str, Any]:
         a_imt=a_imt,
         p_state_mt=p_state_mt,
         u_m=u_m_true,
-        theta_init_from_dgp=theta_true,
     )
 
-    n_saved = int(res3["n_saved"])
-    rates = res3["accept"]["rates"]
-    print(
-        "=== Stockpiling estimation complete ===\n"
-        f"saved draws: {n_saved} | accept rates: "
-        f"beta={rates['beta']:.3f}, alpha={rates['alpha']:.3f}, v={rates['v']:.3f}, "
-        f"fc={rates['fc']:.3f}, lambda={rates['lambda_c']:.3f}, u_scale={rates['u_scale']:.3f}"
+    pi_I0 = np.full(stock["I_max"] + 1, 1.0 / (stock["I_max"] + 1), dtype=np.float64)
+
+    eval_out = evaluate_stockpiling(
+        a_imt=a_imt,
+        p_state_mt=p_state_mt,
+        u_m=u_m_true,
+        price_vals=stock["price_vals"],
+        P_price=stock["P_price"],
+        I_max=stock["I_max"],
+        pi_I0=pi_I0,
+        waste_cost=stock["waste_cost"],
+        eps=stock["eps"],
+        tol=stock["dp"]["tol"],
+        max_iter=stock["dp"]["max_iter"],
+        theta_hat=res3["theta_hat"],
+        theta_true=theta_true,
     )
 
-    return {
-        "phase12": {"dgp": dgp, "delta_hat": delta_hat, "res2": res2},
-        "stockpiling": {
-            "data": {"a_imt": a_imt, "p_state_mt": p_state_mt, "u_m": u_m_true},
-            "theta_true": theta_true,
-            "res": res3,
-        },
-    }
+    print("=== Stockpiling evaluation ===")
+    print(format_evaluation_summary(eval_out))
 
 
 if __name__ == "__main__":

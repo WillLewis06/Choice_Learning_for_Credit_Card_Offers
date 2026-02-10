@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from conftest import assert_finite_np
-from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
+from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
 
 
 # -----------------------------------------------------------------------------

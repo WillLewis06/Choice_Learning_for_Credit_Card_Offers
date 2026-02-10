@@ -4,8 +4,8 @@ import pytest
 import tensorflow as tf
 
 from conftest import assert_all_finite_tf
-import market_shock_estimators.lu_tuning as lu_tuning
-from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
+import lu.shrinkage.lu_tuning as lu_tuning
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
 
 
 # -----------------------------------------------------------------------------

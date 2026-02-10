@@ -21,10 +21,10 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
-from market_shock_estimators.lu_diagnostics import LuShrinkageDiagnostics
-from market_shock_estimators.lu_posterior import LuPosteriorTF
-from market_shock_estimators.lu_tuning import tune_shrinkage
-from market_shock_estimators.lu_updates import (
+from lu.shrinkage.lu_diagnostics import LuShrinkageDiagnostics
+from lu.shrinkage.lu_posterior import LuPosteriorTF
+from lu.shrinkage.lu_tuning import tune_shrinkage
+from lu.shrinkage.lu_updates import (
     update_E_bar,
     update_beta,
     update_gamma,
@@ -32,7 +32,7 @@ from market_shock_estimators.lu_updates import (
     update_phi,
     update_r,
 )
-from market_shock_estimators.lu_validate_input import (
+from lu.shrinkage.lu_validate_input import (
     fit_validate_input,
     init_validate_input,
 )

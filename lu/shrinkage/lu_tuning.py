@@ -28,13 +28,13 @@ from typing import Callable, Tuple
 
 import tensorflow as tf
 
-from market_shock_estimators.lu_updates import (
+from lu.shrinkage.lu_updates import (
     update_E_bar,
     update_beta,
     update_njt,
     update_r,
 )
-from market_shock_estimators.lu_validate_input import (
+from lu.shrinkage.lu_validate_input import (
     tune_k_validate_input,
     tune_shrinkage_validate_input,
 )

@@ -3,7 +3,7 @@ import pytest
 
 from conftest import assert_finite_np
 
-from datasets.dgp import (
+from datasets.lu_dgp import (
     generate_market_conditions,
     BasicLuChoiceModel,
     _generate_market_shares,

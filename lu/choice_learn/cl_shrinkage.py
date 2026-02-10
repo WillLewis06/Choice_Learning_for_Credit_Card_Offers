@@ -23,19 +23,19 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 
-from market_shock_estimators.choice_learn.choice_learn_diagnostics import (
+from lu.choice_learn.cl_diagnostics import (
     ChoiceLearnShrinkageDiagnostics,
 )
-from market_shock_estimators.choice_learn.choice_learn_posterior import LuPosteriorTF
-from market_shock_estimators.choice_learn.choice_learn_tuning import tune_shrinkage
-from market_shock_estimators.choice_learn.choice_learn_updates import (
+from lu.choice_learn.cl_posterior import LuPosteriorTF
+from lu.choice_learn.cl_tuning import tune_shrinkage
+from lu.choice_learn.cl_updates import (
     update_E_bar,
     update_alpha,
     update_gamma,
     update_njt,
     update_phi,
 )
-from market_shock_estimators.choice_learn.choice_learn_validate_input import (
+from lu.choice_learn.cl_validate_input import (
     fit_validate_input,
     init_validate_input,
 )

@@ -17,13 +17,13 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import numpy as np
 
-from datasets.market_shocks_dgp import (
+from datasets.lu_dgp import (
     BasicLuChoiceModel,
     generate_market,
     generate_market_conditions,
 )
-from market_shock_estimators.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
-from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
+from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
 from toolbox.assess_estimator import print_assessment
 
 

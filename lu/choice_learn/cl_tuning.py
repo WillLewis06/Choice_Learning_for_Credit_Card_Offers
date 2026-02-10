@@ -28,12 +28,12 @@ from typing import Callable, Tuple
 
 import tensorflow as tf
 
-from market_shock_estimators.choice_learn.choice_learn_updates import (
+from lu.choice_learn.cl_updates import (
     update_alpha,
     update_E_bar,
     update_njt,
 )
-from market_shock_estimators.choice_learn.choice_learn_validate_input import (
+from lu.choice_learn.cl_validate_input import (
     tune_k_validate_input,
     tune_shrinkage_validate_input,
 )

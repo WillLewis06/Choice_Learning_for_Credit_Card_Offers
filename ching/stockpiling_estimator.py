@@ -45,11 +45,6 @@ from ching.stockpiling_input_validation import (
 )
 
 
-def _logit(x: tf.Tensor) -> tf.Tensor:
-    """log(x) - log(1-x) for x in (0,1)."""
-    return tf.math.log(x) - tf.math.log1p(-x)
-
-
 class StockpilingEstimator:
     """
     Estimate Phase-3 stockpiling parameters with elementwise RW-MH on z-parameters.
@@ -79,12 +74,26 @@ class StockpilingEstimator:
         tol: float,
         max_iter: int,
         sigmas: dict[str, float],
-        theta_init: dict[str, Any],
         seed: int,
     ) -> None:
+        # Derive (M, N) from inputs to build a prior-mode initializer for validation.
+        a_np = np.asarray(a_imt)
+        self.M = int(a_np.shape[0])
+        self.N = int(a_np.shape[1])
+
+        # Prior-mode initializer in constrained space (not taken from any truth source):
+        #   z_* = 0  =>  beta=lambda_c=0.5; alpha=v=fc=u_scale=1.0
+        theta_init_prior = {
+            "beta": 0.5 * np.ones((self.M, self.N), dtype=np.float64),
+            "alpha": 1.0 * np.ones((self.M, self.N), dtype=np.float64),
+            "v": 1.0 * np.ones((self.M, self.N), dtype=np.float64),
+            "fc": 1.0 * np.ones((self.M, self.N), dtype=np.float64),
+            "lambda_c": 0.5 * np.ones((self.M, self.N), dtype=np.float64),
+            "u_scale": 1.0 * np.ones((self.M,), dtype=np.float64),
+        }
 
         validate_stockpiling_estimator_init_inputs(
-            a_imt=a_imt,
+            a_imt=a_np,
             p_state_mt=p_state_mt,
             u_m=u_m,
             price_vals=price_vals,
@@ -96,17 +105,13 @@ class StockpilingEstimator:
             tol=tol,
             max_iter=max_iter,
             sigmas=sigmas,
-            theta_init=theta_init,
+            theta_init=theta_init_prior,
         )
 
         # -------------------------
         # Convert inputs to TF
         # -------------------------
-        a_np = np.asarray(a_imt)
         p_np = np.asarray(p_state_mt)
-
-        self.M = int(a_np.shape[0])
-        self.N = int(a_np.shape[1])
 
         self.a_imt = tf.convert_to_tensor(a_np, dtype=tf.int32)  # (M,N,T)
         self.p_state_mt = tf.convert_to_tensor(p_np, dtype=tf.int32)  # (M,T)
@@ -139,41 +144,18 @@ class StockpilingEstimator:
         self.rng = tf.random.Generator.from_seed(int(seed))
 
         # -------------------------
-        # Initialize z from theta_init
+        # Initialize z at prior mode: all zeros.
         # -------------------------
-        beta0 = tf.convert_to_tensor(
-            np.asarray(theta_init["beta"]), dtype=tf.float64
-        )  # (M,N)
-        alpha0 = tf.convert_to_tensor(
-            np.asarray(theta_init["alpha"]), dtype=tf.float64
-        )  # (M,N)
-        v0 = tf.convert_to_tensor(
-            np.asarray(theta_init["v"]), dtype=tf.float64
-        )  # (M,N)
-        fc0 = tf.convert_to_tensor(
-            np.asarray(theta_init["fc"]), dtype=tf.float64
-        )  # (M,N)
-        lambda0 = tf.convert_to_tensor(
-            np.asarray(theta_init["lambda_c"]), dtype=tf.float64
-        )  # (M,N)
-        u_scale0 = tf.convert_to_tensor(
-            np.asarray(theta_init["u_scale"]), dtype=tf.float64
-        )  # (M,)
-
-        z_beta0 = _logit(beta0)
-        z_alpha0 = tf.math.log(alpha0)
-        z_v0 = tf.math.log(v0)
-        z_fc0 = tf.math.log(fc0)
-        z_lambda0 = _logit(lambda0)
-        z_u_scale0 = tf.math.log(u_scale0)
+        z_mn = tf.zeros((self.M, self.N), dtype=tf.float64)
+        z_m = tf.zeros((self.M,), dtype=tf.float64)
 
         self.z: dict[str, tf.Variable] = {
-            "z_beta": tf.Variable(z_beta0, trainable=False, dtype=tf.float64),
-            "z_alpha": tf.Variable(z_alpha0, trainable=False, dtype=tf.float64),
-            "z_v": tf.Variable(z_v0, trainable=False, dtype=tf.float64),
-            "z_fc": tf.Variable(z_fc0, trainable=False, dtype=tf.float64),
-            "z_lambda": tf.Variable(z_lambda0, trainable=False, dtype=tf.float64),
-            "z_u_scale": tf.Variable(z_u_scale0, trainable=False, dtype=tf.float64),
+            "z_beta": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
+            "z_alpha": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
+            "z_v": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
+            "z_fc": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
+            "z_lambda": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
+            "z_u_scale": tf.Variable(z_m, trainable=False, dtype=tf.float64),
         }
 
         # Elementwise acceptance counters (counts accepted entries per block).

@@ -1,15 +1,12 @@
-# tests/conftest.py
 """
-Shared pytest fixtures and helper functions for the Lu (Section 4) test suite.
+Shared pytest fixtures and helper functions for the choice-learn + Lu sparse-shock
+test suite.
 
 Design goals:
 - Centralize repeated tiny (T=2, J=3) problem construction used across:
-  - test_lu_shrinkage.py
-  - test_lu_tuning.py
-  - test_lu_posterior.py
-  - test_lu_updates.py
+  - cl_shrinkage / cl_tuning / cl_posterior / cl_updates tests
 - Centralize common test-only helpers (finite checks, simplex checks, bool-like checks).
-- Centralize generic inversion-data generators used in test_inversion.py.
+- Centralize generic inversion-data generators used in any inversion-style tests.
 
 Non-goals:
 - No pytest markers / skipping logic.
@@ -25,7 +22,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from market_shock_estimators.lu_posterior import LuPosteriorTF
+from lu.choice_learn.cl_posterior import LuPosteriorTF
 
 
 # -----------------------------------------------------------------------------
@@ -160,27 +157,30 @@ def assert_prob_simplex_tf(sjt_t: Any, s0t: Any, *, atol: float = 1e-12) -> None
 
 
 # -----------------------------------------------------------------------------
-# Canonical tiny Lu market (NumPy)
+# Canonical tiny choice-learn + Lu market (NumPy)
 # -----------------------------------------------------------------------------
 @pytest.fixture
 def tiny_market_np() -> Dict[str, Any]:
     """
-    Canonical tiny market used across Lu tests.
+    Canonical tiny market used across choice-learn + Lu tests.
 
     Shapes:
-    - pjt, wjt, qjt: (T, J) with T=2, J=3
+    - delta_cl, qjt: (T, J) with T=2, J=3
     - q0t: (T,)
     """
     T, J = 2, 3
 
-    # Use the most common variant across posterior/updates/tuning.
-    pjt = np.array([[1.0, 1.2, 0.8], [0.9, 1.1, 1.3]], dtype=np.float64)
-    wjt = np.array([[0.5, 0.7, 0.6], [0.4, 0.9, 0.3]], dtype=np.float64)
+    # Fixed baseline logits (e.g., from the trained choice-learn model).
+    delta_cl = np.array(
+        [[0.20, -0.10, 0.00], [0.05, 0.15, -0.20]],
+        dtype=np.float64,
+    )
 
+    # Observed counts (inside + outside).
     qjt = np.array([[10.0, 5.0, 2.0], [3.0, 7.0, 1.0]], dtype=np.float64)
     q0t = np.array([20.0, 15.0], dtype=np.float64)
 
-    return {"T": T, "J": J, "pjt": pjt, "wjt": wjt, "qjt": qjt, "q0t": q0t}
+    return {"T": T, "J": J, "delta_cl": delta_cl, "qjt": qjt, "q0t": q0t}
 
 
 # Backwards-compatible alias for tests that currently use this name.
@@ -190,7 +190,7 @@ def tiny_market_data(tiny_market_np: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Canonical tiny Lu market + latent state bundle (TensorFlow)
+# Canonical tiny market + latent state bundle (TensorFlow)
 # -----------------------------------------------------------------------------
 @pytest.fixture
 def tiny_problem_tf(tiny_market_np: Dict[str, Any]) -> Dict[str, Any]:
@@ -198,20 +198,16 @@ def tiny_problem_tf(tiny_market_np: Dict[str, Any]) -> Dict[str, Any]:
     Canonical tiny tensors for posterior/update tests.
 
     Includes:
-    - observed data tensors: pjt, wjt, qjt, q0t
-    - latent state tensors: E_bar, njt, gamma, phi
-    - parameter tensors: beta_p, beta_w, r
+    - observed data tensors: delta_cl, qjt, q0t
+    - latent state tensors: alpha, E_bar, njt, gamma, phi
     """
     T, J = int(tiny_market_np["T"]), int(tiny_market_np["J"])
 
-    pjt = tf.constant(tiny_market_np["pjt"], dtype=tf.float64)
-    wjt = tf.constant(tiny_market_np["wjt"], dtype=tf.float64)
+    delta_cl = tf.constant(tiny_market_np["delta_cl"], dtype=tf.float64)
     qjt = tf.constant(tiny_market_np["qjt"], dtype=tf.float64)
     q0t = tf.constant(tiny_market_np["q0t"], dtype=tf.float64)
 
-    beta_p = tf.constant(-1.0, dtype=tf.float64)
-    beta_w = tf.constant(0.3, dtype=tf.float64)
-    r = tf.constant(0.0, dtype=tf.float64)
+    alpha = tf.constant(1.0, dtype=tf.float64)
 
     E_bar = tf.constant([0.1, -0.2], dtype=tf.float64)
     njt = tf.constant([[0.0, 0.2, -0.1], [0.05, -0.02, 0.0]], dtype=tf.float64)
@@ -222,13 +218,10 @@ def tiny_problem_tf(tiny_market_np: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "T": T,
         "J": J,
-        "pjt": pjt,
-        "wjt": wjt,
+        "delta_cl": delta_cl,
         "qjt": qjt,
         "q0t": q0t,
-        "beta_p": beta_p,
-        "beta_w": beta_w,
-        "r": r,
+        "alpha": alpha,
         "E_bar": E_bar,
         "njt": njt,
         "gamma": gamma,
@@ -244,8 +237,8 @@ def tiny_problem(tiny_problem_tf: Dict[str, Any]) -> Dict[str, Any]:
 
 @pytest.fixture
 def tiny_inputs(tiny_problem_tf: Dict[str, Any]) -> Dict[str, Any]:
-    # posterior tests typically don't need beta_p/beta_w/r
-    keys = ["T", "J", "pjt", "wjt", "qjt", "q0t", "E_bar", "njt", "gamma", "phi"]
+    # Posterior tests often want only observed data + latent state.
+    keys = ["T", "J", "delta_cl", "qjt", "q0t", "alpha", "E_bar", "njt", "gamma", "phi"]
     return {k: tiny_problem_tf[k] for k in keys}
 
 
@@ -254,8 +247,7 @@ def tiny_inputs(tiny_problem_tf: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 @pytest.fixture
 def posterior_small() -> LuPosteriorTF:
-    # Small n_draws keeps tests fast; seed keeps stochastic tests stable.
-    return LuPosteriorTF(n_draws=25, seed=123, dtype=tf.float64)
+    return LuPosteriorTF(dtype=tf.float64)
 
 
 # Backwards-compatible alias used by existing tests.

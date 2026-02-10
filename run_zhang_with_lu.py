@@ -16,9 +16,9 @@ import tensorflow as tf
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-from datasets.cl_with_shocks_dgp import generate_choice_learn_market_shocks_dgp
+from datasets.zhang_with_lu_dgp import generate_choice_learn_market_shocks_dgp
 from models.featurebased import BaseFeatureBasedDeepHalo
-from market_shock_estimators.choice_learn.choice_learn_shrinkage import (
+from lu.choice_learn.cl_shrinkage import (
     ChoiceLearnShrinkageEstimator,
 )
 

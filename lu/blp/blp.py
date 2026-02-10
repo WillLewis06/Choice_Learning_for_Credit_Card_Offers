@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.optimize import minimize
 
-from market_shock_estimators.inversion import invert_all_markets
+from lu.blp.inversion import invert_all_markets
 
 
 def build_strong_IVs(wjt, ujt):

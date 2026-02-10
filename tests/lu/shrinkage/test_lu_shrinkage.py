@@ -3,10 +3,10 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-import market_shock_estimators.lu_shrinkage as lu_shrinkage_mod
-from market_shock_estimators.lu_diagnostics import LuShrinkageDiagnostics
-from market_shock_estimators.lu_posterior import LuPosteriorTF
-from market_shock_estimators.lu_shrinkage import LuShrinkageEstimator
+import lu.shrinkage.lu_shrinkage as lu_shrinkage_mod
+from lu.shrinkage.lu_diagnostics import LuShrinkageDiagnostics
+from lu.shrinkage.lu_posterior import LuPosteriorTF
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
 
 # Import shared test helpers from tests/conftest.py (as requested).
 from conftest import (

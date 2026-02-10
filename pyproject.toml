@@ -26,4 +26,4 @@ addopts = "-q"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["datasets*", "market_shock_estimators*", "models*", "toolbox*"]
+include = ["datasets*", "lu*", "ching*", "models*", "toolbox*"]

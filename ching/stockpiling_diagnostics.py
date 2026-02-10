@@ -47,7 +47,6 @@ def report_iteration_progress(shrink: "StockpilingEstimator", it) -> None:
     lambda_c_mean = tf.reduce_mean(lambda_c)
 
     u_scale_mean = tf.reduce_mean(u_scale)
-    u_scale_norm = tf.norm(u_scale)
 
     tf.print(
         "[Stockpiling] it=",
@@ -64,8 +63,6 @@ def report_iteration_progress(shrink: "StockpilingEstimator", it) -> None:
         round4(lambda_c_mean),
         " | u_scale_mean=",
         round4(u_scale_mean),
-        ", u_scale_norm=",
-        round4(u_scale_norm),
     )
 
 

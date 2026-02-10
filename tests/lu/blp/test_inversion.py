@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from conftest import assert_finite_np, fixed_draws, make_feasible_shares
-from market_shock_estimators.inversion import (
+from lu.blp.inversion import (
     check_market_inputs,
     simulate_shares,
     invert_market,

@@ -7,7 +7,7 @@ from conftest import (
     assert_bool_like_tf,
     assert_in_open_unit_interval_tf,
 )
-from market_shock_estimators.lu_updates import (
+from lu.shrinkage.lu_updates import (
     update_E_bar,
     update_beta,
     update_gamma,
