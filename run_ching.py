@@ -1,4 +1,3 @@
-# run_ching.py
 """End-to-end orchestration for:
 
 - Phase 1: feature-based baseline choice model (delta_hat)
@@ -89,43 +88,37 @@ shrink_ridge = 1e-6
 
 product_index = 0  # chosen product j*
 
-stock = {
-    "N": 500,
-    "T": 50,
-    "I_max": 10,
-    "theta_scalar": {
-        "beta": 0.95,
-        "alpha": 1.0,
-        "v": 2.0,
-        "fc": 0.2,
-        "lambda_c": 0.3,
-    },
-    "P_price": np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float64),
-    "price_vals": np.array([1.0, 0.8], dtype=np.float64),
-    "waste_cost": 1.0,
-    "dp": {"tol": 1e-10, "max_iter": 50_000},
-    "eps": 1e-12,
+# Stockpiling DGP/likelihood config (formerly stock dict)
+stock_N = 500
+stock_T = 100
+stock_I_max = 10
+stock_P_price = np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float64)
+stock_price_vals = np.array([1.0, 0.8], dtype=np.float64)
+stock_waste_cost = 1.0
+stock_dp_tol = 1e-10
+stock_dp_max_iter = 50_000
+stock_eps = 1e-12
+
+# MCMC config (formerly mcmc dict); keep k and sigmas as dicts
+mcmc_seed = 0
+mcmc_n_iter = 15
+
+k = {
+    "beta": 1,
+    "alpha": 0.7,
+    "v": 1,
+    "fc": 0.7,
+    "lambda": 1,
+    "u_scale": 0.05,
 }
 
-mcmc = {
-    "seed": 0,
-    "n_iter": 15,
-    "k": {
-        "beta": 0.2,
-        "alpha": 0.2,
-        "v": 0.2,
-        "fc": 0.2,
-        "lambda": 0.2,
-        "u_scale": 0.05,
-    },
-    "sigmas": {
-        "z_beta": 2.0,
-        "z_alpha": 2.0,
-        "z_v": 2.0,
-        "z_fc": 2.0,
-        "z_lambda": 2.0,
-        "z_u_scale": 2.0,
-    },
+sigmas = {
+    "z_beta": 2.0,
+    "z_alpha": 2.0,
+    "z_v": 2.0,
+    "z_fc": 2.0,
+    "z_lambda": 2.0,
+    "z_u_scale": 2.0,
 }
 
 
@@ -134,20 +127,12 @@ mcmc = {
 # =============================================================================
 
 
-def _broadcast_theta_mn(
-    theta: dict[str, float], M: int, N: int
-) -> dict[str, np.ndarray]:
-    """Broadcast scalar parameters to arrays of shape (M,N)."""
-    return {k: np.full((M, N), float(v), dtype=np.float64) for k, v in theta.items()}
-
-
 def _uniform_pi_I0(I_max: int) -> np.ndarray:
     """Uniform initial inventory belief over {0,...,I_max}."""
     return np.full((I_max + 1,), 1.0 / (I_max + 1), dtype=np.float64)
 
 
 def run_stockpiling_dgp(
-    *,
     delta_used: np.ndarray,
     E_bar_used: np.ndarray,
     njt_used: np.ndarray,
@@ -170,30 +155,25 @@ def run_stockpiling_dgp(
     E_bar_used = np.asarray(E_bar_used, dtype=np.float64)
     njt_used = np.asarray(njt_used, dtype=np.float64)
 
-    M = int(E_bar_used.shape[0])
-    theta_true = _broadcast_theta_mn(stock["theta_scalar"], M, stock["N"])
-
-    a_imt, p_state_mt, u_m_true, _ = generate_dgp(
+    a_imt, p_state_mt, u_m_true, theta_true = generate_dgp(
         seed=seed_dgp,
         delta_true=delta_used,
         E_bar_true=E_bar_used,
         njt_true=njt_used,
         product_index=product_index,
-        N=stock["N"],
-        T=stock["T"],
-        theta_true=theta_true,
-        I_max=stock["I_max"],
-        P_price=stock["P_price"],
-        price_vals=stock["price_vals"],
-        waste_cost=stock["waste_cost"],
-        tol=stock["dp"]["tol"],
-        max_iter=stock["dp"]["max_iter"],
+        N=stock_N,
+        T=stock_T,
+        I_max=stock_I_max,
+        P_price=stock_P_price,
+        price_vals=stock_price_vals,
+        waste_cost=stock_waste_cost,
+        tol=stock_dp_tol,
+        max_iter=stock_dp_max_iter,
     )
     return a_imt, p_state_mt, u_m_true, theta_true
 
 
 def run_stockpiling_estimation(
-    *,
     a_imt: np.ndarray,
     p_state_mt: np.ndarray,
     u_m: np.ndarray,
@@ -204,22 +184,21 @@ def run_stockpiling_estimation(
         a_imt=a_imt,
         p_state_mt=p_state_mt,
         u_m=u_m,
-        price_vals=stock["price_vals"],
-        P_price=stock["P_price"],
-        I_max=stock["I_max"],
-        pi_I0=_uniform_pi_I0(stock["I_max"]),
-        waste_cost=stock["waste_cost"],
-        eps=stock["eps"],
-        tol=stock["dp"]["tol"],
-        max_iter=stock["dp"]["max_iter"],
-        sigmas=mcmc["sigmas"],
-        seed=mcmc["seed"],
+        price_vals=stock_price_vals,
+        P_price=stock_P_price,
+        I_max=stock_I_max,
+        pi_I0=_uniform_pi_I0(stock_I_max),
+        waste_cost=stock_waste_cost,
+        eps=stock_eps,
+        tol=stock_dp_tol,
+        max_iter=stock_dp_max_iter,
+        sigmas=sigmas,
+        seed=mcmc_seed,
     )
     print("=== Stockpiling Estimator built ===")
 
-    k = mcmc["k"]
     est.fit(
-        n_iter=mcmc["n_iter"],
+        n_iter=mcmc_n_iter,
         k_beta=k["beta"],
         k_alpha=k["alpha"],
         k_v=k["v"],
@@ -346,22 +325,23 @@ def main() -> dict[str, Any]:
         u_m=u_m_true,
     )
 
-    pi_I0 = np.full(stock["I_max"] + 1, 1.0 / (stock["I_max"] + 1), dtype=np.float64)
+    pi_I0 = _uniform_pi_I0(stock_I_max)
 
     eval_out = evaluate_stockpiling(
         a_imt=a_imt,
         p_state_mt=p_state_mt,
         u_m=u_m_true,
-        price_vals=stock["price_vals"],
-        P_price=stock["P_price"],
-        I_max=stock["I_max"],
+        price_vals=stock_price_vals,
+        P_price=stock_P_price,
+        I_max=stock_I_max,
         pi_I0=pi_I0,
-        waste_cost=stock["waste_cost"],
-        eps=stock["eps"],
-        tol=stock["dp"]["tol"],
-        max_iter=stock["dp"]["max_iter"],
+        waste_cost=stock_waste_cost,
+        eps=stock_eps,
+        tol=stock_dp_tol,
+        max_iter=stock_dp_max_iter,
         theta_hat=res3["theta_hat"],
         theta_true=theta_true,
+        mcmc={"n_saved": res3["n_saved"], "accept": res3["accept"]},
     )
 
     print("=== Stockpiling evaluation ===")

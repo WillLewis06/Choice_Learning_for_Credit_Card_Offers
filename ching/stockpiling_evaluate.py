@@ -344,7 +344,6 @@ def predictive_metrics(
 
 
 def evaluate_stockpiling(
-    *,
     a_imt: np.ndarray,
     p_state_mt: np.ndarray,
     u_m: np.ndarray,
@@ -358,6 +357,7 @@ def evaluate_stockpiling(
     max_iter: int,
     theta_hat: dict[str, np.ndarray],
     theta_true: Optional[dict[str, np.ndarray]] = None,
+    mcmc: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Simple evaluation wrapper.
@@ -367,6 +367,7 @@ def evaluate_stockpiling(
         "fit": {...},
         "oracle": {...},   # only if theta_true provided
         "param": {...},    # only if theta_true provided
+        "mcmc": {...},     # only if mcmc provided (e.g., {"n_saved": ..., "accept": {...}})
       }
     """
     out: dict[str, Any] = {}
@@ -410,6 +411,9 @@ def evaluate_stockpiling(
             theta=theta_oracle,
         )
 
+    if mcmc is not None:
+        out["mcmc"] = mcmc
+
     return out
 
 
@@ -426,6 +430,7 @@ def format_evaluation_summary(
     fit = eval_out["fit"]
     oracle = eval_out.get("oracle")
     params = eval_out.get("param")
+    mcmc = eval_out.get("mcmc")
 
     shp = fit.get("shape", {})
     M = shp.get("M")
@@ -440,6 +445,28 @@ def format_evaluation_summary(
 
     def f4(x: float) -> str:
         return f"{x:>8.4f}"
+
+    def _to_int(x: Any) -> Optional[int]:
+        if x is None:
+            return None
+        try:
+            return int(x)
+        except Exception:
+            try:
+                return int(np.asarray(x).item())
+            except Exception:
+                return None
+
+    def _to_float(x: Any) -> Optional[float]:
+        if x is None:
+            return None
+        try:
+            return float(x)
+        except Exception:
+            try:
+                return float(np.asarray(x).item())
+            except Exception:
+                return None
 
     lines: list[str] = []
 
@@ -546,5 +573,57 @@ def format_evaluation_summary(
                 f"{f6(pk['mean_hat'])} "
                 f"{f6(bias)}"
             )
+
+    # MCMC acceptance (elementwise)
+    if isinstance(mcmc, dict):
+        accept = mcmc.get("accept", {})
+        rates = accept.get("rates", {})
+        counts = accept.get("counts", {})
+        n_saved = _to_int(mcmc.get("n_saved", None))
+
+        if isinstance(rates, dict) and rates:
+            lines.append("")
+            lines.append("mcmc acceptance (elementwise)")
+            if n_saved is not None:
+                lines.append(f"n_saved: {n_saved}")
+
+            a_header = f"{'block':<10}{'rate':>10}{'accepted':>12}{'proposed':>12}"
+            lines.append(a_header)
+            lines.append("-" * len(a_header))
+
+            # Preferred display order.
+            order = ["beta", "alpha", "v", "fc", "lambda_c", "u_scale"]
+
+            total_acc = 0
+            total_prop = 0
+
+            for k in order:
+                if k not in rates:
+                    continue
+
+                r = _to_float(rates.get(k))
+                c = _to_int(counts.get(k))
+
+                proposed = None
+                if n_saved is not None and M is not None and N is not None:
+                    if k == "u_scale":
+                        proposed = n_saved * int(M)
+                    else:
+                        proposed = n_saved * int(M) * int(N)
+
+                # Update totals if we can.
+                if c is not None:
+                    total_acc += c
+                if proposed is not None:
+                    total_prop += proposed
+
+                r_str = f"{r:>10.4f}" if r is not None else f"{'':>10}"
+                c_str = f"{c:>12d}" if c is not None else f"{'':>12}"
+                p_str = f"{proposed:>12d}" if proposed is not None else f"{'':>12}"
+                lines.append(f"{k:<10}{r_str}{c_str}{p_str}")
+
+            if total_prop > 0:
+                overall = total_acc / max(1, total_prop)
+                lines.append(f"overall: {overall:.4f} ({total_acc}/{total_prop})")
 
     return "\n".join(lines)

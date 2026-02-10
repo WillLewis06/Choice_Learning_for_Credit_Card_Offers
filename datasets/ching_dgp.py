@@ -19,7 +19,8 @@ Model conventions:
   - markets are independent
     - consumers (latent inventories) are generated independently per market (inventory resets per market)
     - price chain is simulated independently per market (fresh random start state per market)
-  - Ching parameters are consumer-specific within market:
+  - Ching parameters are consumer-specific in this DGP:
+    - one draw per (market, consumer) for each parameter
     - theta_true is a dict of arrays, each shape (M, N): beta, alpha, v, fc, lambda_c
   - waste-at-cap penalty in the DP: waste_cost * (1 - lambda_c) * 1{I == I_max}
   - EV1 shocks scale normalized to 1 -> log-sum-exp value and softmax CCPs
@@ -33,6 +34,99 @@ from __future__ import annotations
 import numpy as np
 
 from ching.stockpiling_input_validation import validate_stockpiling_dgp_inputs
+
+# =============================================================================
+# DGP hyperparameters (z-scale Normal) for per-(market, consumer) theta sampling
+# =============================================================================
+
+
+def _logit(p: float) -> float:
+    """logit(p) = log(p / (1-p)) for scalar p in (0,1)."""
+    return float(np.log(p) - np.log1p(-p))
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid for numpy arrays."""
+    # Clip only to prevent overflow in exp for extreme inputs.
+    x = np.clip(x, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+# One draw per (market, consumer) on z-scale; then transform:
+#   beta, lambda_c: sigmoid(z)
+#   alpha, v, fc:   exp(z)
+#
+# Means are centered using Ching/Osborne empirical magnitudes where appropriate.
+# lambda_c is a design choice in this simplified Bernoulli-consumption DGP.
+THETA_Z_HYPERS: dict[str, dict[str, float]] = {
+    "beta": {"mu": _logit(0.71), "sd": 0.35},
+    "alpha": {"mu": float(np.log(0.27)), "sd": 0.50},
+    "v": {"mu": float(np.log(0.48)), "sd": 0.50},
+    "fc": {"mu": float(np.log(1.83)), "sd": 0.50},
+    "lambda_c": {"mu": _logit(0.30), "sd": 0.35},
+}
+
+
+def sample_theta_true_consumer_independent(
+    rng: np.random.Generator,
+    M: int,
+    N: int,
+) -> dict[str, np.ndarray]:
+    """
+    Sample one parameter draw per (market, consumer) on the unconstrained (z) scale,
+    then transform to constrained space.
+
+    Returns:
+      theta_true dict with keys: beta, alpha, v, fc, lambda_c
+      Each value is float64 array of shape (M, N).
+    """
+    # Sample z arrays (M, N)
+    z_beta = rng.normal(
+        THETA_Z_HYPERS["beta"]["mu"], THETA_Z_HYPERS["beta"]["sd"], size=(M, N)
+    )
+    z_alpha = rng.normal(
+        THETA_Z_HYPERS["alpha"]["mu"], THETA_Z_HYPERS["alpha"]["sd"], size=(M, N)
+    )
+    z_v = rng.normal(THETA_Z_HYPERS["v"]["mu"], THETA_Z_HYPERS["v"]["sd"], size=(M, N))
+    z_fc = rng.normal(
+        THETA_Z_HYPERS["fc"]["mu"], THETA_Z_HYPERS["fc"]["sd"], size=(M, N)
+    )
+    z_lambda = rng.normal(
+        THETA_Z_HYPERS["lambda_c"]["mu"],
+        THETA_Z_HYPERS["lambda_c"]["sd"],
+        size=(M, N),
+    )
+
+    # Transform to constrained space (M, N)
+    beta = _sigmoid(z_beta).astype(np.float64, copy=False)
+    lambda_c = _sigmoid(z_lambda).astype(np.float64, copy=False)
+
+    alpha = np.exp(z_alpha).astype(np.float64, copy=False)
+    v = np.exp(z_v).astype(np.float64, copy=False)
+    fc = np.exp(z_fc).astype(np.float64, copy=False)
+
+    return {
+        "beta": beta,
+        "alpha": alpha,
+        "v": v,
+        "fc": fc,
+        "lambda_c": lambda_c,
+    }
+
+
+def sample_theta_true_market_broadcast(
+    rng: np.random.Generator,
+    M: int,
+    N: int,
+) -> dict[str, np.ndarray]:
+    """
+    Backwards-compatible name.
+
+    Previously: sampled one draw per market and broadcast across N consumers.
+    Now: consumer-independent sampling (one draw per (m,n)).
+    """
+    return sample_theta_true_consumer_independent(rng=rng, M=M, N=N)
+
 
 # =============================================================================
 # Helpers
@@ -199,7 +293,6 @@ def generate_dgp(
     product_index: int,
     N: int,
     T: int,
-    theta_true: dict[str, np.ndarray],
     I_max: int,
     P_price: np.ndarray,
     price_vals: np.ndarray,
@@ -210,8 +303,8 @@ def generate_dgp(
     """
     Generate seller-observed data for the stockpiling model.
 
-    theta_true must contain consumer-specific arrays of shape (M,N) for:
-      - "beta", "alpha", "v", "fc", "lambda_c"
+    This DGP samples consumer-specific parameters internally:
+      - one draw per (market, consumer) for each parameter (beta, alpha, v, fc, lambda_c)
 
     Returns:
       a_imt      (M, N, T)
@@ -219,6 +312,13 @@ def generate_dgp(
       u_m_true   (M,)
       theta_true (dict of (M,N) arrays)
     """
+    rng = np.random.default_rng(seed)
+
+    M = int(E_bar_true.shape[0])
+    S = int(P_price.shape[0])
+
+    # Sample per-(market, consumer) theta (shape (M,N)).
+    theta_true = sample_theta_true_consumer_independent(rng=rng, M=M, N=N)
 
     validate_stockpiling_dgp_inputs(
         delta_true=delta_true,
@@ -235,11 +335,6 @@ def generate_dgp(
         tol=tol,
         max_iter=max_iter,
     )
-
-    rng = np.random.default_rng(seed)
-
-    M = E_bar_true.shape[0]
-    S = P_price.shape[0]
 
     u_m_true = compute_u_m(delta_true, E_bar_true, njt_true, product_index)
 
