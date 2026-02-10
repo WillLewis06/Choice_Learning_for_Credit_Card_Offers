@@ -10,7 +10,7 @@ from lu.choice_learn.cl_posterior import LuPosteriorTF
 from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageEstimator
 
 # Shared test helpers from tests/conftest.py
-from conftest import (
+from tests.lu.choice_learn.conftest import (
     assert_all_finite_tf,
     assert_binary_01_tf,
     assert_in_open_unit_interval_tf,

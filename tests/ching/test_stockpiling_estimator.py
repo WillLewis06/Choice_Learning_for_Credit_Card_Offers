@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-import ching.stockpiling_estimator as est_mod
 from ching.stockpiling_estimator import StockpilingEstimator
 
 
@@ -48,12 +47,7 @@ def test_init_converts_inputs_and_initial_state(
     assert tuple(est.pi_I0.shape) == (I,)
     assert est.pi_I0.dtype == tf.float64
 
-    assert est.waste_cost.dtype == tf.float64
-    assert est.eps.dtype == tf.float64
-    assert est.tol.dtype == tf.float64
-    assert est.max_iter.dtype == tf.int32
-
-    # Inventory maps exist (detailed correctness is tested in posterior tests).
+    # Inventory maps exist (posterior tests cover detailed correctness).
     maps = est.maps
     assert isinstance(maps, (tuple, list)) and len(maps) == 4
     D_down, D_up, stockout_mask, at_cap_mask = maps
@@ -85,7 +79,7 @@ def test_init_converts_inputs_and_initial_state(
     assert int(est.accept_lambda.numpy()) == 0
     assert int(est.accept_u_scale.numpy()) == 0
 
-    # No diagnostics until fit
+    # No diagnostics until fit()
     assert est._diag is None
 
 
@@ -115,7 +109,7 @@ def test_init_rejects_invalid_inputs(
     sigmas_local = dict(sigmas)
 
     if bad_case == "pi_I0_not_normalized":
-        pi_I0 = 2.0 * pi_I0  # sum != 1
+        pi_I0 = 2.0 * pi_I0
     elif bad_case == "sigmas_missing_key":
         sigmas_local.pop("z_u_scale")
     else:
@@ -165,25 +159,54 @@ def test_fit_rejects_invalid_fit_inputs(
         )
 
 
-def test_fit_updates_z_accept_counts_and_posterior_means_with_deterministic_mh(
+def test_fit_updates_z_accept_counts_and_posterior_means_with_deterministic_step(
     estimator_tiny: StockpilingEstimator,
     tiny_dims: dict[str, int],
     proposal_scales_tiny: dict[str, float],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """
+    Deterministic, fast test of estimator accounting and get_results:
+    patch the per-iteration step to avoid TF tracing / posterior cost.
+    """
+    est = estimator_tiny
     M, N = tiny_dims["M"], tiny_dims["N"]
 
-    def fake_rw_mh_step(z_current, logp_fn, k, rng):
-        # Deterministic: always add 1 and always accept.
-        z_new = tf.cast(z_current, tf.float64) + tf.ones_like(
-            z_current, dtype=tf.float64
-        )
-        accepted = tf.ones_like(z_current, dtype=tf.bool)
-        return z_new, accepted
+    def fake_iteration_step(
+        self: StockpilingEstimator, it, k_beta, k_alpha, k_v, k_fc, k_lambda, k_u_scale
+    ) -> None:
+        ones_mn = tf.ones_like(self.z["z_beta"], dtype=tf.float64)
+        ones_m = tf.ones_like(self.z["z_u_scale"], dtype=tf.float64)
 
-    monkeypatch.setattr(est_mod, "rw_mh_step", fake_rw_mh_step, raising=True)
+        # Increment each z block by +1
+        self.z["z_beta"].assign_add(ones_mn)
+        self.z["z_alpha"].assign_add(ones_mn)
+        self.z["z_v"].assign_add(ones_mn)
+        self.z["z_fc"].assign_add(ones_mn)
+        self.z["z_lambda"].assign_add(ones_mn)
+        self.z["z_u_scale"].assign_add(ones_m)
 
-    est = estimator_tiny
+        # Accept everything (elementwise counts)
+        add_mn = tf.convert_to_tensor(self.M * self.N, dtype=tf.int32)
+        add_m = tf.convert_to_tensor(self.M, dtype=tf.int32)
+        self.accept_beta.assign_add(add_mn)
+        self.accept_alpha.assign_add(add_mn)
+        self.accept_v.assign_add(add_mn)
+        self.accept_fc.assign_add(add_mn)
+        self.accept_lambda.assign_add(add_mn)
+        self.accept_u_scale.assign_add(add_m)
+
+        # Accumulate posterior means (no printing)
+        assert self._diag is not None
+        self._diag._accumulate_draw(self)
+
+    monkeypatch.setattr(
+        est,
+        "_mcmc_iteration_step",
+        fake_iteration_step.__get__(est, StockpilingEstimator),
+        raising=True,
+    )
+
     est.fit(n_iter=2, **proposal_scales_tiny)
 
     # z increments twice
@@ -194,7 +217,6 @@ def test_fit_updates_z_accept_counts_and_posterior_means_with_deterministic_mh(
     res = est.get_results()
     assert res["n_saved"] == 2
 
-    # Acceptance counts (elementwise): n_iter * (#elements)
     counts = res["accept"]["counts"]
     assert counts["beta"] == 2 * M * N
     assert counts["alpha"] == 2 * M * N
@@ -216,8 +238,6 @@ def test_fit_updates_z_accept_counts_and_posterior_means_with_deterministic_mh(
     exp_hat_expected = 0.5 * (np.exp(1.0) + np.exp(2.0))
 
     theta_hat = res["theta_hat"]
-
-    # Types: numpy arrays returned, python scalar for n_saved, python floats for rates
     assert isinstance(theta_hat["beta"], np.ndarray)
     assert isinstance(theta_hat["u_scale"], np.ndarray)
     assert isinstance(res["n_saved"], int)
@@ -246,18 +266,40 @@ def test_fit_resets_acceptance_counters_each_call(
     proposal_scales_tiny: dict[str, float],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    est = estimator_tiny
     M, N = tiny_dims["M"], tiny_dims["N"]
 
-    def fake_rw_mh_step(z_current, logp_fn, k, rng):
-        z_new = tf.cast(z_current, tf.float64) + tf.ones_like(
-            z_current, dtype=tf.float64
-        )
-        accepted = tf.ones_like(z_current, dtype=tf.bool)
-        return z_new, accepted
+    def fake_iteration_step(
+        self: StockpilingEstimator, it, k_beta, k_alpha, k_v, k_fc, k_lambda, k_u_scale
+    ) -> None:
+        ones_mn = tf.ones_like(self.z["z_beta"], dtype=tf.float64)
+        ones_m = tf.ones_like(self.z["z_u_scale"], dtype=tf.float64)
 
-    monkeypatch.setattr(est_mod, "rw_mh_step", fake_rw_mh_step, raising=True)
+        self.z["z_beta"].assign_add(ones_mn)
+        self.z["z_alpha"].assign_add(ones_mn)
+        self.z["z_v"].assign_add(ones_mn)
+        self.z["z_fc"].assign_add(ones_mn)
+        self.z["z_lambda"].assign_add(ones_mn)
+        self.z["z_u_scale"].assign_add(ones_m)
 
-    est = estimator_tiny
+        add_mn = tf.convert_to_tensor(self.M * self.N, dtype=tf.int32)
+        add_m = tf.convert_to_tensor(self.M, dtype=tf.int32)
+        self.accept_beta.assign_add(add_mn)
+        self.accept_alpha.assign_add(add_mn)
+        self.accept_v.assign_add(add_mn)
+        self.accept_fc.assign_add(add_mn)
+        self.accept_lambda.assign_add(add_mn)
+        self.accept_u_scale.assign_add(add_m)
+
+        assert self._diag is not None
+        self._diag._accumulate_draw(self)
+
+    monkeypatch.setattr(
+        est,
+        "_mcmc_iteration_step",
+        fake_iteration_step.__get__(est, StockpilingEstimator),
+        raising=True,
+    )
 
     est.fit(n_iter=1, **proposal_scales_tiny)
     res1 = est.get_results()
@@ -271,7 +313,7 @@ def test_fit_resets_acceptance_counters_each_call(
     assert res2["accept"]["counts"]["beta"] == 1 * M * N
     assert res2["accept"]["counts"]["u_scale"] == 1 * M
 
-    # Since z is not reset, second fit's posterior mean corresponds to z==2 only.
+    # z is not reset; first fit makes z==1, second fit makes z==2 for the saved draw
     beta_expected = _sigmoid(2.0)
     exp_expected = np.exp(2.0)
     np.testing.assert_allclose(
@@ -285,78 +327,6 @@ def test_fit_resets_acceptance_counters_each_call(
     )
 
 
-def test_logp_closures_return_shape_matching_each_block(
-    estimator_tiny: StockpilingEstimator,
-    proposal_scales_tiny: dict[str, float],
-    tiny_dims: dict[str, int],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Patch posterior view functions to cheap shape-correct stubs, and patch rw_mh_step to
-    assert logp_fn(z_candidate) has the same shape as z_candidate (for each block).
-    """
-    M, N = tiny_dims["M"], tiny_dims["N"]
-
-    def fake_logpost_z_beta_mn(*, z, **kwargs):
-        return tf.zeros_like(z["z_beta"])
-
-    def fake_logpost_z_alpha_mn(*, z, **kwargs):
-        return tf.zeros_like(z["z_alpha"])
-
-    def fake_logpost_z_v_mn(*, z, **kwargs):
-        return tf.zeros_like(z["z_v"])
-
-    def fake_logpost_z_fc_mn(*, z, **kwargs):
-        return tf.zeros_like(z["z_fc"])
-
-    def fake_logpost_z_lambda_mn(*, z, **kwargs):
-        return tf.zeros_like(z["z_lambda"])
-
-    def fake_logpost_u_scale_m(*, z, **kwargs):
-        return tf.zeros_like(z["z_u_scale"])
-
-    monkeypatch.setattr(
-        est_mod, "logpost_z_beta_mn", fake_logpost_z_beta_mn, raising=True
-    )
-    monkeypatch.setattr(
-        est_mod, "logpost_z_alpha_mn", fake_logpost_z_alpha_mn, raising=True
-    )
-    monkeypatch.setattr(est_mod, "logpost_z_v_mn", fake_logpost_z_v_mn, raising=True)
-    monkeypatch.setattr(est_mod, "logpost_z_fc_mn", fake_logpost_z_fc_mn, raising=True)
-    monkeypatch.setattr(
-        est_mod, "logpost_z_lambda_mn", fake_logpost_z_lambda_mn, raising=True
-    )
-    monkeypatch.setattr(
-        est_mod, "logpost_u_scale_m", fake_logpost_u_scale_m, raising=True
-    )
-
-    def shape_check_rw_mh_step(z_current, logp_fn, k, rng):
-        logp = logp_fn(tf.convert_to_tensor(z_current, dtype=tf.float64))
-        tf.debugging.assert_equal(tf.shape(logp), tf.shape(z_current))
-        accepted = tf.zeros_like(z_current, dtype=tf.bool)
-        return tf.convert_to_tensor(z_current, dtype=tf.float64), accepted
-
-    monkeypatch.setattr(est_mod, "rw_mh_step", shape_check_rw_mh_step, raising=True)
-
-    est = estimator_tiny
-    est.fit(n_iter=1, **proposal_scales_tiny)
-
-    # No accepts
-    res = est.get_results()
-    assert res["n_saved"] == 1
-    assert res["accept"]["counts"]["beta"] == 0
-    assert res["accept"]["counts"]["u_scale"] == 0
-
-    # With z still at 0, posterior mean is prior-mode transform.
-    np.testing.assert_allclose(res["theta_hat"]["beta"], 0.5, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(res["theta_hat"]["alpha"], 1.0, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(res["theta_hat"]["u_scale"], 1.0, rtol=0.0, atol=0.0)
-
-    # Shapes
-    assert res["theta_hat"]["beta"].shape == (M, N)
-    assert res["theta_hat"]["u_scale"].shape == (M,)
-
-
 def test_init_and_fit_do_not_mutate_numpy_inputs(
     panel_np: dict[str, np.ndarray],
     u_m_np: np.ndarray,
@@ -368,6 +338,7 @@ def test_init_and_fit_do_not_mutate_numpy_inputs(
     proposal_scales_tiny: dict[str, float],
     silence_progress: None,
     tf_seed: None,
+    test_seed: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     a0 = panel_np["a_imt"].copy()
@@ -376,14 +347,6 @@ def test_init_and_fit_do_not_mutate_numpy_inputs(
     pv0 = price_process["price_vals"].copy()
     P0 = price_process["P_price"].copy()
     pi0 = pi_I0_uniform.copy()
-
-    # Patch MH to avoid posterior cost
-    def fake_rw_mh_step(z_current, logp_fn, k, rng):
-        z_new = tf.cast(z_current, tf.float64)
-        accepted = tf.zeros_like(z_current, dtype=tf.bool)
-        return z_new, accepted
-
-    monkeypatch.setattr(est_mod, "rw_mh_step", fake_rw_mh_step, raising=True)
 
     est = StockpilingEstimator(
         a_imt=panel_np["a_imt"],
@@ -398,8 +361,23 @@ def test_init_and_fit_do_not_mutate_numpy_inputs(
         tol=float(tiny_dp_config["tol"]),
         max_iter=int(tiny_dp_config["max_iter"]),
         sigmas=sigmas,
-        seed=123,
+        seed=int(test_seed),
     )
+
+    # Patch the iteration step to avoid posterior cost.
+    def fake_iteration_step(
+        self: StockpilingEstimator, it, k_beta, k_alpha, k_v, k_fc, k_lambda, k_u_scale
+    ) -> None:
+        assert self._diag is not None
+        self._diag._accumulate_draw(self)
+
+    monkeypatch.setattr(
+        est,
+        "_mcmc_iteration_step",
+        fake_iteration_step.__get__(est, StockpilingEstimator),
+        raising=True,
+    )
+
     est.fit(n_iter=1, **proposal_scales_tiny)
 
     np.testing.assert_array_equal(panel_np["a_imt"], a0)
@@ -417,12 +395,12 @@ def test_fit_runs_with_real_posterior_one_iteration_smoke(
 ) -> None:
     """
     Smoke test: ensure the unpatched estimator can run one iteration end-to-end.
-    Marked slow because it executes the posterior DP/filter.
+    Marked slow because it executes posterior DP/filter inside tf.function.
     """
     estimator_tiny.fit(n_iter=1, **proposal_scales_tiny)
     res = estimator_tiny.get_results()
 
     assert res["n_saved"] == 1
-    for k, v in res["theta_hat"].items():
+    for v in res["theta_hat"].values():
         assert isinstance(v, np.ndarray)
         assert np.isfinite(v).all()

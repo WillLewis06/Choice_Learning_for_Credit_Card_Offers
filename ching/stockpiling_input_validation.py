@@ -30,8 +30,6 @@ _REQUIRED_THETA_CONSUMER_KEYS = (
     "lambda_c",
 )
 
-_REQUIRED_THETA_INIT_KEYS = _REQUIRED_THETA_CONSUMER_KEYS + ("u_scale",)
-
 
 def _as_np(x: Any, name: str) -> np.ndarray:
     try:
@@ -211,7 +209,6 @@ def validate_stockpiling_estimator_init_inputs(
     tol: Any,
     max_iter: Any,
     sigmas: dict[str, Any],
-    theta_init: dict[str, Any],
 ) -> tuple[int, int, int, int]:
     """
     Minimal validation for StockpilingEstimator.__init__ inputs.
@@ -297,34 +294,6 @@ def validate_stockpiling_estimator_init_inputs(
     _require_keys(sigmas, _REQUIRED_SIGMA_KEYS, "sigmas")
     for k in _REQUIRED_SIGMA_KEYS:
         _require_positive_scalar(sigmas[k], f"sigmas[{k}]")
-
-    _require_keys(theta_init, _REQUIRED_THETA_INIT_KEYS, "theta_init")
-
-    # Shapes and constraints needed to avoid log/logit producing inf/nan in estimator init.
-    theta0_arrays: dict[str, np.ndarray] = {}
-    for k in _REQUIRED_THETA_CONSUMER_KEYS:
-        a = _as_np(theta_init[k], f"theta_init[{k}]")
-        _require_shape(a, (M, N), f"theta_init[{k}]")
-        _require_finite(a, f"theta_init[{k}]")
-        theta0_arrays[k] = a
-
-    u_scale = _as_np(theta_init["u_scale"], "theta_init[u_scale]")
-    _require_shape(u_scale, (M,), "theta_init[u_scale]")
-    _require_finite(u_scale, "theta_init[u_scale]")
-
-    beta0 = theta0_arrays["beta"]
-    lam0 = theta0_arrays["lambda_c"]
-    if not ((beta0 > 0.0) & (beta0 < 1.0)).all():
-        raise ValueError("theta_init[beta]: expected all entries in (0,1)")
-    if not ((lam0 > 0.0) & (lam0 < 1.0)).all():
-        raise ValueError("theta_init[lambda_c]: expected all entries in (0,1)")
-
-    for k in ("alpha", "v", "fc"):
-        if not (theta0_arrays[k] > 0.0).all():
-            raise ValueError(f"theta_init[{k}]: expected all entries > 0")
-
-    if not (u_scale > 0.0).all():
-        raise ValueError("theta_init[u_scale]: expected all entries > 0")
 
     return M, N, T, S
 

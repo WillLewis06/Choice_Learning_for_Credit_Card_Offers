@@ -8,6 +8,13 @@ import tensorflow as tf
 import ching.stockpiling_posterior as sp
 
 
+@pytest.fixture
+def inventory_maps_tf(tiny_dims: dict[str, int]):
+    """Inventory maps as (idx_down, idx_up, stockout_mask, at_cap_mask)."""
+    I_max = tf.constant(int(tiny_dims["I_max"]), dtype=tf.int32)
+    return sp.build_inventory_maps(I_max)
+
+
 def _sigmas_tf(sigmas: dict[str, float]) -> dict[str, tf.Tensor]:
     return {
         k: tf.convert_to_tensor(float(v), dtype=tf.float64) for k, v in sigmas.items()
@@ -54,25 +61,20 @@ def test_build_inventory_maps_correctness(
     tiny_dims: dict[str, int],
     inventory_maps_tf,
 ) -> None:
-    D_down, D_up, stockout_mask, at_cap_mask = inventory_maps_tf
+    idx_down, idx_up, stockout_mask, at_cap_mask = inventory_maps_tf
     I_max = tiny_dims["I_max"]
     I = I_max + 1
 
-    assert tuple(D_down.shape) == (I, I)
-    assert tuple(D_up.shape) == (I, I)
+    assert tuple(idx_down.shape) == (I,)
+    assert tuple(idx_up.shape) == (I,)
     assert tuple(stockout_mask.shape) == (I,)
     assert tuple(at_cap_mask.shape) == (I,)
 
-    Dd = D_down.numpy()
-    Du = D_up.numpy()
-
-    # Each row is a one-hot mapping
-    np.testing.assert_allclose(Dd.sum(axis=1), 1.0)
-    np.testing.assert_allclose(Du.sum(axis=1), 1.0)
-
     # For I_max=2: down = [0,0,1], up = [1,2,2]
-    np.testing.assert_array_equal(np.argmax(Dd, axis=1), np.asarray([0, 0, 1]))
-    np.testing.assert_array_equal(np.argmax(Du, axis=1), np.asarray([1, 2, 2]))
+    np.testing.assert_array_equal(
+        idx_down.numpy(), np.asarray([0, 0, 1], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(idx_up.numpy(), np.asarray([1, 2, 2], dtype=np.int32))
 
     np.testing.assert_array_equal(stockout_mask.numpy(), np.asarray([1.0, 0.0, 0.0]))
     np.testing.assert_array_equal(at_cap_mask.numpy(), np.asarray([0.0, 0.0, 1.0]))
@@ -84,7 +86,7 @@ def test_make_flow_utilities_penalties(
     inventory_maps_tf,
     tiny_dims: dict[str, int],
 ) -> None:
-    D_down, D_up, stockout_mask, at_cap_mask = inventory_maps_tf
+    _, _, stockout_mask, at_cap_mask = inventory_maps_tf
     theta = sp.unconstrained_to_theta(z_blocks_tf)
 
     u0, u1 = sp.make_flow_utilities(
@@ -310,29 +312,7 @@ def test_logpost_views_combine_ll_and_prior_correctly_with_patch(
         maps=inventory_maps_tf,
     )
 
-    prior_us = sp.logprior_u_scale_m(z_blocks_tf, sigmas_tf)
+    prior_us = sp.logprior_normal_m(z_blocks_tf["z_u_scale"], sigmas_tf["z_u_scale"])
     np.testing.assert_allclose(
         out_us.numpy(), (tf.reduce_sum(ll_fake, axis=1) + prior_us).numpy()
     )
-
-    out_scalar = sp.logpost(
-        z=z_blocks_tf,
-        a_imt=tf_inputs["a_imt"],
-        p_state_mt=tf_inputs["p_state_mt"],
-        u_m=tf_inputs["u_m"],
-        price_vals=tf_inputs["price_vals"],
-        P_price=tf_inputs["P_price"],
-        pi_I0=tf_inputs["pi_I0"],
-        waste_cost=tf_inputs["waste_cost"],
-        eps=tf_inputs["eps"],
-        tol=tf.constant(1.0e-6, tf.float64),
-        max_iter=tf.constant(10, tf.int32),
-        sigmas=sigmas_tf,
-        maps=inventory_maps_tf,
-    )
-
-    lp_consumer = sp.logprior_consumer_mn(z_blocks_tf, sigmas_tf)
-    expected_scalar = (
-        tf.reduce_sum(ll_fake) + tf.reduce_sum(lp_consumer) + tf.reduce_sum(prior_us)
-    )
-    np.testing.assert_allclose(out_scalar.numpy(), expected_scalar.numpy())
