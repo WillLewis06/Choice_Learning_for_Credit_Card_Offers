@@ -1,6 +1,4 @@
 """
-ching/stockpiling_posterior.py
-
 Pure TensorFlow posterior components for a minimal Ching-style stockpiling model
 with latent inventory and seller-observed (purchases, prices) only.
 
@@ -56,6 +54,9 @@ def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
       z_fc      (M,N) -> fc        > 0
       z_lambda  (M,N) -> lambda_c  in (0,1)
       z_u_scale (M,)  -> u_scale   > 0 (shared within each market)
+
+    Returns:
+      dict[str, tf.Tensor]: constrained parameters with the same shapes.
     """
     return {
         "beta": tf.math.sigmoid(z["z_beta"]),
@@ -68,7 +69,15 @@ def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
 
 
 def _consumption_probs(lambda_c_mn: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-    """Return (p_c0, p_c1) with shapes matching lambda_c_mn."""
+    """
+    Consumption mixture weights.
+
+    Args:
+      lambda_c_mn: (M,N) probability of consumption in a period.
+
+    Returns:
+      (p_c0, p_c1) with shapes (M,N), where p_c0 = 1-lambda_c, p_c1 = lambda_c.
+    """
     p_c1 = lambda_c_mn
     p_c0 = one_f64 - lambda_c_mn
     return p_c0, p_c1
@@ -111,6 +120,12 @@ def build_inventory_maps(I_max: tf.Tensor) -> InventoryMaps:
 def _unpack_maps(
     maps: InventoryMaps,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    """
+    Unpack inventory maps tuple.
+
+    Returns:
+      (idx_down, idx_up, stockout_mask, at_cap_mask)
+    """
     idx_down, idx_up, stockout_mask, at_cap_mask = maps
     return idx_down, idx_up, stockout_mask, at_cap_mask
 
@@ -119,19 +134,27 @@ def _pushforward_inventory_mass(w_mni: tf.Tensor, idx_next_i: tf.Tensor) -> tf.T
     """
     Push mass forward under a deterministic mapping i -> idx_next_i[i].
 
+    This implements:
+      w_next[..., j] = sum_{i : idx_next_i[i] = j} w[..., i]
+    using unsorted_segment_sum.
+
     Inputs:
-      w_mni:     (M,N,I)
-      idx_next_i:(I,) int32 mapping each current inventory i to next index
+      w_mni:      (M,N,I)
+      idx_next_i: (I,) int32 mapping each current inventory i to next index
 
     Returns:
-      w_next_mni: (M,N,I) where w_next[...,j] = sum_{i: idx_next_i[i]=j} w[...,i]
+      w_next_mni: (M,N,I)
     """
     I = tf.shape(w_mni)[2]
+
+    # Reshape to (I, M*N) so segment-summing over i maps mass into next-inventory bins.
     w_imn = tf.transpose(w_mni, perm=[2, 0, 1])  # (I,M,N)
     w_iK = tf.reshape(w_imn, tf.stack([I, -1]))  # (I, M*N)
+
     w_next_iK = tf.math.unsorted_segment_sum(
         w_iK, idx_next_i, num_segments=I
     )  # (I, M*N)
+
     w_next_imn = tf.reshape(
         w_next_iK, tf.stack([I, tf.shape(w_mni)[0], tf.shape(w_mni)[1]])
     )  # (I,M,N)
@@ -144,6 +167,15 @@ def _pushforward_inventory_mass(w_mni: tf.Tensor, idx_next_i: tf.Tensor) -> tf.T
 
 
 def _logsumexp2(x0: tf.Tensor, x1: tf.Tensor) -> tf.Tensor:
+    """
+    Stable elementwise log(exp(x0) + exp(x1)).
+
+    Args:
+      x0, x1: broadcastable tensors
+
+    Returns:
+      tensor: elementwise log-sum-exp.
+    """
     m = tf.maximum(x0, x1)
     return m + tf.math.log(tf.exp(x0 - m) + tf.exp(x1 - m))
 
@@ -181,17 +213,28 @@ def make_flow_utilities(
     u1_base_mns1 = u_m_scaled_mn11 - alpha_mn11 * price_11s1 - fc_mn11  # (M,N,S,1)
     u1 = tf.broadcast_to(u1_base_mns1, shape_mnsi)  # (M,N,S,I)
 
+    # Expected waste penalty when at inventory cap and consumption does not occur.
     p_c0_mn11, _ = _consumption_probs(theta["lambda_c"])
     p_c0_mn11 = p_c0_mn11[:, :, None, None]  # (M,N,1,1)
     u1 = u1 - waste_cost * p_c0_mn11 * at_cap_mask[None, None, None, :]
 
+    # Stockout penalty applies only at I==0.
     u0_mn1i = -theta["v"][:, :, None, None] * stockout_mask[None, None, None, :]
     u0 = tf.broadcast_to(u0_mn1i, shape_mnsi)
     return u0, u1
 
 
 def expected_over_next_price(V: tf.Tensor, P_price: tf.Tensor) -> tf.Tensor:
-    """EV_next[m,n,s,I] = sum_{s'} P_price[s,s'] * V[m,n,s',I]."""
+    """
+    EV_next[m,n,s,I] = sum_{s'} P_price[s,s'] * V[m,n,s',I].
+
+    Inputs:
+      V:       (M,N,S,I)
+      P_price: (S,S)
+
+    Returns:
+      (M,N,S,I)
+    """
     return tf.einsum("ab,mnbi->mnai", P_price, V)
 
 
@@ -205,28 +248,32 @@ def bellman_update(
     idx_up: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """
-    One Bellman update.
+    One Bellman update for logit shocks.
+
+    Consumption mixture:
+      - if a=0: next inventory is i (c=0) or down(i) (c=1)
+      - if a=1: next inventory is up(i) (c=0) or i (c=1)
 
     Returns:
-      V_new, Q0, Q1: all (M,N,S,I)
+      (v_new, q0, q1): all (M,N,S,I)
     """
-    EV_next = expected_over_next_price(V, P_price)  # (M,N,S,I)
+    ev_next = expected_over_next_price(V, P_price)  # (M,N,S,I)
 
     beta_mn11 = theta["beta"][:, :, None, None]
     p_c0_mn11, p_c1_mn11 = _consumption_probs(theta["lambda_c"])
     p_c0_mn11 = p_c0_mn11[:, :, None, None]
     p_c1_mn11 = p_c1_mn11[:, :, None, None]
 
-    EV_down = tf.gather(EV_next, idx_down, axis=3)  # EV_next[..., down(i)]
-    EV_up = tf.gather(EV_next, idx_up, axis=3)  # EV_next[..., up(i)]
+    ev_down = tf.gather(ev_next, idx_down, axis=3)  # ev_next[..., down(i)]
+    ev_up = tf.gather(ev_next, idx_up, axis=3)  # ev_next[..., up(i)]
 
-    cont0 = p_c0_mn11 * EV_next + p_c1_mn11 * EV_down
-    cont1 = p_c0_mn11 * EV_up + p_c1_mn11 * EV_next
+    cont0 = p_c0_mn11 * ev_next + p_c1_mn11 * ev_down
+    cont1 = p_c0_mn11 * ev_up + p_c1_mn11 * ev_next
 
-    Q0 = u0 + beta_mn11 * cont0
-    Q1 = u1 + beta_mn11 * cont1
-    V_new = _logsumexp2(Q0, Q1)
-    return V_new, Q0, Q1
+    q0 = u0 + beta_mn11 * cont0
+    q1 = u1 + beta_mn11 * cont1
+    v_new = _logsumexp2(q0, q1)
+    return v_new, q0, q1
 
 
 def solve_value_function(
@@ -240,34 +287,37 @@ def solve_value_function(
     max_iter: tf.Tensor,
 ) -> tf.Tensor:
     """
-    Value iteration.
+    Value iteration until max-norm change <= tol or max_iter reached.
+
+    Inputs:
+      u0,u1: (M,N,S,I)
 
     Returns:
-      V_final: (M,N,S,I)
+      v_final: (M,N,S,I)
     """
-    V0 = tf.zeros_like(u0)
+    v0 = tf.zeros_like(u0)
     diff0 = tf.constant(1.0e30, dtype=tf.float64)
 
-    def cond(it: tf.Tensor, V_curr: tf.Tensor, diff_curr: tf.Tensor) -> tf.Tensor:
+    def cond(it: tf.Tensor, v_curr: tf.Tensor, diff_curr: tf.Tensor) -> tf.Tensor:
         return tf.logical_and(it < max_iter, diff_curr > tol)
 
-    def body(it: tf.Tensor, V_curr: tf.Tensor, diff_curr: tf.Tensor):
-        V_new, _, _ = bellman_update(V_curr, u0, u1, theta, P_price, idx_down, idx_up)
-        diff_new = tf.reduce_max(tf.abs(V_new - V_curr))
-        return it + 1, V_new, diff_new
+    def body(it: tf.Tensor, v_curr: tf.Tensor, diff_curr: tf.Tensor):
+        v_new, _, _ = bellman_update(v_curr, u0, u1, theta, P_price, idx_down, idx_up)
+        diff_new = tf.reduce_max(tf.abs(v_new - v_curr))
+        return it + 1, v_new, diff_new
 
     it0 = tf.constant(0, tf.int32)
-    _, V_final, _ = tf.while_loop(
+    _, v_final, _ = tf.while_loop(
         cond,
         body,
-        loop_vars=[it0, V0, diff0],
+        loop_vars=[it0, v0, diff0],
         shape_invariants=[
             it0.get_shape(),
             tf.TensorShape([None, None, None, None]),
             diff0.get_shape(),
         ],
     )
-    return V_final
+    return v_final
 
 
 def solve_ccp_buy(
@@ -296,12 +346,13 @@ def solve_ccp_buy(
         stockout_mask=stockout_mask,
         at_cap_mask=at_cap_mask,
     )
-    V_final = solve_value_function(
+
+    v_final = solve_value_function(
         u0, u1, theta, P_price, idx_down, idx_up, tol, max_iter
     )
-    _, Q0, Q1 = bellman_update(V_final, u0, u1, theta, P_price, idx_down, idx_up)
-    denom = _logsumexp2(Q0, Q1)
-    return tf.exp(Q1 - denom)
+    _, q0, q1 = bellman_update(v_final, u0, u1, theta, P_price, idx_down, idx_up)
+    denom = _logsumexp2(q0, q1)
+    return tf.exp(q1 - denom)
 
 
 # =============================================================================
@@ -312,7 +363,12 @@ def solve_ccp_buy(
 def initial_inventory_belief(
     pi_I0: tf.Tensor, M: tf.Tensor, N: tf.Tensor, eps: tf.Tensor
 ) -> tf.Tensor:
-    """Initial belief b0 over inventory for each (m,n). Returns (M,N,I), normalized."""
+    """
+    Initial inventory belief b0 for each (m,n).
+
+    Returns:
+      b0: (M,N,I) normalized, with I = len(pi_I0).
+    """
     I = tf.shape(pi_I0)[0]
     b0 = tf.broadcast_to(pi_I0[None, None, :], tf.stack([M, N, I]))
     denom = tf.reduce_sum(b0, axis=2, keepdims=True)
@@ -335,7 +391,10 @@ def select_pi_by_state(ccp_buy: tf.Tensor, s_mt: tf.Tensor) -> tf.Tensor:
     S = tf.shape(ccp_buy)[2]
     I = tf.shape(ccp_buy)[3]
 
+    # Flatten (M,N) to a batch dimension so we can gather by (batch, state).
     ccp_flat = tf.reshape(ccp_buy, tf.stack([M * N, S, I]))  # (M*N,S,I)
+
+    # Broadcast market state s_mt to consumers, then flatten to (M*N,).
     s_mn = tf.tile(s_mt[:, None], tf.stack([1, N]))  # (M,N)
     s_flat = tf.reshape(s_mn, tf.stack([M * N]))  # (M*N,)
 
@@ -346,7 +405,12 @@ def select_pi_by_state(ccp_buy: tf.Tensor, s_mt: tf.Tensor) -> tf.Tensor:
 
 
 def action_likelihood_by_inventory(pi_mnI: tf.Tensor, a_mn: tf.Tensor) -> tf.Tensor:
-    """Return lik_I (M,N,I) = P(a_mn | I)."""
+    """
+    Action likelihood conditional on inventory.
+
+    Returns:
+      lik_I: (M,N,I) where lik_I[m,n,i] = P(a_mn[m,n] | I=i).
+    """
     a = tf.cast(a_mn, tf.float64)
     return a[:, :, None] * pi_mnI + (one_f64 - a)[:, :, None] * (one_f64 - pi_mnI)
 
@@ -355,8 +419,10 @@ def bayes_update_belief_mn(
     b: tf.Tensor, lik_I: tf.Tensor, eps: tf.Tensor
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """
+    Bayesian update step b(I) -> posterior weights proportional to b(I)*lik(I).
+
     Returns:
-      w_post:     (M,N,I) unnormalized weights proportional to posterior over I_t
+      w_post:     (M,N,I) unnormalized weights
       ll_step_mn: (M,N)   log predictive probability for each (m,n)
     """
     w_post = b * lik_I
@@ -386,9 +452,11 @@ def transition_belief(
     p_c0_mn1 = p_c0_mn1[:, :, None]
     p_c1_mn1 = p_c1_mn1[:, :, None]
 
+    # Deterministic inventory pushforwards under down(i) and up(i).
     w_down = _pushforward_inventory_mass(w_post, idx_down)
     w_up = _pushforward_inventory_mass(w_post, idx_up)
 
+    # Mixture over consumption c, then mixture over action a.
     w_next0 = p_c0_mn1 * w_post + p_c1_mn1 * w_down
     w_next1 = p_c0_mn1 * w_up + p_c1_mn1 * w_post
     w_next = (one_f64 - a)[:, :, None] * w_next0 + a[:, :, None] * w_next1
@@ -407,7 +475,14 @@ def loglik_hidden_inventory_mn(
     maps: InventoryMaps,
 ) -> tf.Tensor:
     """
-    Forward filter integrating out latent inventory.
+    Forward filter integrating out latent inventory per (m,n).
+
+    Inputs:
+      a_imt:      (M,N,T) int/float (cast internally where needed)
+      p_state_mt: (M,T)   int32
+      ccp_buy:    (M,N,S,I)
+      pi_I0:      (I,)
+      lambda_c_mn:(M,N)
 
     Returns:
       loglik_mn: (M,N) where each entry is sum_t log P(a_{m,n,t} | history)
@@ -455,12 +530,22 @@ def loglik_hidden_inventory_mn(
 
 
 def logprior_normal_mn(z_block_mn: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
-    """Elementwise Normal(0, sigma^2) log prior (up to constants), shape (M,N)."""
+    """
+    Elementwise Normal(0, sigma^2) log prior (up to additive constants).
+
+    Returns:
+      (M,N)
+    """
     return -0.5 * tf.square(z_block_mn / sigma)
 
 
 def logprior_normal_m(z_block_m: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
-    """Elementwise Normal(0, sigma^2) log prior (up to constants), shape (M,)."""
+    """
+    Elementwise Normal(0, sigma^2) log prior (up to additive constants).
+
+    Returns:
+      (M,)
+    """
     return -0.5 * tf.square(z_block_m / sigma)
 
 
@@ -484,9 +569,12 @@ def loglik_mn(
     maps: InventoryMaps,
 ) -> tf.Tensor:
     """
-    Per-consumer log-likelihood contributions, shape (M,N).
+    Per-consumer log-likelihood contributions.
 
     Computes CCPs via DP under theta(z), then runs a forward filter per consumer.
+
+    Returns:
+      (M,N)
     """
     theta = unconstrained_to_theta(z)
     ccp_buy = solve_ccp_buy(
@@ -527,6 +615,15 @@ def _logpost_consumer_block_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """
+    Log posterior view for a single per-(m,n) z-block.
+
+    This returns (M,N) so rw_mh_step can apply elementwise accept/reject
+    for the specified z_key.
+
+    Returns:
+      (M,N)
+    """
     ll = loglik_mn(
         z=z,
         a_imt=a_imt,
@@ -560,6 +657,7 @@ def logpost_z_beta_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """(M,N) log posterior view for updating z_beta."""
     return _logpost_consumer_block_mn(
         z=z,
         z_key="z_beta",
@@ -594,6 +692,7 @@ def logpost_z_alpha_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """(M,N) log posterior view for updating z_alpha."""
     return _logpost_consumer_block_mn(
         z=z,
         z_key="z_alpha",
@@ -628,6 +727,7 @@ def logpost_z_v_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """(M,N) log posterior view for updating z_v."""
     return _logpost_consumer_block_mn(
         z=z,
         z_key="z_v",
@@ -662,6 +762,7 @@ def logpost_z_fc_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """(M,N) log posterior view for updating z_fc."""
     return _logpost_consumer_block_mn(
         z=z,
         z_key="z_fc",
@@ -696,6 +797,7 @@ def logpost_z_lambda_mn(
     maps: InventoryMaps,
     sigmas: dict[str, tf.Tensor],
 ) -> tf.Tensor:
+    """(M,N) log posterior view for updating z_lambda."""
     return _logpost_consumer_block_mn(
         z=z,
         z_key="z_lambda",

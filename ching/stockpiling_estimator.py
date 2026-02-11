@@ -19,6 +19,9 @@
 #
 # Accumulation:
 #   - No burn-in / thinning: all iterations contribute to posterior mean.
+#
+# Reporting:
+#   - All printing is delegated to ching.stockpiling_diagnostics.
 
 from __future__ import annotations
 
@@ -29,6 +32,11 @@ import tensorflow as tf
 
 from toolbox.mcmc_kernels import rw_mh_step
 
+from ching.stockpiling_diagnostics import report_iteration_progress
+from ching.stockpiling_input_validation import (
+    validate_stockpiling_estimator_fit_inputs,
+    validate_stockpiling_estimator_init_inputs,
+)
 from ching.stockpiling_posterior import (
     build_inventory_maps,
     logpost_u_scale_m,
@@ -38,42 +46,6 @@ from ching.stockpiling_posterior import (
     logpost_z_lambda_mn,
     logpost_z_v_mn,
 )
-from ching.stockpiling_input_validation import (
-    validate_stockpiling_estimator_fit_inputs,
-    validate_stockpiling_estimator_init_inputs,
-)
-
-
-def _round4(x: tf.Tensor) -> tf.Tensor:
-    """Format tensor values as strings with 4 decimal places (no scientific notation)."""
-    return tf.strings.as_string(x, precision=4, scientific=False)
-
-
-def _report_iteration_progress(z: dict[str, tf.Tensor], it: tf.Tensor) -> None:
-    """TF-compatible one-line sampler summary (runs inside tf.function)."""
-    beta = tf.math.sigmoid(z["z_beta"])
-    alpha = tf.exp(z["z_alpha"])
-    v = tf.exp(z["z_v"])
-    fc = tf.exp(z["z_fc"])
-    lambda_c = tf.math.sigmoid(z["z_lambda"])
-    u_scale = tf.exp(z["z_u_scale"])
-
-    tf.print(
-        "[Stockpiling] it=",
-        it,
-        " | mean(beta)=",
-        _round4(tf.reduce_mean(beta)),
-        ", mean(alpha)=",
-        _round4(tf.reduce_mean(alpha)),
-        ", mean(v)=",
-        _round4(tf.reduce_mean(v)),
-        ", mean(fc)=",
-        _round4(tf.reduce_mean(fc)),
-        ", mean(lambda_c)=",
-        _round4(tf.reduce_mean(lambda_c)),
-        " | u_scale_mean=",
-        _round4(tf.reduce_mean(u_scale)),
-    )
 
 
 class StockpilingEstimator:
@@ -463,4 +435,4 @@ class StockpilingEstimator:
         self.sums["lambda_c"].assign_add(lambda_c)
         self.sums["u_scale"].assign_add(u_scale)
 
-        _report_iteration_progress(z_curr, it)
+        report_iteration_progress(self, it)

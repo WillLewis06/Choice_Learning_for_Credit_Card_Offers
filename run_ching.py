@@ -1,21 +1,21 @@
-"""End-to-end orchestration for:
+"""
+End-to-end orchestration for:
 
 - Phase 1: feature-based baseline choice model (delta_hat)
 - Phase 2: Lu-style shrinkage on market-product shocks (E_bar_hat, njt_hat, alpha_hat)
-- Stockpiling model: generate seller-observed purchases under forward-looking inventory and
-  estimate stockpiling parameters treating (per-market) utilities as fixed inputs.
+- Phase 3 (stockpiling): generate seller-observed purchases under a forward-looking
+  inventory model, then estimate stockpiling parameters treating utilities as fixed.
 
 Notes:
 - This orchestration layer stays NumPy/Python only. Any TensorFlow conversion is handled
   inside the stockpiling estimator.
-- Input validation and detailed diagnostics should live elsewhere; this file only prints
-  high-level milestones (plus existing Phase 1–2 diagnostics functions).
+- Input validation and detailed diagnostics live elsewhere; this file prints high-level
+  milestones plus existing Phase 1–2 diagnostics.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import numpy as np
 
@@ -101,7 +101,7 @@ stock_eps = 1e-12
 
 # MCMC config (formerly mcmc dict); keep k and sigmas as dicts
 mcmc_seed = 0
-mcmc_n_iter = 15
+mcmc_n_iter = 4
 
 k = {
     "beta": 1,
@@ -128,7 +128,12 @@ sigmas = {
 
 
 def _uniform_pi_I0(I_max: int) -> np.ndarray:
-    """Uniform initial inventory belief over {0,...,I_max}."""
+    """
+    Uniform initial-inventory belief over {0, ..., I_max}.
+
+    Returns:
+      ndarray: shape (I_max + 1,), float64.
+    """
     return np.full((I_max + 1,), 1.0 / (I_max + 1), dtype=np.float64)
 
 
@@ -138,18 +143,17 @@ def run_stockpiling_dgp(
     njt_used: np.ndarray,
     seed_dgp: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Generate seller-observed stockpiling data using fixed utilities.
+    """
+    Generate seller-observed stockpiling data using fixed utilities.
 
-    The fixed utilities are represented by (delta_used, E_bar_used, njt_used), where the
-    per-market intercept for product_index is:
-
+    Fixed per-market intercept for product_index:
       u_m = delta_used[product_index] + E_bar_used[m] + njt_used[m, product_index].
 
     Returns:
-      a_imt      (M, N, T)
-      p_state_mt (M, T)
-      u_m_true   (M,)
-      theta_true dict of (M,N) arrays
+      a_imt      (M, N, T) int64 purchases
+      p_state_mt (M, T)    int64 price states
+      u_m_true   (M,)      float64 market intercepts
+      theta_true dict of (M, N) float64 arrays
     """
     delta_used = np.asarray(delta_used, dtype=np.float64)
     E_bar_used = np.asarray(E_bar_used, dtype=np.float64)
@@ -178,8 +182,15 @@ def run_stockpiling_estimation(
     p_state_mt: np.ndarray,
     u_m: np.ndarray,
 ) -> dict[str, object]:
-    """Estimate stockpiling parameters from seller-observed data."""
+    """
+    Fit stockpiling parameters from seller-observed data.
 
+    Returns:
+      dict with keys used downstream, including:
+        - "theta_hat": fitted parameter summary (structure defined by estimator)
+        - "n_saved": number of saved posterior draws
+        - "accept": acceptance rate diagnostics
+    """
     est = StockpilingEstimator(
         a_imt=a_imt,
         p_state_mt=p_state_mt,
@@ -216,8 +227,8 @@ def run_stockpiling_estimation(
 # =============================================================================
 
 
-def main() -> dict[str, Any]:
-    """Run Phase 1–2 utilities, then stockpiling DGP and estimation."""
+def main() -> None:
+    """Run Phase 1–2 utilities, then stockpiling DGP, estimation, and evaluation."""
     # -------------------------------------------------------------------------
     # Phase 1
     # -------------------------------------------------------------------------
@@ -297,9 +308,11 @@ def main() -> dict[str, Any]:
     E_bar_hat = np.asarray(res2["E_bar_hat"], dtype=np.float64)
     njt_hat = np.asarray(res2["njt_hat"], dtype=np.float64)
 
-    # Feed the stockpiling DGP with (delta_used, E_bar_used, njt_used).
+    # Rescale Phase-1 utilities by the Phase-2 normalization (alpha_hat) so the
+    # stockpiling DGP/likelihood sees utilities on the intended scale.
     delta_used = alpha_hat * delta_hat
 
+    # Generate seller-observed stockpiling panel data using fixed utilities.
     print("=== Stockpiling DGP: Generating seller-observed data ===")
     a_imt, p_state_mt, u_m_true, theta_true = run_stockpiling_dgp(
         delta_used=delta_used,
@@ -327,6 +340,8 @@ def main() -> dict[str, Any]:
 
     pi_I0 = _uniform_pi_I0(stock_I_max)
 
+    # Evaluate fitted parameters versus (optional) oracle truth and summarize MCMC
+    # diagnostics (acceptance, saved draws) in a single reviewer-friendly report.
     eval_out = evaluate_stockpiling(
         a_imt=a_imt,
         p_state_mt=p_state_mt,

@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 
-_REQUIRED_SIGMA_KEYS = (
+_required_sigma_keys = (
     "z_beta",
     "z_alpha",
     "z_v",
@@ -22,7 +22,7 @@ _REQUIRED_SIGMA_KEYS = (
     "z_u_scale",
 )
 
-_REQUIRED_THETA_CONSUMER_KEYS = (
+_required_theta_consumer_keys = (
     "beta",
     "alpha",
     "v",
@@ -31,35 +31,84 @@ _REQUIRED_THETA_CONSUMER_KEYS = (
 )
 
 
+# =============================================================================
+# Small conversion helpers
+# =============================================================================
+
+
 def _as_np(x: Any, name: str) -> np.ndarray:
+    """
+    Convert an input to a NumPy array.
+
+    Raises:
+      TypeError: if conversion fails.
+    """
     try:
         return np.asarray(x)
     except Exception as e:  # pragma: no cover
         raise TypeError(f"{name}: could not convert to numpy array: {e}") from e
 
 
+# =============================================================================
+# Shape/value checks (minimal; avoid duplicate deep validation)
+# =============================================================================
+
+
 def _require_keys(d: dict[str, Any], keys: tuple[str, ...], name: str) -> None:
+    """
+    Require that a dictionary contains a given set of keys.
+
+    Raises:
+      ValueError: if any key is missing.
+    """
     missing = [k for k in keys if k not in d]
     if missing:
         raise ValueError(f"{name}: missing keys {missing}. Required keys: {list(keys)}")
 
 
 def _require_ndim(a: np.ndarray, ndim: int, name: str) -> None:
+    """
+    Require a NumPy array to have a specific number of dimensions.
+
+    Raises:
+      ValueError: if ndim does not match.
+    """
     if a.ndim != ndim:
         raise ValueError(f"{name}: expected ndim={ndim}, got shape={a.shape}")
 
 
 def _require_shape(a: np.ndarray, shape: tuple[int, ...], name: str) -> None:
+    """
+    Require a NumPy array to have an exact shape.
+
+    Raises:
+      ValueError: if shape does not match.
+    """
     if tuple(a.shape) != tuple(shape):
         raise ValueError(f"{name}: expected shape={shape}, got shape={a.shape}")
 
 
 def _require_finite(a: np.ndarray, name: str) -> None:
+    """
+    Require a NumPy array to contain only finite values.
+
+    Raises:
+      ValueError: if any entry is nan/inf.
+    """
     if not np.isfinite(a).all():
         raise ValueError(f"{name}: contains non-finite values (nan/inf)")
 
 
 def _require_positive_scalar(x: Any, name: str) -> float:
+    """
+    Require a scalar convertible to float and strictly positive.
+
+    Returns:
+      float: converted scalar.
+
+    Raises:
+      TypeError/ValueError on conversion failure or invalid value.
+    """
     try:
         v = float(x)
     except Exception as e:  # pragma: no cover
@@ -70,6 +119,15 @@ def _require_positive_scalar(x: Any, name: str) -> float:
 
 
 def _require_nonnegative_scalar(x: Any, name: str) -> float:
+    """
+    Require a scalar convertible to float and non-negative.
+
+    Returns:
+      float: converted scalar.
+
+    Raises:
+      TypeError/ValueError on conversion failure or invalid value.
+    """
     try:
         v = float(x)
     except Exception as e:  # pragma: no cover
@@ -79,7 +137,16 @@ def _require_nonnegative_scalar(x: Any, name: str) -> float:
     return v
 
 
-def _require_int_scalar(x: Any, name: str, *, min_value: int | None = None) -> int:
+def _require_int_scalar(x: Any, name: str, min_value: int | None = None) -> int:
+    """
+    Require a scalar convertible to int, optionally bounded below.
+
+    Returns:
+      int: converted scalar.
+
+    Raises:
+      TypeError/ValueError on conversion failure or invalid value.
+    """
     try:
         v = int(x)
     except Exception as e:  # pragma: no cover
@@ -92,9 +159,19 @@ def _require_int_scalar(x: Any, name: str, *, min_value: int | None = None) -> i
 
 
 def _validate_markov_matrix(P: np.ndarray, name: str) -> None:
+    """
+    Minimal validation for a row-stochastic Markov transition matrix.
+
+    Checks:
+      - finite entries
+      - nonnegative entries
+      - rows sum to 1 within a small tolerance
+    """
     _require_finite(P, name)
     if (P < 0).any():
         raise ValueError(f"{name}: expected all entries >= 0")
+
+    # atol is small and rtol is 0 to enforce absolute row-stochasticity.
     row_sums = P.sum(axis=1)
     if not np.allclose(row_sums, 1.0, atol=1e-10, rtol=0.0):
         raise ValueError(
@@ -102,8 +179,12 @@ def _validate_markov_matrix(P: np.ndarray, name: str) -> None:
         )
 
 
+# =============================================================================
+# Public validators
+# =============================================================================
+
+
 def validate_stockpiling_dgp_inputs(
-    *,
     delta_true: Any,
     E_bar_true: Any,
     njt_true: Any,
@@ -121,7 +202,8 @@ def validate_stockpiling_dgp_inputs(
     """
     Minimal validation for ching_dgp.generate_dgp inputs.
 
-    Returns (M, N, T, S).
+    Returns:
+      (M, N, T, S)
     """
     delta_true = _as_np(delta_true, "delta_true")
     E_bar_true = _as_np(E_bar_true, "E_bar_true")
@@ -168,20 +250,20 @@ def validate_stockpiling_dgp_inputs(
     _require_finite(price_vals, "price_vals")
     _validate_markov_matrix(P_price, "P_price")
 
-    _require_keys(theta_true, _REQUIRED_THETA_CONSUMER_KEYS, "theta_true")
+    _require_keys(theta_true, _required_theta_consumer_keys, "theta_true")
 
     theta_arrays: dict[str, np.ndarray] = {}
-    for k in _REQUIRED_THETA_CONSUMER_KEYS:
+    for k in _required_theta_consumer_keys:
         a = _as_np(theta_true[k], f"theta_true[{k}]")
         _require_shape(a, (M, N), f"theta_true[{k}]")
         _require_finite(a, f"theta_true[{k}]")
         theta_arrays[k] = a
 
     beta = theta_arrays["beta"]
-    lam = theta_arrays["lambda_c"]
+    lambda_c = theta_arrays["lambda_c"]
     if not ((beta > 0.0) & (beta < 1.0)).all():
         raise ValueError("theta_true[beta]: expected all entries in (0,1)")
-    if not ((lam > 0.0) & (lam < 1.0)).all():
+    if not ((lambda_c > 0.0) & (lambda_c < 1.0)).all():
         raise ValueError("theta_true[lambda_c]: expected all entries in (0,1)")
 
     for k in ("alpha", "v", "fc"):
@@ -196,7 +278,6 @@ def validate_stockpiling_dgp_inputs(
 
 
 def validate_stockpiling_estimator_init_inputs(
-    *,
     a_imt: Any,
     p_state_mt: Any,
     u_m: Any,
@@ -213,7 +294,8 @@ def validate_stockpiling_estimator_init_inputs(
     """
     Minimal validation for StockpilingEstimator.__init__ inputs.
 
-    Returns (M, N, T, S).
+    Returns:
+      (M, N, T, S)
     """
     a_imt = _as_np(a_imt, "a_imt")
     p_state_mt = _as_np(p_state_mt, "p_state_mt")
@@ -247,7 +329,7 @@ def validate_stockpiling_estimator_init_inputs(
     _require_finite(price_vals, "price_vals")
     _validate_markov_matrix(P_price, "P_price")
 
-    # Minimal value checks needed to avoid indexing / invalid log-likelihood.
+    # Minimal value checks needed to avoid indexing failures and invalid likelihood.
     if np.issubdtype(a_imt.dtype, np.bool_):
         pass
     else:
@@ -291,15 +373,14 @@ def validate_stockpiling_estimator_init_inputs(
     _require_positive_scalar(tol, "tol")
     _require_int_scalar(max_iter, "max_iter", min_value=1)
 
-    _require_keys(sigmas, _REQUIRED_SIGMA_KEYS, "sigmas")
-    for k in _REQUIRED_SIGMA_KEYS:
+    _require_keys(sigmas, _required_sigma_keys, "sigmas")
+    for k in _required_sigma_keys:
         _require_positive_scalar(sigmas[k], f"sigmas[{k}]")
 
     return M, N, T, S
 
 
 def validate_stockpiling_estimator_fit_inputs(
-    *,
     n_iter: Any,
     k_beta: Any,
     k_alpha: Any,
@@ -308,7 +389,11 @@ def validate_stockpiling_estimator_fit_inputs(
     k_lambda: Any,
     k_u_scale: Any,
 ) -> None:
-    """Minimal validation for StockpilingEstimator.fit inputs."""
+    """
+    Minimal validation for StockpilingEstimator.fit inputs.
+
+    Checks that iteration count and step sizes are finite and positive.
+    """
     _require_int_scalar(n_iter, "n_iter", min_value=1)
 
     _require_positive_scalar(k_beta, "k_beta")

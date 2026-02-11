@@ -1,30 +1,116 @@
 # tests/ching/test_stockpiling_posterior.py
+"""
+Unit tests for `ching.stockpiling_posterior`.
+
+These tests focus on small, deterministic objects to validate:
+- transformations from unconstrained z-blocks to constrained parameters,
+- inventory-map construction,
+- flow-utility construction (including boundary penalties),
+- forward filtering of hidden inventory (log-likelihood),
+- end-to-end log-likelihood and log-posterior "views" used by the MCMC kernels.
+
+The tests avoid pytest fixtures. Instead, they build a tiny synthetic environment via
+`ching_conftest` helper functions (called directly like normal Python functions).
+"""
+
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
-import pytest
+
+import ching_conftest as cc  # sets TF_CPP_MIN_LOG_LEVEL before importing TF
 import tensorflow as tf
 
 import ching.stockpiling_posterior as sp
 
 
-@pytest.fixture
-def inventory_maps_tf(tiny_dims: dict[str, int]):
-    """Inventory maps as (idx_down, idx_up, stockout_mask, at_cap_mask)."""
-    I_max = tf.constant(int(tiny_dims["I_max"]), dtype=tf.int32)
-    return sp.build_inventory_maps(I_max)
-
-
 def _sigmas_tf(sigmas: dict[str, float]) -> dict[str, tf.Tensor]:
+    """Convert prior scales to float64 TensorFlow tensors."""
     return {
         k: tf.convert_to_tensor(float(v), dtype=tf.float64) for k, v in sigmas.items()
     }
 
 
-def test_unconstrained_to_theta_shapes_and_constraints(
-    tiny_dims: dict[str, int],
-    z_blocks_tf: dict[str, tf.Tensor],
-) -> None:
+def _to_tf_float64_dict(arrs: dict[str, np.ndarray]) -> dict[str, tf.Tensor]:
+    """Convert a dict of numpy arrays to float64 TensorFlow tensors."""
+    return {k: tf.convert_to_tensor(v, dtype=tf.float64) for k, v in arrs.items()}
+
+
+def _build_tf_inputs(
+    panel_np: dict[str, np.ndarray],
+    u_m_np: np.ndarray,
+    price_proc: dict[str, np.ndarray],
+    pi_i0_np: np.ndarray,
+    dp_cfg: dict[str, float | int],
+) -> dict[str, tf.Tensor]:
+    """
+    Build canonical TF inputs for posterior calls.
+
+    Returns a dict containing:
+      a_imt, p_state_mt: int32
+      u_m, price_vals, P_price, pi_I0: float64
+      waste_cost, eps, tol: float64
+      max_iter: int32
+    """
+    return {
+        "a_imt": tf.convert_to_tensor(panel_np["a_imt"], dtype=tf.int32),
+        "p_state_mt": tf.convert_to_tensor(panel_np["p_state_mt"], dtype=tf.int32),
+        "u_m": tf.convert_to_tensor(u_m_np, dtype=tf.float64),
+        "price_vals": tf.convert_to_tensor(price_proc["price_vals"], dtype=tf.float64),
+        "P_price": tf.convert_to_tensor(price_proc["P_price"], dtype=tf.float64),
+        "pi_I0": tf.convert_to_tensor(pi_i0_np, dtype=tf.float64),
+        "waste_cost": tf.convert_to_tensor(
+            float(dp_cfg["waste_cost"]), dtype=tf.float64
+        ),
+        "eps": tf.convert_to_tensor(float(dp_cfg["eps"]), dtype=tf.float64),
+        "tol": tf.convert_to_tensor(float(dp_cfg["tol"]), dtype=tf.float64),
+        "max_iter": tf.convert_to_tensor(int(dp_cfg["max_iter"]), dtype=tf.int32),
+    }
+
+
+def _tiny_env() -> tuple[
+    dict[str, int],
+    dict[str, tf.Tensor],
+    dict[str, tf.Tensor],
+    dict[str, float],
+    sp.InventoryMaps,
+]:
+    """
+    Build the small deterministic Phase-3 objects used by all tests.
+
+    Returns:
+      tiny_dims:   dict with M,N,T,S,I_max
+      tf_inputs:   canonical TF inputs (see `_build_tf_inputs`)
+      z_blocks_tf: unconstrained blocks (float64) at the prior mode (all zeros)
+      sigmas:      prior scales (python floats)
+      maps:        inventory maps tuple
+    """
+    # The constructions below are deterministic, but set a seed for safety.
+    tf.random.set_seed(0)
+
+    tiny_dims = cc.tiny_dims()
+    dp_cfg = cc.tiny_dp_config()
+
+    panel_np = cc.panel_np(tiny_dims)
+    u_m_np = cc.u_m_np(tiny_dims)
+    price_proc = cc.price_process(tiny_dims)
+    pi_i0_np = cc.pi_I0_uniform(tiny_dims)
+
+    tf_inputs = _build_tf_inputs(panel_np, u_m_np, price_proc, pi_i0_np, dp_cfg)
+
+    z_blocks_tf = _to_tf_float64_dict(cc.z_blocks_np(tiny_dims))
+    sigmas = cc.sigmas()
+
+    maps = sp.build_inventory_maps(
+        tf.convert_to_tensor(int(tiny_dims["I_max"]), dtype=tf.int32)
+    )
+    return tiny_dims, tf_inputs, z_blocks_tf, sigmas, maps
+
+
+def test_unconstrained_to_theta_shapes_and_constraints() -> None:
+    """z-block transforms should produce correctly-shaped, constrained parameters."""
+    tiny_dims, _, z_blocks_tf, _, _ = _tiny_env()
     theta = sp.unconstrained_to_theta(z_blocks_tf)
 
     M, N = tiny_dims["M"], tiny_dims["N"]
@@ -57,20 +143,20 @@ def test_unconstrained_to_theta_shapes_and_constraints(
     assert np.all(theta["u_scale"].numpy() > 0.0)
 
 
-def test_build_inventory_maps_correctness(
-    tiny_dims: dict[str, int],
-    inventory_maps_tf,
-) -> None:
-    idx_down, idx_up, stockout_mask, at_cap_mask = inventory_maps_tf
-    I_max = tiny_dims["I_max"]
-    I = I_max + 1
+def test_build_inventory_maps_correctness() -> None:
+    """Inventory maps should encode boundary-safe up/down moves and masks."""
+    tiny_dims, _, _, _, maps = _tiny_env()
+    idx_down, idx_up, stockout_mask, at_cap_mask = maps
+
+    i_max = int(tiny_dims["I_max"])
+    I = i_max + 1
 
     assert tuple(idx_down.shape) == (I,)
     assert tuple(idx_up.shape) == (I,)
     assert tuple(stockout_mask.shape) == (I,)
     assert tuple(at_cap_mask.shape) == (I,)
 
-    # For I_max=2: down = [0,0,1], up = [1,2,2]
+    # For i_max=2: down = [0,0,1], up = [1,2,2]
     np.testing.assert_array_equal(
         idx_down.numpy(), np.asarray([0, 0, 1], dtype=np.int32)
     )
@@ -80,13 +166,10 @@ def test_build_inventory_maps_correctness(
     np.testing.assert_array_equal(at_cap_mask.numpy(), np.asarray([0.0, 0.0, 1.0]))
 
 
-def test_make_flow_utilities_penalties(
-    tf_inputs: dict[str, tf.Tensor],
-    z_blocks_tf: dict[str, tf.Tensor],
-    inventory_maps_tf,
-    tiny_dims: dict[str, int],
-) -> None:
-    _, _, stockout_mask, at_cap_mask = inventory_maps_tf
+def test_make_flow_utilities_penalties() -> None:
+    """Flow-utility tensors should have correct shapes and boundary penalties."""
+    tiny_dims, tf_inputs, z_blocks_tf, _, maps = _tiny_env()
+    _, _, stockout_mask, at_cap_mask = maps
     theta = sp.unconstrained_to_theta(z_blocks_tf)
 
     u0, u1 = sp.make_flow_utilities(
@@ -100,8 +183,8 @@ def test_make_flow_utilities_penalties(
 
     M, N = tiny_dims["M"], tiny_dims["N"]
     S = int(tf_inputs["price_vals"].shape[0])
-    I_max = tiny_dims["I_max"]
-    I = I_max + 1
+    i_max = int(tiny_dims["I_max"])
+    I = i_max + 1
 
     assert tuple(u0.shape) == (M, N, S, I)
     assert tuple(u1.shape) == (M, N, S, I)
@@ -113,23 +196,23 @@ def test_make_flow_utilities_penalties(
     waste = float(tf_inputs["waste_cost"].numpy())
 
     # u0 = -v * 1{I==0}
-    expected_u0_I0 = np.broadcast_to(-v_np[:, :, None], (M, N, S))
-    np.testing.assert_allclose(u0_np[:, :, :, 0], expected_u0_I0)
+    expected_u0_i0 = np.broadcast_to(-v_np[:, :, None], (M, N, S))
+    np.testing.assert_allclose(u0_np[:, :, :, 0], expected_u0_i0)
 
     # u0 = 0 for I>0
     np.testing.assert_allclose(u0_np[:, :, :, 1:], 0.0)
 
-    # u1 penalty at cap: -waste_cost*(1-lambda_c)*1{I==I_max}
-    diff_cap = u1_np[:, :, :, I_max] - u1_np[:, :, :, I_max - 1]
+    # u1 penalty at cap: -waste_cost*(1-lambda_c)*1{I==i_max}
+    diff_cap = u1_np[:, :, :, i_max] - u1_np[:, :, :, i_max - 1]
     expected_pen = np.broadcast_to(-waste * (1.0 - lam_np)[:, :, None], (M, N, S))
     np.testing.assert_allclose(diff_cap, expected_pen)
 
 
-def test_select_pi_by_state_gathers_correct_state(
-    tiny_dims: dict[str, int],
-) -> None:
-    M, N, S, I_max = tiny_dims["M"], tiny_dims["N"], tiny_dims["S"], tiny_dims["I_max"]
-    I = I_max + 1
+def test_select_pi_by_state_gathers_correct_state() -> None:
+    """`select_pi_by_state` must gather the correct price-state slice per market."""
+    tiny_dims, _, _, _, _ = _tiny_env()
+    M, N, S, i_max = tiny_dims["M"], tiny_dims["N"], tiny_dims["S"], tiny_dims["I_max"]
+    I = i_max + 1
     assert S == 2
 
     # ccp_buy[m,n,0,i]=0.1, ccp_buy[m,n,1,i]=0.9
@@ -142,28 +225,26 @@ def test_select_pi_by_state_gathers_correct_state(
     )
 
     s_mt = tf.constant([0, 1], dtype=tf.int32)  # per-market
-    pi_mnI = sp.select_pi_by_state(ccp_buy, s_mt)
+    pi_mni = sp.select_pi_by_state(ccp_buy, s_mt)
 
-    assert tuple(pi_mnI.shape) == (M, N, I)
-    pi_np = pi_mnI.numpy()
+    assert tuple(pi_mni.shape) == (M, N, I)
+    pi_np = pi_mni.numpy()
 
     np.testing.assert_allclose(pi_np[0, :, :], 0.1)
     np.testing.assert_allclose(pi_np[1, :, :], 0.9)
 
 
-def test_forward_filter_constant_ccp_half_gives_T_log_half(
-    tiny_dims: dict[str, int],
-    tf_inputs: dict[str, tf.Tensor],
-    inventory_maps_tf,
-) -> None:
-    M, N, T, S, I_max = (
+def test_forward_filter_constant_ccp_half_gives_T_log_half() -> None:
+    """With constant CCP=0.5 and all-zero actions, log-likelihood equals T*log(0.5)."""
+    tiny_dims, tf_inputs, _, _, maps = _tiny_env()
+    M, N, T, S, i_max = (
         tiny_dims["M"],
         tiny_dims["N"],
         tiny_dims["T"],
         tiny_dims["S"],
         tiny_dims["I_max"],
     )
-    I = I_max + 1
+    I = i_max + 1
 
     # Constant CCP = 0.5 for all (m,n,s,I)
     ccp_buy = tf.fill([M, N, S, I], tf.constant(0.5, tf.float64))
@@ -178,7 +259,7 @@ def test_forward_filter_constant_ccp_half_gives_T_log_half(
         pi_I0=tf_inputs["pi_I0"],
         lambda_c_mn=tf.fill([M, N], tf.constant(0.3, tf.float64)),
         eps=tf_inputs["eps"],
-        maps=inventory_maps_tf,
+        maps=maps,
     )
 
     assert tuple(ll_mn.shape) == (M, N)
@@ -186,33 +267,31 @@ def test_forward_filter_constant_ccp_half_gives_T_log_half(
     np.testing.assert_allclose(ll_mn.numpy(), expected, rtol=0.0, atol=1e-12)
 
 
-def test_solve_ccp_buy_shape_range_and_monotone_in_price_when_price_is_absorbing(
-    tiny_dims: dict[str, int],
-    tf_inputs: dict[str, tf.Tensor],
-    z_blocks_tf: dict[str, tf.Tensor],
-    inventory_maps_tf,
-) -> None:
+def test_solve_ccp_buy_shape_range_and_monotone_in_price_when_price_is_absorbing() -> (
+    None
+):
     """
-    Use an absorbing price-state transition to remove "current state predicts future states"
-    effects. Then lower current price should weakly increase Pr(buy) for every inventory.
+    With an absorbing price-state transition, the current state does not predict future states.
+    Then a lower current price should weakly increase Pr(buy) for every inventory level.
     """
+    tiny_dims, tf_inputs, z_blocks_tf, _, maps = _tiny_env()
     theta = sp.unconstrained_to_theta(z_blocks_tf)
 
     tol = tf.constant(1.0e-6, tf.float64)
     max_iter = tf.constant(80, tf.int32)
 
     S = int(tf_inputs["price_vals"].shape[0])
-    P_absorb = tf.eye(S, dtype=tf.float64)
+    p_absorb = tf.eye(S, dtype=tf.float64)
 
     ccp_buy = sp.solve_ccp_buy(
         u_m=tf_inputs["u_m"],
         price_vals=tf_inputs["price_vals"],
-        P_price=P_absorb,
+        P_price=p_absorb,
         theta=theta,
         waste_cost=tf_inputs["waste_cost"],
         tol=tol,
         max_iter=max_iter,
-        maps=inventory_maps_tf,
+        maps=maps,
     )
 
     M, N, I = tiny_dims["M"], tiny_dims["N"], tiny_dims["I_max"] + 1
@@ -226,14 +305,9 @@ def test_solve_ccp_buy_shape_range_and_monotone_in_price_when_price_is_absorbing
     assert np.all(ccp_np[:, :, 1, :] >= ccp_np[:, :, 0, :] - 1e-12)
 
 
-def test_loglik_mn_runs_end_to_end_and_is_finite(
-    tiny_dims: dict[str, int],
-    tf_inputs: dict[str, tf.Tensor],
-    z_blocks_tf: dict[str, tf.Tensor],
-    inventory_maps_tf,
-) -> None:
-    tol = tf.constant(1.0e-6, tf.float64)
-    max_iter = tf.constant(60, tf.int32)
+def test_loglik_mn_runs_end_to_end_and_is_finite() -> None:
+    """`loglik_mn` should run end-to-end and return finite (M,N) outputs."""
+    tiny_dims, tf_inputs, z_blocks_tf, _, maps = _tiny_env()
 
     ll_mn = sp.loglik_mn(
         z=z_blocks_tf,
@@ -245,9 +319,9 @@ def test_loglik_mn_runs_end_to_end_and_is_finite(
         pi_I0=tf_inputs["pi_I0"],
         waste_cost=tf_inputs["waste_cost"],
         eps=tf_inputs["eps"],
-        tol=tol,
-        max_iter=max_iter,
-        maps=inventory_maps_tf,
+        tol=tf.constant(1.0e-6, tf.float64),
+        max_iter=tf.constant(60, tf.int32),
+        maps=maps,
     )
 
     M, N = tiny_dims["M"], tiny_dims["N"]
@@ -256,14 +330,13 @@ def test_loglik_mn_runs_end_to_end_and_is_finite(
     assert np.isfinite(ll_np).all()
 
 
-def test_logpost_views_combine_ll_and_prior_correctly_with_patch(
-    tiny_dims: dict[str, int],
-    tf_inputs: dict[str, tf.Tensor],
-    z_blocks_tf: dict[str, tf.Tensor],
-    sigmas: dict[str, float],
-    inventory_maps_tf,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_logpost_views_combine_ll_and_prior_correctly_with_patch() -> None:
+    """
+    The log-posterior "view" functions should equal:
+      loglik_mn(z) + logprior(z_block)   (for MN blocks)
+      sum_n loglik_mn(z)[m,n] + logprior(z_u_scale[m])  (for market block)
+    """
+    tiny_dims, tf_inputs, z_blocks_tf, sigmas, maps = _tiny_env()
     M, N = tiny_dims["M"], tiny_dims["N"]
     sigmas_tf = _sigmas_tf(sigmas)
 
@@ -272,47 +345,45 @@ def test_logpost_views_combine_ll_and_prior_correctly_with_patch(
         [M, N],
     )
 
-    def _fake_loglik_mn(*args, **kwargs):
-        return ll_fake
+    with patch.object(sp, "loglik_mn", return_value=ll_fake):
+        out_beta = sp.logpost_z_beta_mn(
+            z=z_blocks_tf,
+            a_imt=tf_inputs["a_imt"],
+            p_state_mt=tf_inputs["p_state_mt"],
+            u_m=tf_inputs["u_m"],
+            price_vals=tf_inputs["price_vals"],
+            P_price=tf_inputs["P_price"],
+            pi_I0=tf_inputs["pi_I0"],
+            waste_cost=tf_inputs["waste_cost"],
+            eps=tf_inputs["eps"],
+            tol=tf.constant(1.0e-6, tf.float64),
+            max_iter=tf.constant(10, tf.int32),
+            sigmas=sigmas_tf,
+            maps=maps,
+        )
 
-    monkeypatch.setattr(sp, "loglik_mn", _fake_loglik_mn, raising=True)
+        prior_beta = sp.logprior_normal_mn(z_blocks_tf["z_beta"], sigmas_tf["z_beta"])
+        np.testing.assert_allclose(out_beta.numpy(), (ll_fake + prior_beta).numpy())
 
-    out_beta = sp.logpost_z_beta_mn(
-        z=z_blocks_tf,
-        a_imt=tf_inputs["a_imt"],
-        p_state_mt=tf_inputs["p_state_mt"],
-        u_m=tf_inputs["u_m"],
-        price_vals=tf_inputs["price_vals"],
-        P_price=tf_inputs["P_price"],
-        pi_I0=tf_inputs["pi_I0"],
-        waste_cost=tf_inputs["waste_cost"],
-        eps=tf_inputs["eps"],
-        tol=tf.constant(1.0e-6, tf.float64),
-        max_iter=tf.constant(10, tf.int32),
-        sigmas=sigmas_tf,
-        maps=inventory_maps_tf,
-    )
+        out_us = sp.logpost_u_scale_m(
+            z=z_blocks_tf,
+            a_imt=tf_inputs["a_imt"],
+            p_state_mt=tf_inputs["p_state_mt"],
+            u_m=tf_inputs["u_m"],
+            price_vals=tf_inputs["price_vals"],
+            P_price=tf_inputs["P_price"],
+            pi_I0=tf_inputs["pi_I0"],
+            waste_cost=tf_inputs["waste_cost"],
+            eps=tf_inputs["eps"],
+            tol=tf.constant(1.0e-6, tf.float64),
+            max_iter=tf.constant(10, tf.int32),
+            sigmas=sigmas_tf,
+            maps=maps,
+        )
 
-    prior_beta = sp.logprior_normal_mn(z_blocks_tf["z_beta"], sigmas_tf["z_beta"])
-    np.testing.assert_allclose(out_beta.numpy(), (ll_fake + prior_beta).numpy())
-
-    out_us = sp.logpost_u_scale_m(
-        z=z_blocks_tf,
-        a_imt=tf_inputs["a_imt"],
-        p_state_mt=tf_inputs["p_state_mt"],
-        u_m=tf_inputs["u_m"],
-        price_vals=tf_inputs["price_vals"],
-        P_price=tf_inputs["P_price"],
-        pi_I0=tf_inputs["pi_I0"],
-        waste_cost=tf_inputs["waste_cost"],
-        eps=tf_inputs["eps"],
-        tol=tf.constant(1.0e-6, tf.float64),
-        max_iter=tf.constant(10, tf.int32),
-        sigmas=sigmas_tf,
-        maps=inventory_maps_tf,
-    )
-
-    prior_us = sp.logprior_normal_m(z_blocks_tf["z_u_scale"], sigmas_tf["z_u_scale"])
-    np.testing.assert_allclose(
-        out_us.numpy(), (tf.reduce_sum(ll_fake, axis=1) + prior_us).numpy()
-    )
+        prior_us = sp.logprior_normal_m(
+            z_blocks_tf["z_u_scale"], sigmas_tf["z_u_scale"]
+        )
+        np.testing.assert_allclose(
+            out_us.numpy(), (tf.reduce_sum(ll_fake, axis=1) + prior_us).numpy()
+        )

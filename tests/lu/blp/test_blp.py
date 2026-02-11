@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from conftest import assert_finite_np
+from lu_conftest import assert_finite_np, fixed_draws, make_feasible_shares
 from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
 
 # -----------------------------------------------------------------------------
