@@ -19,6 +19,8 @@ import os
 
 import numpy as np
 
+import tensorflow as tf
+
 # Keep TF logs quiet for upstream modules that may import TF internally.
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -30,11 +32,17 @@ from run_zhang_with_lu import (
     run_market_shock_estimator,
 )
 from ching.stockpiling_estimator import StockpilingEstimator
+
 from ching.stockpiling_evaluate import (
     evaluate_stockpiling,
     format_evaluation_summary,
-    myopic_buy_probabilities,
 )
+
+from ching.stockpiling_model import (
+    build_inventory_maps,
+    predict_p_buy_imt_from_theta,
+)
+
 
 # =============================================================================
 # Phase 1: baseline choice model hyperparameters
@@ -105,14 +113,14 @@ stock_eps = 1e-12
 
 # MCMC config (formerly mcmc dict); keep k and sigmas as dicts
 mcmc_seed = 0
-mcmc_n_iter = 30
+mcmc_n_iter = 20
 
 k = {
-    "beta": 1,
-    "alpha": 0.7,
-    "v": 1,
-    "fc": 0.7,
-    "lambda": 1,
+    "beta": 0.5,
+    "alpha": 0.35,
+    "v": 0.5,
+    "fc": 0.35,
+    "lambda": 0.5,
     "u_scale": 0.05,
 }
 
@@ -342,25 +350,60 @@ def main() -> None:
         u_m=u_m_true,
     )
 
-    # Cheap, presentation-friendly predictive probabilities (no DP/filtering).
-    p_buy_hat_imt = myopic_buy_probabilities(
-        a_imt=a_imt,
-        p_state_mt=p_state_mt,
-        u_m=u_m_true,
-        price_vals=stock_price_vals,
-        theta=res3["theta_hat"],
-        assume_stockout=True,
-    )
+    # Model-consistent predictive probabilities (DP + forward filter over latent inventory).
+    maps = build_inventory_maps(tf.constant(stock_I_max, dtype=tf.int32))
 
-    # Optional oracle probabilities using theta_true (u_scale defaults to 1 if missing).
-    p_buy_oracle_imt = myopic_buy_probabilities(
-        a_imt=a_imt,
-        p_state_mt=p_state_mt,
-        u_m=u_m_true,
-        price_vals=stock_price_vals,
-        theta=theta_true,
-        assume_stockout=True,
-    )
+    a_tf = tf.convert_to_tensor(a_imt)  # (M,N,T)
+    p_state_tf = tf.convert_to_tensor(p_state_mt, dtype=tf.int32)  # (M,T)
+    u_m_tf = tf.convert_to_tensor(u_m_true, dtype=tf.float64)  # (M,)
+
+    price_vals_tf = tf.convert_to_tensor(stock_price_vals, dtype=tf.float64)  # (S,)
+    P_price_tf = tf.convert_to_tensor(stock_P_price, dtype=tf.float64)  # (S,S)
+    pi_I0_tf = tf.convert_to_tensor(
+        _uniform_pi_I0(stock_I_max), dtype=tf.float64
+    )  # (I,)
+    waste_cost_tf = tf.constant(stock_waste_cost, dtype=tf.float64)
+    eps_tf = tf.constant(stock_eps, dtype=tf.float64)
+    tol_tf = tf.constant(stock_dp_tol, dtype=tf.float64)
+    max_iter_tf = tf.constant(stock_dp_max_iter, dtype=tf.int32)
+
+    def _theta_to_tf(theta_np: dict[str, np.ndarray]) -> dict[str, tf.Tensor]:
+        return {
+            k: tf.convert_to_tensor(v, dtype=tf.float64) for k, v in theta_np.items()
+        }
+
+    theta_hat_tf = _theta_to_tf(res3["theta_hat"])
+    theta_true_tf = _theta_to_tf(theta_true)
+
+    p_buy_hat_imt = predict_p_buy_imt_from_theta(
+        theta=theta_hat_tf,
+        a_imt=a_tf,
+        p_state_mt=p_state_tf,
+        u_m=u_m_tf,
+        price_vals=price_vals_tf,
+        P_price=P_price_tf,
+        pi_I0=pi_I0_tf,
+        waste_cost=waste_cost_tf,
+        eps=eps_tf,
+        tol=tol_tf,
+        max_iter=max_iter_tf,
+        maps=maps,
+    ).numpy()
+
+    p_buy_oracle_imt = predict_p_buy_imt_from_theta(
+        theta=theta_true_tf,
+        a_imt=a_tf,
+        p_state_mt=p_state_tf,
+        u_m=u_m_tf,
+        price_vals=price_vals_tf,
+        P_price=P_price_tf,
+        pi_I0=pi_I0_tf,
+        waste_cost=waste_cost_tf,
+        eps=eps_tf,
+        tol=tol_tf,
+        max_iter=max_iter_tf,
+        maps=maps,
+    ).numpy()
 
     eval_out = evaluate_stockpiling(
         a_imt=a_imt,

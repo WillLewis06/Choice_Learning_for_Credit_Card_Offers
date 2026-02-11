@@ -37,8 +37,8 @@ from ching.stockpiling_input_validation import (
     validate_stockpiling_estimator_fit_inputs,
     validate_stockpiling_estimator_init_inputs,
 )
+from ching.stockpiling_model import build_inventory_maps
 from ching.stockpiling_posterior import (
-    build_inventory_maps,
     logpost_u_scale_m,
     logpost_z_alpha_mn,
     logpost_z_beta_mn,

@@ -1,23 +1,32 @@
 """
 datasets/bonus2_dgp.py
 
-Bonus Question 2 DGP: habit formation + peer effects + time features + market features
-layered on top of fixed Phase-1 baseline utilities (Zhang feature-based model outputs).
+Bonus Question 2 DGP (current):
 
-This module does NOT run Phase 1. It assumes Phase-1 baseline utilities are provided as
-an input array `delta` of shape (M, J), fixed over time within each market.
+Inputs from Phase 1:
+- Fixed product set and fixed baseline utilities delta_{m,j} (provided as input).
+
+Within each market:
+- Habit formation (per consumer-product).
+- Peer effects via a sparse social network (lagged neighbor choices).
+- Time effects:
+    (i) consumer-specific day-of-week effects (7 values per consumer),
+    (ii) mean-zero seasonal sinusoid.
+- Fixed market features x_m (constant over time).
 
 True DGP (no alpha):
   v_{m,i,j,t} = delta_{m,j}
                + beta_habit  * H_{m,i,j,t}
                + beta_peer   * P_{m,i,j,t}
-               + beta_time^T   c_t
-               + beta_market^T x_{m,t}
+               + beta_dow_{m,i, dow(t)}
+               + beta_season * s_t
+               + beta_market^T x_m
   v_{m,i,0,t} = 0  (outside option)
 
-Choices y_{m,i,t} are sampled via multinomial logit with outside option.
-Peer exposure uses lagged neighbor choices (t-1).
-Habit stock is a decaying count of past purchases of each product.
+Network degrees:
+- For each consumer i, sample K_i ~ Normal(avg_friends, friends_sd^2), round to int,
+  clip to [0, N-1]. Sample K_i distinct neighbors uniformly from {0..N-1}\{i}.
+  Weights are uniform 1/K_i when K_i > 0.
 """
 
 from __future__ import annotations
@@ -37,143 +46,164 @@ def make_rng(seed):
     Returns
     -------
     rng : np.random.Generator
+        Random generator.
     """
     return np.random.default_rng(seed)
 
 
-def generate_time_features(T, kind="dow+season", season_period=28):
+def generate_time_features(T, season_period=28):
     """
-    Generate deterministic time features c_t shared across markets.
+    Generate observed time features known to the estimator.
 
-    Minimal default:
-      - day-of-week one-hot (7 dims) using t mod 7
-      - seasonality sin/cos with fixed period (2 dims), optional
+    Two features:
+      - dow_t: day-of-week index in {0..6}, where dow_t = t % 7
+      - s_t: mean-zero seasonal sinusoid sin(2π t / P)
 
     Parameters
     ----------
     T : int
         Number of time steps.
-    kind : str
-        "dow" or "dow+season".
     season_period : int
-        Period for seasonality (used when kind includes "season").
+        Period P for the sinusoid (must be positive).
 
     Returns
     -------
-    c : np.ndarray
-        Array of shape (T, d_c).
+    dow : np.ndarray
+        Day-of-week index, shape (T,), dtype int64.
+    s : np.ndarray
+        Seasonal sinusoid, shape (T,), dtype float64.
     """
-    t = np.arange(T, dtype=np.int64)
-
-    if kind not in ("dow", "dow+season"):
-        raise ValueError(f"Unknown kind={kind!r}. Expected 'dow' or 'dow+season'.")
-
-    # Day-of-week one-hot
-    dow = (t % 7).astype(np.int64)
-    c_dow = np.zeros((T, 7), dtype=np.float64)
-    c_dow[np.arange(T), dow] = 1.0
-
-    if kind == "dow":
-        return c_dow
-
-    # Seasonality (sin/cos) with a fixed period
+    if T <= 0:
+        raise ValueError("T must be positive.")
     if season_period is None or season_period <= 0:
-        raise ValueError(
-            "season_period must be a positive integer when using 'dow+season'."
-        )
+        raise ValueError("season_period must be a positive integer.")
+
+    t = np.arange(T, dtype=np.int64)
+    dow = (t % 7).astype(np.int64)
 
     ang = 2.0 * np.pi * (t.astype(np.float64) / float(season_period))
-    c_season = np.column_stack([np.sin(ang), np.cos(ang)]).astype(np.float64)
+    s = np.sin(ang).astype(np.float64)
 
-    return np.concatenate([c_dow, c_season], axis=1)
+    return dow, s
 
 
-def generate_market_features(M, T, d_x, rng, ar1_rho=0.0, ar1_sigma=1.0):
+def generate_market_features(M, d_x, rng):
     """
-    Generate market covariates x_{m,t} independently across markets.
-
-    If ar1_rho == 0, features are i.i.d. N(0, ar1_sigma^2).
-    Else, each dimension follows AR(1):
-      x_t = ar1_rho * x_{t-1} + ar1_sigma * eps_t, eps_t ~ N(0, I)
+    Generate fixed market features x_m that do not vary over time.
 
     Parameters
     ----------
     M : int
         Number of markets.
-    T : int
-        Number of time steps.
     d_x : int
-        Number of market features.
+        Dimension of market features (>= 0).
     rng : np.random.Generator
         Random generator.
-    ar1_rho : float
-        AR(1) coefficient.
-    ar1_sigma : float
-        Innovation scale.
 
     Returns
     -------
     x : np.ndarray
-        Array of shape (M, T, d_x).
+        Market features, shape (M, d_x), dtype float64.
     """
-    x = np.zeros((M, T, d_x), dtype=np.float64)
-
-    if ar1_rho == 0.0:
-        x[:] = rng.normal(loc=0.0, scale=ar1_sigma, size=(M, T, d_x))
-        return x
-
-    eps = rng.normal(loc=0.0, scale=ar1_sigma, size=(M, T, d_x))
-    x[:, 0, :] = eps[:, 0, :]
-    for t in range(1, T):
-        x[:, t, :] = ar1_rho * x[:, t - 1, :] + eps[:, t, :]
-    return x
+    if M <= 0:
+        raise ValueError("M must be positive.")
+    if d_x < 0:
+        raise ValueError("d_x must be >= 0.")
+    if d_x == 0:
+        return np.zeros((M, 0), dtype=np.float64)
+    return rng.normal(loc=0.0, scale=1.0, size=(M, d_x)).astype(np.float64)
 
 
-def generate_sparse_network(N, expected_degree, rng):
+def generate_consumer_dow_effects(N, rng, sd=0.5):
     """
-    Generate a sparse within-market social network in adjacency-list form.
+    Generate consumer-specific day-of-week effects beta_dow_i[d] for d=0..6.
 
-    Minimal choice: fixed-K neighbors per node, sampled uniformly without replacement.
-    Weights are uniform 1/K per row.
+    Effects are independent across consumers and across days:
+      beta_dow_i[d] ~ Normal(0, sd^2)
 
     Parameters
     ----------
     N : int
-        Number of consumers in the market.
-    expected_degree : int
-        Number of neighbors per node (K). Clipped to [0, N-1].
+        Number of consumers.
+    rng : np.random.Generator
+        Random generator.
+    sd : float
+        Standard deviation of day-of-week effects.
+
+    Returns
+    -------
+    beta_dow : np.ndarray
+        Consumer-specific day-of-week effects, shape (N, 7), dtype float64.
+    """
+    if N <= 0:
+        raise ValueError("N must be positive.")
+    if sd < 0.0:
+        raise ValueError("sd must be >= 0.")
+    if sd == 0.0:
+        return np.zeros((N, 7), dtype=np.float64)
+    return rng.normal(loc=0.0, scale=sd, size=(N, 7)).astype(np.float64)
+
+
+def generate_sparse_network(N, avg_friends, friends_sd, rng):
+    """
+    Generate a sparse within-market social network in adjacency-list form, with
+    heterogeneous degree per consumer.
+
+    For each consumer i:
+      K_i ~ Normal(avg_friends, friends_sd^2), rounded to int and clipped to [0, N-1].
+      Sample K_i distinct neighbors uniformly from {0..N-1} \\ {i}.
+      Assign weights uniformly 1/K_i when K_i > 0.
+
+    This yields a directed network: i listing k as a neighbor does not imply k lists i.
+
+    Parameters
+    ----------
+    N : int
+        Number of consumers.
+    avg_friends : float
+        Mean number of friends.
+    friends_sd : float
+        Standard deviation for number of friends (>= 0).
     rng : np.random.Generator
         Random generator.
 
     Returns
     -------
-    nbrs : np.ndarray
-        Neighbor indices of shape (N, K), dtype int64.
-    wts : np.ndarray
-        Row-normalized weights of shape (N, K), dtype float64.
+    nbrs : list[np.ndarray]
+        Length N. nbrs[i] has shape (K_i,) with neighbor indices (int64).
+    wts : list[np.ndarray]
+        Length N. wts[i] has shape (K_i,) with weights summing to 1 when K_i>0 (float64).
     """
     if N <= 0:
         raise ValueError("N must be positive.")
-    K = int(expected_degree)
-    if K < 0:
-        raise ValueError("expected_degree must be >= 0.")
-    K = min(K, max(0, N - 1))
+    if friends_sd < 0.0:
+        raise ValueError("friends_sd must be >= 0.")
 
-    nbrs = np.zeros((N, K), dtype=np.int64)
-    wts = np.zeros((N, K), dtype=np.float64)
+    mu = float(avg_friends)
+    sd = float(friends_sd)
 
-    if K == 0:
-        return nbrs, wts
+    nbrs = []
+    wts = []
 
     for i in range(N):
-        # Candidates exclude self i
-        candidates = np.arange(N, dtype=np.int64)
-        if N > 1:
-            candidates = np.concatenate([candidates[:i], candidates[i + 1 :]])
-        chosen = rng.choice(candidates, size=K, replace=False)
-        nbrs[i, :] = chosen
+        k = int(np.rint(rng.normal(loc=mu, scale=sd)))
+        if k < 0:
+            k = 0
+        if k > N - 1:
+            k = N - 1
 
-    wts[:] = 1.0 / float(K)
+        if k == 0:
+            nbrs.append(np.zeros(0, dtype=np.int64))
+            wts.append(np.zeros(0, dtype=np.float64))
+            continue
+
+        candidates = np.arange(N, dtype=np.int64)
+        candidates = np.concatenate([candidates[:i], candidates[i + 1 :]])
+        chosen = rng.choice(candidates, size=k, replace=False)
+
+        nbrs.append(chosen.astype(np.int64))
+        wts.append(np.full(k, 1.0 / float(k), dtype=np.float64))
+
     return nbrs, wts
 
 
@@ -181,57 +211,60 @@ def peer_exposure_from_prev_choice(y_prev, nbrs, wts, J):
     """
     Compute lagged peer exposure P_{i,j} from neighbors' previous choices.
 
-    P[i, j-1] = sum_k wts[i,k] * 1{ y_prev[nbrs[i,k]] == j }, for j=1..J
+    For j=1..J:
+      P[i, j-1] = sum_k wts[i][k] * 1{ y_prev[nbrs[i][k]] == j }
     Outside option (0) contributes nothing.
 
     Parameters
     ----------
     y_prev : np.ndarray
         Previous choices, shape (N,), ints in {0..J}.
-    nbrs : np.ndarray
-        Neighbor indices, shape (N, K).
-    wts : np.ndarray
-        Neighbor weights, shape (N, K).
+    nbrs : list[np.ndarray]
+        Neighbors; nbrs[i] has shape (K_i,).
+    wts : list[np.ndarray]
+        Weights; wts[i] has shape (K_i,).
     J : int
         Number of inside products.
 
     Returns
     -------
     P : np.ndarray
-        Peer exposure, shape (N, J).
+        Peer exposure, shape (N, J), dtype float64.
     """
-    N = y_prev.shape[0]
-    K = nbrs.shape[1]
+    N = int(y_prev.shape[0])
     P = np.zeros((N, J), dtype=np.float64)
 
-    if K == 0 or J == 0:
+    if J == 0:
         return P
 
     for i in range(N):
-        for k in range(K):
-            nb = nbrs[i, k]
+        ni = nbrs[i]
+        wi = wts[i]
+        for k in range(int(ni.shape[0])):
+            nb = int(ni[k])
             y_nb = int(y_prev[nb])
             if y_nb > 0:
-                # map product id j in {1..J} to column j-1
-                P[i, y_nb - 1] += wts[i, k]
+                P[i, y_nb - 1] += float(wi[k])
+
     return P
 
 
 def sample_mnl(v, rng):
     """
-    Sample multinomial logit choices with an outside option of utility 0.
+    Sample multinomial logit choices with an outside option utility fixed at 0.
 
     Parameters
     ----------
     v : np.ndarray
         Inside-option utilities, shape (N, J).
     rng : np.random.Generator
+        Random generator.
 
     Returns
     -------
     y : np.ndarray
         Choices, shape (N,), ints in {0..J}.
-        0 denotes outside option.
+        0 denotes the outside option.
     """
     N, J = v.shape
     y = np.zeros(N, dtype=np.int64)
@@ -239,60 +272,73 @@ def sample_mnl(v, rng):
     if J == 0:
         return y
 
-    # Stable computation: subtract row max.
-    vmax = np.max(v, axis=1)  # shape (N,)
-    ev = np.exp(v - vmax[:, None])  # shape (N, J)
-    e0 = np.exp(-vmax)  # outside utility 0 shifted by -vmax
-    denom = e0 + np.sum(ev, axis=1)  # shape (N,)
+    vmax_inside = np.max(v, axis=1)
+    shift = np.maximum(0.0, vmax_inside)
 
-    # Probabilities for inside options
-    p_inside = ev / denom[:, None]  # shape (N, J)
-    p0 = e0 / denom  # shape (N,)
+    ev = np.exp(v - shift[:, None])
+    e0 = np.exp(-shift)
+    denom = e0 + np.sum(ev, axis=1)
 
-    # Sample via cumulative probabilities (minimal, readable loop)
+    p0 = e0 / denom
+    p_inside = ev / denom[:, None]
+
     for i in range(N):
         u = rng.random()
         cum = p0[i]
         if u < cum:
             y[i] = 0
             continue
-        # Inside options: assign smallest j such that u < p0 + sum_{r<=j} p_r
         for j in range(J):
             cum += p_inside[i, j]
             if u < cum:
                 y[i] = j + 1
                 break
-        # If due to numeric drift no break, choose last inside option
         if y[i] == 0:
             y[i] = J
+
     return y
 
 
-def simulate_market_panel(delta_mj, x_t, c_t, nbrs, wts, params, rng):
+def simulate_market_panel(
+    delta_mj, x_m, dow_t, s_t, beta_dow_i, nbrs, wts, params, rng
+):
     """
-    Simulate one market panel y_{i,t} for i=1..N, t=1..T.
+    Simulate one market panel y_{i,t} given fixed baseline utilities and network.
+
+    Implements:
+      v_{i,j,t} = delta_j
+                  + beta_habit  * H_{i,j,t}
+                  + beta_peer   * P_{i,j,t}
+                  + beta_dow_i[ dow_t[t] ]
+                  + beta_season * s_t[t]
+                  + beta_market^T x_m
+      v_{i,0,t} = 0
 
     Parameters
     ----------
     delta_mj : np.ndarray
-        Baseline utilities from Phase 1 for this market, shape (J,).
-        Fixed over time in this DGP.
-    x_t : np.ndarray
-        Market features for this market, shape (T, d_x).
-    c_t : np.ndarray
-        Time features shared across markets, shape (T, d_c).
-    nbrs : np.ndarray
-        Neighbor indices, shape (N, K).
-    wts : np.ndarray
-        Neighbor weights, shape (N, K).
+        Baseline utilities for this market, shape (J,).
+    x_m : np.ndarray
+        Fixed market features, shape (d_x,).
+    dow_t : np.ndarray
+        Day-of-week indices, shape (T,), ints in {0..6}.
+    s_t : np.ndarray
+        Seasonal sinusoid, shape (T,), float.
+    beta_dow_i : np.ndarray
+        Consumer-specific day-of-week effects, shape (N, 7).
+    nbrs : list[np.ndarray]
+        Neighbor lists; length N.
+    wts : list[np.ndarray]
+        Weight lists; length N.
     params : dict
         True parameters:
           - beta_habit : float
           - beta_peer : float
-          - beta_time : np.ndarray shape (d_c,)
+          - beta_season : float
           - beta_market : np.ndarray shape (d_x,)
           - rho_h : float in (0, 1]
     rng : np.random.Generator
+        Random generator.
 
     Returns
     -------
@@ -300,49 +346,55 @@ def simulate_market_panel(delta_mj, x_t, c_t, nbrs, wts, params, rng):
         Simulated choices, shape (N, T), ints in {0..J}.
     """
     delta_mj = np.asarray(delta_mj, dtype=np.float64)
-    x_t = np.asarray(x_t, dtype=np.float64)
-    c_t = np.asarray(c_t, dtype=np.float64)
+    x_m = np.asarray(x_m, dtype=np.float64)
+    dow_t = np.asarray(dow_t, dtype=np.int64)
+    s_t = np.asarray(s_t, dtype=np.float64)
+    beta_dow_i = np.asarray(beta_dow_i, dtype=np.float64)
 
     J = int(delta_mj.shape[0])
-    T = int(x_t.shape[0])
-    N = int(nbrs.shape[0])
+    T = int(dow_t.shape[0])
+    N = len(nbrs)
+
+    if s_t.shape[0] != T:
+        raise ValueError("dow_t and s_t must have the same length.")
+    if beta_dow_i.shape != (N, 7):
+        raise ValueError("beta_dow_i must have shape (N, 7).")
+    if len(wts) != N:
+        raise ValueError("nbrs and wts must have the same length.")
 
     beta_habit = float(params["beta_habit"])
     beta_peer = float(params["beta_peer"])
-    beta_time = np.asarray(params["beta_time"], dtype=np.float64)
+    beta_season = float(params["beta_season"])
     beta_market = np.asarray(params["beta_market"], dtype=np.float64)
     rho_h = float(params["rho_h"])
 
     if not (0.0 < rho_h <= 1.0):
         raise ValueError("rho_h must be in (0, 1].")
-    if beta_time.shape[0] != c_t.shape[1]:
-        raise ValueError("beta_time length must match c_t second dimension.")
-    if beta_market.shape[0] != x_t.shape[1]:
-        raise ValueError("beta_market length must match x_t second dimension.")
+    if beta_market.shape[0] != x_m.shape[0]:
+        raise ValueError("beta_market length must match x_m length.")
+
+    market_shift = float(beta_market @ x_m)
 
     y_it = np.zeros((N, T), dtype=np.int64)
-
-    # Habit stock H[i, j] for j=1..J stored as column j-1
     H = np.zeros((N, J), dtype=np.float64)
-
-    # Previous choices for lagged peer exposure; start at outside
     y_prev = np.zeros(N, dtype=np.int64)
-
     decay = 1.0 - rho_h
 
     for t in range(T):
-        # Peer exposure from previous time step
         P = peer_exposure_from_prev_choice(y_prev, nbrs, wts, J)
 
-        # Scalars that shift all inside options equally at time t
-        time_shift = float(beta_time @ c_t[t])
-        market_shift = float(beta_market @ x_t[t])
+        dow_idx = int(dow_t[t])
+        if dow_idx < 0 or dow_idx > 6:
+            raise ValueError("dow_t must contain only values in {0..6}.")
+        dow_shift = beta_dow_i[:, dow_idx]  # shape (N,)
 
-        # Deterministic inside utilities (true DGP; no alpha)
+        time_shift = beta_season * float(s_t[t])
+
         v = (
             delta_mj[None, :]
             + beta_habit * H
             + beta_peer * P
+            + dow_shift[:, None]
             + time_shift
             + market_shift
         )
@@ -350,7 +402,6 @@ def simulate_market_panel(delta_mj, x_t, c_t, nbrs, wts, params, rng):
         y = sample_mnl(v, rng)
         y_it[:, t] = y
 
-        # Habit update: decay then add 1 to chosen inside option
         if decay != 0.0:
             H *= decay
 
@@ -369,84 +420,115 @@ def simulate_bonus2_dgp(
     N,
     T,
     d_x,
-    expected_degree,
+    avg_friends,
     params_true,
     seed=None,
-    time_kind="dow+season",
     season_period=28,
-    ar1_rho=0.0,
-    ar1_sigma=1.0,
+    friends_sd=2.0,
 ):
     """
-    Simulate multi-market Bonus Q2 data with fixed Phase-1 baseline utilities.
+    Simulate multi-market data for the Bonus Q2 true model.
+
+    Notes:
+    - delta is fixed from Phase 1 and time-invariant.
+    - x_m is fixed per market (known to estimator).
+    - dow_t and s_t are known to the estimator.
+    - beta_dow_{m,i,d} is consumer-specific and independent across i and d in the DGP.
+    - Social network degrees K_i are sampled from Normal(avg_friends, friends_sd^2) and clipped.
 
     Parameters
     ----------
     delta : np.ndarray
-        Baseline utilities from Phase 1, shape (M, J). Fixed over time.
+        Phase-1 baseline utilities, shape (M, J). Fixed over time.
     N : int
-        Number of consumers per market (constant across markets in this minimal implementation).
+        Number of consumers per market (constant across markets).
     T : int
         Number of time steps.
     d_x : int
-        Market feature dimension.
-    expected_degree : int
-        Fixed number of neighbors per consumer in each market graph.
+        Market feature dimension (fixed features per market).
+    avg_friends : float
+        Mean number of friends per consumer (Normal mean for K_i).
     params_true : dict
-        True parameters (see simulate_market_panel).
+        True model parameters:
+          - beta_habit : float
+          - beta_peer : float
+          - beta_season : float
+          - beta_market : np.ndarray shape (d_x,)
+          - rho_h : float in (0, 1]
+        Optional DGP-only:
+          - beta_dow_sd : float (default 0.5)
     seed : int | None
         Random seed.
-    time_kind : str
-        "dow" or "dow+season".
     season_period : int
-        Period for seasonality if used.
-    ar1_rho : float
-        AR(1) coefficient for market features; 0.0 means i.i.d.
-    ar1_sigma : float
-        Innovation scale for market features.
+        Period for seasonal sinusoid s_t.
+    friends_sd : float
+        Std dev for number of friends (Normal sd), >= 0.
 
     Returns
     -------
     out : dict
         Keys:
           - y : np.ndarray shape (M, N, T), ints in {0..J}
-          - delta : np.ndarray shape (M, J)
-          - x : np.ndarray shape (M, T, d_x)
-          - c : np.ndarray shape (T, d_c)
-          - nbrs : list of np.ndarray, each shape (N, K)
-          - wts : list of np.ndarray, each shape (N, K)
+          - delta : np.ndarray shape (M, J) (echo)
+          - x : np.ndarray shape (M, d_x) fixed market features
+          - dow : np.ndarray shape (T,) day-of-week indices
+          - s : np.ndarray shape (T,) seasonal sinusoid
+          - beta_dow : np.ndarray shape (M, N, 7) consumer-specific dow effects
+          - nbrs : list (len M) of list (len N) of neighbor index arrays
+          - wts : list (len M) of list (len N) of neighbor weight arrays
           - params_true : dict (echo)
     """
     delta = np.asarray(delta, dtype=np.float64)
     if delta.ndim != 2:
         raise ValueError("delta must have shape (M, J).")
     M, J = delta.shape
-    if J <= 0:
-        raise ValueError("J must be positive.")
-    if N <= 0 or T <= 0 or d_x < 0:
-        raise ValueError("N and T must be positive; d_x must be >= 0.")
+    if M <= 0 or J <= 0:
+        raise ValueError("delta must have positive shape (M, J).")
+    if N <= 0:
+        raise ValueError("N must be positive.")
+    if T <= 0:
+        raise ValueError("T must be positive.")
+    if d_x < 0:
+        raise ValueError("d_x must be >= 0.")
 
     rng = make_rng(seed)
 
-    c = generate_time_features(T, time_kind, season_period)
-    x = generate_market_features(M, T, d_x, rng, ar1_rho, ar1_sigma)
+    dow, s = generate_time_features(T, season_period)
+    x = generate_market_features(M, d_x, rng)
+
+    beta_dow_sd = float(params_true.get("beta_dow_sd", 0.5))
+    beta_dow = np.zeros((M, N, 7), dtype=np.float64)
+    for m in range(M):
+        beta_dow[m] = generate_consumer_dow_effects(N, rng, beta_dow_sd)
 
     y = np.zeros((M, N, T), dtype=np.int64)
     nbrs_list = []
     wts_list = []
 
     for m in range(M):
-        nbrs, wts = generate_sparse_network(N, expected_degree, rng)
+        nbrs, wts = generate_sparse_network(N, avg_friends, friends_sd, rng)
         nbrs_list.append(nbrs)
         wts_list.append(wts)
 
-        y[m] = simulate_market_panel(delta[m], x[m], c, nbrs, wts, params_true, rng)
+        y[m] = simulate_market_panel(
+            delta[m],
+            x[m],
+            dow,
+            s,
+            beta_dow[m],
+            nbrs,
+            wts,
+            params_true,
+            rng,
+        )
 
     return {
         "y": y,
         "delta": delta,
         "x": x,
-        "c": c,
+        "dow": dow,
+        "s": s,
+        "beta_dow": beta_dow,
         "nbrs": nbrs_list,
         "wts": wts_list,
         "params_true": params_true,

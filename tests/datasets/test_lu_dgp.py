@@ -1,22 +1,33 @@
 import numpy as np
 import pytest
 
-from conftest import assert_finite_np
-
 from datasets.lu_dgp import (
-    generate_market_conditions,
     BasicLuChoiceModel,
     _generate_market_shares,
     generate_market,
+    generate_market_conditions,
 )
 
 
 # -----------------------------------------------------------------------------
 # Local deterministic helpers (NumPy-only)
 # -----------------------------------------------------------------------------
-def _assert_prob_simplex(
-    sjt: np.ndarray, s0t: np.ndarray, *, atol: float = 1e-12
-) -> None:
+def assert_finite_np(x: np.ndarray, name: str = "array") -> None:
+    """
+    Assert that a NumPy array contains only finite values.
+
+    This is defined locally to keep this test module independent of pytest's
+    conftest mechanism.
+    """
+    x = np.asarray(x)
+    ok = np.isfinite(x)
+    if not np.all(ok):
+        idx = np.argwhere(~ok)
+        preview = idx[:5].tolist()
+        raise AssertionError(f"{name} contains non-finite values at indices {preview}.")
+
+
+def _assert_prob_simplex(sjt: np.ndarray, s0t: np.ndarray, atol: float = 1e-12) -> None:
     """
     sjt: (T,J), s0t: (T,)
     Checks: finite, bounds, and s0t + sum_j sjt == 1 marketwise.
