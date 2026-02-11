@@ -1,67 +1,61 @@
-# tests/test_cl_tuning.py
+"""
+Unit tests for lu.choice_learn.cl_tuning.
+
+Constraints for this test module
+- No pytest fixture injection: all tests are plain functions with no fixture args.
+- Shared assertion helpers are imported from `lu_conftest` (a normal Python module).
+- Patching uses unittest.mock.patch (not the pytest monkeypatch fixture).
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import tensorflow as tf
 
-from conftest import assert_all_finite_tf
 import lu.choice_learn.cl_tuning as cl_tuning
 from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageEstimator
+from lu_conftest import assert_all_finite_tf
+
+DTYPE = tf.float64
 
 
 # -----------------------------------------------------------------------------
 # Helpers (test-only)
 # -----------------------------------------------------------------------------
-def _assert_scalar_positive(x: tf.Tensor) -> None:
-    x = tf.convert_to_tensor(x, dtype=tf.float64)
-    assert x.shape == ()
-    assert_all_finite_tf(x)
-    assert float(x.numpy()) > 0.0
-
-
-def _snapshot_state(shrink: ChoiceLearnShrinkageEstimator) -> dict:
-    return {
-        "alpha": float(shrink.alpha.read_value().numpy()),
-        "E_bar": shrink.E_bar.read_value().numpy().copy(),
-        "njt": shrink.njt.read_value().numpy().copy(),
-        "gamma": shrink.gamma.read_value().numpy().copy(),
-        "phi": shrink.phi.read_value().numpy().copy(),
-    }
-
-
-def _assert_state_unchanged(before: dict, after: dict) -> None:
-    assert before["alpha"] == after["alpha"]
-    assert np.allclose(before["E_bar"], after["E_bar"], atol=0.0, rtol=0.0)
-    assert np.allclose(before["njt"], after["njt"], atol=0.0, rtol=0.0)
-    assert np.array_equal(before["gamma"], after["gamma"])
-    assert np.allclose(before["phi"], after["phi"], atol=0.0, rtol=0.0)
-
-
-def _build_shrink(
-    tiny_market_data: dict, *, seed: int = 123
-) -> ChoiceLearnShrinkageEstimator:
+def _tiny_cl_data_np(seed: int = 0) -> dict:
     """
-    Build a tiny ChoiceLearnShrinkageEstimator.
+    Tiny (T=2, J=3) choice-learn panel for tuning tests.
 
-    Expects the ChoiceLearn conftest schema:
-      - delta_cl: (T,J)
-      - qjt: (T,J)
-      - q0t: (T,)
+    Keys
+    - delta_cl: (T,J) np.float64
+    - qjt: (T,J) np.float64
+    - q0t: (T,) np.float64
     """
-    delta_cl = np.asarray(tiny_market_data["delta_cl"], dtype=np.float64)
-    qjt = np.asarray(tiny_market_data["qjt"], dtype=np.float64)
-    q0t = np.asarray(tiny_market_data["q0t"], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    T, J = 2, 3
 
+    delta_cl = rng.normal(size=(T, J)).astype(np.float64)
+    qjt = rng.integers(low=1, high=15, size=(T, J)).astype(np.float64)
+    q0t = rng.integers(low=5, high=25, size=(T,)).astype(np.float64)
+
+    return {"T": T, "J": J, "delta_cl": delta_cl, "qjt": qjt, "q0t": q0t}
+
+
+def _build_shrink(tiny_data: dict, seed: int = 123) -> ChoiceLearnShrinkageEstimator:
     return ChoiceLearnShrinkageEstimator(
-        delta_cl=delta_cl,
-        qjt=qjt,
-        q0t=q0t,
+        delta_cl=tiny_data["delta_cl"],
+        qjt=tiny_data["qjt"],
+        q0t=tiny_data["q0t"],
         seed=seed,
     )
 
 
 def _set_tuning_params(
     shrink: ChoiceLearnShrinkageEstimator,
-    *,
     pilot_length: int = 1,
     ridge: float = 1e-6,
     target_low: float = 0.3,
@@ -79,41 +73,93 @@ def _set_tuning_params(
     shrink.factor_tmh = factor_tmh
 
 
-def _patch_updates(monkeypatch, *, accept_all: bool) -> None:
+def _assert_scalar_positive(x: tf.Tensor) -> None:
+    x_t = tf.convert_to_tensor(x, dtype=DTYPE)
+    assert x_t.shape == ()
+    assert_all_finite_tf(x_t)
+    assert float(x_t.numpy()) > 0.0
+
+
+def _snapshot_state(shrink: ChoiceLearnShrinkageEstimator) -> dict:
+    return {
+        "alpha": float(shrink.alpha.read_value().numpy()),
+        "E_bar": shrink.E_bar.read_value().numpy().copy(),
+        "njt": shrink.njt.read_value().numpy().copy(),
+        "gamma": shrink.gamma.read_value().numpy().copy(),
+        "phi": shrink.phi.read_value().numpy().copy(),
+    }
+
+
+def _assert_state_unchanged(before: dict, after: dict) -> None:
+    assert before["alpha"] == after["alpha"]
+    assert np.array_equal(before["E_bar"], after["E_bar"])
+    assert np.array_equal(before["njt"], after["njt"])
+    assert np.array_equal(before["gamma"], after["gamma"])
+    assert np.array_equal(before["phi"], after["phi"])
+
+
+@contextmanager
+def _patched_updates(accept_all: bool):
     """
-    Patch update_* functions in cl_tuning so that:
-    - proposals do not change the state (identity updates)
+    Patch cl_tuning update_* functions so that:
+    - proposals do not change the pilot state (identity updates)
     - acceptance is deterministic (all accept or all reject)
     """
     accept_bool = tf.constant(bool(accept_all), dtype=tf.bool)
 
-    def stub_update_alpha(**kwargs):
-        return kwargs["alpha"], accept_bool
+    def stub_update_alpha(
+        posterior,
+        rng: tf.random.Generator,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        delta_cl: tf.Tensor,
+        alpha: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        k_alpha: tf.Tensor,
+    ):
+        return alpha, accept_bool
 
-    def stub_update_E_bar(**kwargs):
-        E_bar = kwargs["E_bar"]
-        accepted = tf.fill(tf.shape(E_bar), accept_bool)
-        return E_bar, accepted
+    def stub_update_E_bar(
+        posterior,
+        rng: tf.random.Generator,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        delta_cl: tf.Tensor,
+        alpha: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+        phi: tf.Tensor,
+        k_E_bar: tf.Tensor,
+    ):
+        accepted_vec = tf.fill(tf.shape(E_bar), accept_bool)
+        return E_bar, accepted_vec
 
-    def stub_update_njt(**kwargs):
-        njt = kwargs["njt"]
-        T = tf.cast(tf.shape(njt)[0], tf.float64)
-        acc_sum = T if accept_all else tf.constant(0.0, tf.float64)
+    def stub_update_njt(
+        posterior,
+        rng: tf.random.Generator,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        delta_cl: tf.Tensor,
+        alpha: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+        phi: tf.Tensor,
+        k_njt: tf.Tensor,
+        ridge: tf.Tensor,
+    ):
+        if accept_all:
+            acc_sum = tf.cast(tf.shape(njt)[0], tf.float64)
+        else:
+            acc_sum = tf.constant(0.0, tf.float64)
         return njt, acc_sum
 
-    monkeypatch.setattr(cl_tuning, "update_alpha", stub_update_alpha)
-    monkeypatch.setattr(cl_tuning, "update_E_bar", stub_update_E_bar)
-    monkeypatch.setattr(cl_tuning, "update_njt", stub_update_njt)
-
-
-# -----------------------------------------------------------------------------
-# Fixtures
-# -----------------------------------------------------------------------------
-@pytest.fixture
-def shrinkage_estimator(tiny_market_data):
-    shrink = _build_shrink(tiny_market_data)
-    _set_tuning_params(shrink)
-    return shrink
+    with patch.object(cl_tuning, "update_alpha", stub_update_alpha):
+        with patch.object(cl_tuning, "update_E_bar", stub_update_E_bar):
+            with patch.object(cl_tuning, "update_njt", stub_update_njt):
+                yield
 
 
 # -----------------------------------------------------------------------------
@@ -159,14 +205,7 @@ def test_tune_k_validate_input_rejects_invalid_args():
             factor=1.0,
             name="x",
         ),
-        dict(
-            pilot_length=1,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.1,
-            name=123,  # type: ignore[arg-type]
-        ),
+        dict(pilot_length=1, target_low=0.3, target_high=0.5, max_rounds=1, factor=1.1, name=123),  # type: ignore[arg-type]
     ]
 
     for kw in bad_calls:
@@ -270,64 +309,64 @@ def test_tune_k_preserves_theta_shape_scalar_and_vector():
 
 
 # -----------------------------------------------------------------------------
-# tune_shrinkage integration / wiring tests
+# tune_shrinkage wiring tests
 # -----------------------------------------------------------------------------
-def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types(tiny_market_data):
-    # Missing attribute
-    shrink = _build_shrink(tiny_market_data)
+def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types():
+    data = _tiny_cl_data_np()
+    shrink = _build_shrink(data)
     _set_tuning_params(shrink)
+
+    # Missing attribute
     delattr(shrink, "qjt")
     with pytest.raises(Exception):
         cl_tuning.tune_shrinkage(shrink)
 
     # Wrong type for state variable (must be tf.Variable)
-    shrink = _build_shrink(tiny_market_data)
+    shrink = _build_shrink(data)
     _set_tuning_params(shrink)
     shrink.alpha = shrink.alpha.read_value()  # type: ignore[assignment]
     with pytest.raises(Exception):
         cl_tuning.tune_shrinkage(shrink)
 
     # Invalid factor_rw
-    shrink = _build_shrink(tiny_market_data)
+    shrink = _build_shrink(data)
     _set_tuning_params(shrink, factor_rw=1.0)
     with pytest.raises(Exception):
         cl_tuning.tune_shrinkage(shrink)
 
 
-def test_tune_shrinkage_returns_three_positive_finite_scalars(
-    monkeypatch, shrinkage_estimator
-):
-    shrink = shrinkage_estimator
+def test_tune_shrinkage_returns_three_positive_finite_scalars():
+    data = _tiny_cl_data_np()
+    shrink = _build_shrink(data)
     _set_tuning_params(
         shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
     )
 
-    _patch_updates(monkeypatch, accept_all=True)
+    with _patched_updates(accept_all=True):
+        k_alpha, k_E_bar, k_njt = cl_tuning.tune_shrinkage(shrink)
 
-    k_alpha, k_E_bar, k_njt = cl_tuning.tune_shrinkage(shrink)
     for k in [k_alpha, k_E_bar, k_njt]:
         _assert_scalar_positive(k)
 
 
-def test_tune_shrinkage_does_not_mutate_sampler_state(monkeypatch, shrinkage_estimator):
-    shrink = shrinkage_estimator
+def test_tune_shrinkage_does_not_mutate_sampler_state():
+    data = _tiny_cl_data_np()
+    shrink = _build_shrink(data)
     _set_tuning_params(
         shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
     )
 
-    _patch_updates(monkeypatch, accept_all=False)
-
-    before = _snapshot_state(shrink)
-    _ = cl_tuning.tune_shrinkage(shrink)
-    after = _snapshot_state(shrink)
+    with _patched_updates(accept_all=False):
+        before = _snapshot_state(shrink)
+        _ = cl_tuning.tune_shrinkage(shrink)
+        after = _snapshot_state(shrink)
 
     _assert_state_unchanged(before, after)
 
 
-def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh(
-    monkeypatch, shrinkage_estimator
-):
-    shrink = shrinkage_estimator
+def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
+    data = _tiny_cl_data_np()
+    shrink = _build_shrink(data)
     _set_tuning_params(
         shrink,
         pilot_length=1,
@@ -340,20 +379,27 @@ def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh(
 
     calls: list[tuple[str, float]] = []
 
-    def stub_tune_k(**kwargs):
-        name = str(kwargs.get("name", ""))
-        factor = float(tf.convert_to_tensor(kwargs["factor"]).numpy())
-        calls.append((name, factor))
-        return tf.convert_to_tensor(kwargs["k0"], dtype=tf.float64)
+    def stub_tune_k(
+        theta0: tf.Tensor,
+        step_fn,
+        k0: tf.Tensor,
+        pilot_length: int,
+        target_low: float,
+        target_high: float,
+        max_rounds: int,
+        factor: float,
+        name: str,
+    ) -> tf.Tensor:
+        calls.append((str(name), float(factor)))
+        return tf.convert_to_tensor(k0, dtype=tf.float64)
 
-    monkeypatch.setattr(cl_tuning, "tune_k", stub_tune_k)
-
-    _ = cl_tuning.tune_shrinkage(shrink)
+    with patch.object(cl_tuning, "tune_k", stub_tune_k):
+        _ = cl_tuning.tune_shrinkage(shrink)
 
     names = [n for (n, _) in calls]
     assert (
         len(calls) >= 3
-    ), f"Expected at least 3 tune_k calls, got {len(calls)}: {names}"
+    ), f"Expected at least 3 tune_k calls, got {len(calls)} with names={names}"
 
     atol = 1e-6
     for name, factor in calls:
@@ -363,7 +409,8 @@ def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh(
                 f"{name} used factor={factor}, expected factor_rw={shrink.factor_rw} "
                 f"(abs diff={abs(factor - exp):.3e}, atol={atol:.3e})"
             )
-        if name == "njt":
+
+        if name in ["njt"]:
             exp = float(shrink.factor_tmh)
             assert abs(factor - exp) <= atol, (
                 f"{name} used factor={factor}, expected factor_tmh={shrink.factor_tmh} "

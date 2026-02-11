@@ -30,7 +30,11 @@ from run_zhang_with_lu import (
     run_market_shock_estimator,
 )
 from ching.stockpiling_estimator import StockpilingEstimator
-from ching.stockpiling_evaluate import evaluate_stockpiling, format_evaluation_summary
+from ching.stockpiling_evaluate import (
+    evaluate_stockpiling,
+    format_evaluation_summary,
+    myopic_buy_probabilities,
+)
 
 # =============================================================================
 # Phase 1: baseline choice model hyperparameters
@@ -101,7 +105,7 @@ stock_eps = 1e-12
 
 # MCMC config (formerly mcmc dict); keep k and sigmas as dicts
 mcmc_seed = 0
-mcmc_n_iter = 4
+mcmc_n_iter = 30
 
 k = {
     "beta": 1,
@@ -338,28 +342,37 @@ def main() -> None:
         u_m=u_m_true,
     )
 
-    pi_I0 = _uniform_pi_I0(stock_I_max)
-
-    # Evaluate fitted parameters versus (optional) oracle truth and summarize MCMC
-    # diagnostics (acceptance, saved draws) in a single reviewer-friendly report.
-    eval_out = evaluate_stockpiling(
+    # Cheap, presentation-friendly predictive probabilities (no DP/filtering).
+    p_buy_hat_imt = myopic_buy_probabilities(
         a_imt=a_imt,
         p_state_mt=p_state_mt,
         u_m=u_m_true,
         price_vals=stock_price_vals,
-        P_price=stock_P_price,
-        I_max=stock_I_max,
-        pi_I0=pi_I0,
-        waste_cost=stock_waste_cost,
-        eps=stock_eps,
-        tol=stock_dp_tol,
-        max_iter=stock_dp_max_iter,
-        theta_hat=res3["theta_hat"],
-        theta_true=theta_true,
-        mcmc={"n_saved": res3["n_saved"], "accept": res3["accept"]},
+        theta=res3["theta_hat"],
+        assume_stockout=True,
     )
 
-    print("=== Stockpiling evaluation ===")
+    # Optional oracle probabilities using theta_true (u_scale defaults to 1 if missing).
+    p_buy_oracle_imt = myopic_buy_probabilities(
+        a_imt=a_imt,
+        p_state_mt=p_state_mt,
+        u_m=u_m_true,
+        price_vals=stock_price_vals,
+        theta=theta_true,
+        assume_stockout=True,
+    )
+
+    eval_out = evaluate_stockpiling(
+        a_imt=a_imt,
+        p_buy_hat_imt=p_buy_hat_imt,
+        p_state_mt=p_state_mt,
+        theta_hat=res3["theta_hat"],
+        theta_true=theta_true,
+        p_buy_oracle_imt=p_buy_oracle_imt,
+        mcmc={"accept": res3["accept"], "n_saved": res3["n_saved"]},
+        eps=stock_eps,
+    )
+
     print(format_evaluation_summary(eval_out))
 
 

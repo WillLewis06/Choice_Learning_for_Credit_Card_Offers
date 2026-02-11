@@ -2,21 +2,16 @@
 #
 # Lightweight evaluation utilities for the stockpiling model.
 #
-# Design goals (simplified vs prior version):
-# - No TensorFlow.
-# - No posterior / DP / forward-filter mechanics inside evaluation.
-# - Keep only:
-#     (1) predictive fit metrics: NLL per obs + RMSE on buy probabilities
-#     (2) parameter recovery: RMSE + means (no MAE)
-#     (3) MCMC acceptance summaries (as returned by StockpilingEstimator.get_results)
+# Design goals:
+# - Pure NumPy (no TensorFlow).
+# - No DP / posterior / filtering mechanics inside evaluation.
+# - Evaluate from predicted buy probabilities and (optionally) parameter truth.
 #
-# Predictive probabilities:
-# - Preferred: pass p_buy_hat_imt (and optionally p_buy_oracle_imt) directly.
-# - Backward-compatible fallback: if p_buy_hat_imt is not provided, we compute a cheap
-#   myopic approximation p(buy) = sigmoid(u1 - u0), using:
-#       u1 = u_scale[m]*u_m[m] - alpha[m,n]*price[s_t] - fc[m,n]
-#       u0 = -v[m,n]  (if assume_stockout=True), else 0
-#   This avoids DP/filtering but is not the full dynamic model.
+# Outputs:
+# - Predictive fit: NLL per obs, RMSE of probability predictions vs actions, buy rates,
+#   plus optional by-price-state summaries.
+# - Parameter recovery (optional): RMSE + means for each parameter block.
+# - MCMC diagnostics (optional): acceptance summaries, passed through from the estimator.
 
 from __future__ import annotations
 
@@ -30,18 +25,8 @@ import numpy as np
 # =============================================================================
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    """Numerically stable sigmoid."""
-    x = np.asarray(x, dtype=np.float64)
-    out = np.empty_like(x, dtype=np.float64)
-    pos = x >= 0
-    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
-    ex = np.exp(x[~pos])
-    out[~pos] = ex / (1.0 + ex)
-    return out
-
-
 def _as_float(x: Any) -> Optional[float]:
+    """Convert a scalar-like value to float; return None if conversion fails."""
     if x is None:
         return None
     try:
@@ -54,6 +39,7 @@ def _as_float(x: Any) -> Optional[float]:
 
 
 def _as_int(x: Any) -> Optional[int]:
+    """Convert a scalar-like value to int; return None if conversion fails."""
     if x is None:
         return None
     try:
@@ -63,6 +49,86 @@ def _as_int(x: Any) -> Optional[int]:
             return int(np.asarray(x).item())
         except Exception:
             return None
+
+
+def myopic_buy_probabilities(
+    a_imt: np.ndarray,
+    p_state_mt: np.ndarray,
+    u_m: np.ndarray,
+    price_vals: np.ndarray,
+    theta: dict[str, np.ndarray],
+    assume_stockout: bool = True,
+    clip: float = 60.0,
+) -> np.ndarray:
+    """
+    Compute a simple (myopic) buy probability array p_buy_imt for evaluation.
+
+    This ignores inventory dynamics and forward-looking behavior. It uses a static
+    logit on the current-period utility difference:
+
+      u1 = u_scale[m] * u_m[m] - alpha[m,n] * price[s_mt] - fc[m,n]
+      u0 = -v[m,n]   if assume_stockout else 0
+      p_buy = sigmoid(u1 - u0)
+
+    Inputs:
+      a_imt: (M,N,T) actions (used only for shape)
+      p_state_mt: (M,T) price state indices in {0,...,S-1}
+      u_m: (M,) market intercepts
+      price_vals: (S,) prices by state
+      theta: dict with at least {"alpha","fc"} as (M,N). Uses optional {"v"} (M,N)
+             and optional {"u_scale"} (M,). Missing v -> 0, missing u_scale -> 1.
+
+    Returns:
+      p_buy_imt: (M,N,T) float64 in (0,1).
+    """
+    a = np.asarray(a_imt)
+    if a.ndim != 3:
+        raise ValueError(f"a_imt must be 3D (M,N,T), got shape {a.shape}")
+    M, N, T = map(int, a.shape)
+
+    st = np.asarray(p_state_mt)
+    if st.shape != (M, T):
+        raise ValueError(f"p_state_mt must have shape (M,T)={(M, T)}, got {st.shape}")
+
+    u_m = np.asarray(u_m, dtype=np.float64)
+    if u_m.shape != (M,):
+        raise ValueError(f"u_m must have shape (M,)={(M,)}, got {u_m.shape}")
+
+    price_vals = np.asarray(price_vals, dtype=np.float64)
+    if price_vals.ndim != 1:
+        raise ValueError(f"price_vals must be 1D (S,), got shape {price_vals.shape}")
+
+    alpha = np.asarray(theta["alpha"], dtype=np.float64)
+    fc = np.asarray(theta["fc"], dtype=np.float64)
+    if alpha.shape != (M, N):
+        raise ValueError(
+            f"theta['alpha'] must have shape (M,N)={(M, N)}, got {alpha.shape}"
+        )
+    if fc.shape != (M, N):
+        raise ValueError(f"theta['fc'] must have shape (M,N)={(M, N)}, got {fc.shape}")
+
+    v = np.asarray(theta.get("v", np.zeros((M, N))), dtype=np.float64)
+    if v.shape != (M, N):
+        raise ValueError(f"theta['v'] must have shape (M,N)={(M, N)}, got {v.shape}")
+
+    u_scale = np.asarray(theta.get("u_scale", np.ones((M,))), dtype=np.float64)
+    if u_scale.shape != (M,):
+        raise ValueError(
+            f"theta['u_scale'] must have shape (M,)={(M,)}, got {u_scale.shape}"
+        )
+
+    price_mt = price_vals[st.astype(np.int64, copy=False)]  # (M,T)
+    price_m1t = price_mt[:, None, :]  # (M,1,T)
+
+    u_m_scaled_m11 = (u_scale * u_m)[:, None, None]  # (M,1,1)
+
+    u1 = u_m_scaled_m11 - alpha[:, :, None] * price_m1t - fc[:, :, None]  # (M,N,T)
+    u0 = (-v[:, :, None]) if assume_stockout else 0.0
+
+    d = u1 - u0
+    d = np.clip(d, -clip, clip)
+    p = 1.0 / (1.0 + np.exp(-d))
+    return p.astype(np.float64, copy=False)
 
 
 # =============================================================================
@@ -77,10 +143,14 @@ def parameter_metrics(
     """
     Compare true vs fitted constrained parameters.
 
-    For each key in theta_hat (beta, alpha, v, fc, lambda_c, u_scale):
-      rmse, mean_true, mean_hat
+    For each key present in both dictionaries:
+      - rmse
+      - mean_true
+      - mean_hat
 
-    If theta_true lacks u_scale, it is treated as ones_like(theta_hat["u_scale"]).
+    Notes:
+      - Arrays may be (M,N) or (M,) depending on the parameter block.
+      - Keys are not enforced; this function compares only intersecting keys.
     """
     out: dict[str, dict[str, float]] = {}
 
@@ -88,19 +158,14 @@ def parameter_metrics(
         d = (h - t).astype(np.float64, copy=False)
         return float(np.sqrt(np.mean(d * d)))
 
-    for k, hat in theta_hat.items():
-        if k == "u_scale" and k not in theta_true:
-            true = np.ones_like(np.asarray(hat, dtype=np.float64), dtype=np.float64)
-        else:
-            if k not in theta_true:
-                continue
-            true = np.asarray(theta_true[k], dtype=np.float64)
-
-        hat_arr = np.asarray(hat, dtype=np.float64)
+    keys = [k for k in theta_hat.keys() if k in theta_true]
+    for k in keys:
+        true = np.asarray(theta_true[k], dtype=np.float64)
+        hat = np.asarray(theta_hat[k], dtype=np.float64)
         out[k] = {
-            "rmse": _rmse(true, hat_arr),
+            "rmse": _rmse(true, hat),
             "mean_true": float(np.mean(true)),
-            "mean_hat": float(np.mean(hat_arr)),
+            "mean_hat": float(np.mean(hat)),
         }
 
     return out
@@ -121,9 +186,20 @@ def predictive_metrics_from_probs(
     Compute predictive metrics given predicted buy probabilities.
 
     Inputs:
-      a_imt: (M,N,T) 0/1
-      p_buy_imt: (M,N,T) in [0,1]
-      p_state_mt: optional (M,T) state indices for by-state summaries
+      a_imt: (M,N,T) actions in {0,1}
+      p_buy_imt: (M,N,T) predicted probabilities in [0,1]
+      p_state_mt: optional (M,T) discrete price state indices
+
+    Metrics:
+      - nll_per_obs: mean negative log likelihood
+      - rmse_prob: sqrt(mean((p-a)^2))
+      - buy_rate_emp: mean(a)
+      - buy_rate_pred: mean(p)
+
+    By-state summaries (if p_state_mt provided):
+      - buy_rate_by_state_emp[s] = mean(a | state=s)
+      - buy_rate_by_state_pred[s] = mean(p | state=s)
+      - rmse_buy_rate_by_state = sqrt(mean_s (pred(s)-emp(s))^2), with equal weight per state
     """
     a = np.asarray(a_imt, dtype=np.float64)
     p = np.asarray(p_buy_imt, dtype=np.float64)
@@ -136,17 +212,13 @@ def predictive_metrics_from_probs(
 
     p = np.clip(p, eps, 1.0 - eps)
 
-    # NLL per obs
     nll = -np.mean(a * np.log(p) + (1.0 - a) * np.log(1.0 - p))
-
-    # RMSE on probability predictions vs realized actions
     rmse_prob = float(np.sqrt(np.mean((p - a) ** 2)))
 
     buy_rate_emp = float(np.mean(a))
     buy_rate_pred = float(np.mean(p))
 
-    # Baseline: constant p0 = empirical buy rate
-    p0 = np.clip(buy_rate_emp, eps, 1.0 - eps)
+    p0 = float(np.clip(buy_rate_emp, eps, 1.0 - eps))
     baseline_nll = -np.mean(a * np.log(p0) + (1.0 - a) * np.log(1.0 - p0))
     baseline_rmse = float(np.sqrt(np.mean((p0 - a) ** 2)))
 
@@ -158,21 +230,21 @@ def predictive_metrics_from_probs(
         st = np.asarray(p_state_mt)
         if st.shape != (M, T):
             raise ValueError(
-                f"p_state_mt must have shape (M,T) = {(M,T)}, got {st.shape}"
+                f"p_state_mt must have shape (M,T) = {(M, T)}, got {st.shape}"
             )
 
         st_vals = np.unique(st.astype(np.int64, copy=False))
         diffs: list[float] = []
 
         for s in st_vals.tolist():
-            mask_mt = st == s  # (M,T) bool
+            mask_mt = st == s  # (M,T)
             count_mt = int(mask_mt.sum())
             if count_mt == 0:
                 continue
 
-            # Broadcast mask over N via multiplication (no boolean indexing).
-            mask_mnt = mask_mt[:, None, :]  # (M,1,T) broadcasts in arithmetic
-            den = float(count_mt * N)  # number of (m,n,t) entries in this state
+            # Broadcast mask over N via multiplication (avoid boolean indexing pitfalls).
+            mask_mnt = mask_mt[:, None, :]  # (M,1,T)
+            den = float(count_mt * N)
 
             emp = float(np.sum(a * mask_mnt) / den)
             pred = float(np.sum(p * mask_mnt) / den)
@@ -197,56 +269,10 @@ def predictive_metrics_from_probs(
             "p0": float(p0),
             "nll_per_obs": float(baseline_nll),
             "rmse_prob": float(baseline_rmse),
+            "buy_rate_emp": float(buy_rate_emp),
+            "buy_rate_pred": float(p0),
         },
     }
-
-
-# =============================================================================
-# Fallback: cheap myopic probabilities (no DP/filtering)
-# =============================================================================
-
-
-def myopic_buy_probabilities(
-    a_imt: np.ndarray,
-    p_state_mt: np.ndarray,
-    u_m: np.ndarray,
-    price_vals: np.ndarray,
-    theta: dict[str, np.ndarray],
-    assume_stockout: bool = True,
-) -> np.ndarray:
-    """
-    Cheap fallback: p(buy) = sigmoid(u1 - u0) with inventory fixed/ignored.
-
-    u1 = u_scale[m]*u_m[m] - alpha[m,n]*price[s_t] - fc[m,n]
-    u0 = -v[m,n] if assume_stockout else 0
-    """
-    a = np.asarray(a_imt)
-    M, N, T = a.shape
-
-    st = np.asarray(p_state_mt, dtype=np.int64)
-    if st.shape != (M, T):
-        raise ValueError(f"p_state_mt must have shape (M,T) = {(M,T)}, got {st.shape}")
-
-    u_m = np.asarray(u_m, dtype=np.float64).reshape(M)
-    price_vals = np.asarray(price_vals, dtype=np.float64)
-    price_mt = price_vals[st]  # (M,T)
-
-    alpha = np.asarray(theta["alpha"], dtype=np.float64)  # (M,N)
-    fc = np.asarray(theta["fc"], dtype=np.float64)  # (M,N)
-    v = np.asarray(theta["v"], dtype=np.float64)  # (M,N)
-
-    u_scale = theta.get("u_scale", None)
-    if u_scale is None:
-        u_scale = np.ones((M,), dtype=np.float64)
-    u_scale = np.asarray(u_scale, dtype=np.float64).reshape(M)
-
-    um_eff = (u_scale * u_m)[:, None, None]  # (M,1,1)
-    price_mnt = price_mt[:, None, :]  # (M,1,T)
-
-    u1 = um_eff - alpha[:, :, None] * price_mnt - fc[:, :, None]
-    u0 = (-v[:, :, None]) if assume_stockout else 0.0
-
-    return _sigmoid(u1 - u0)
 
 
 # =============================================================================
@@ -256,50 +282,28 @@ def myopic_buy_probabilities(
 
 def evaluate_stockpiling(
     a_imt: np.ndarray,
+    p_buy_hat_imt: np.ndarray,
     p_state_mt: Optional[np.ndarray] = None,
-    u_m: Optional[np.ndarray] = None,
-    price_vals: Optional[np.ndarray] = None,
     theta_hat: Optional[dict[str, np.ndarray]] = None,
     theta_true: Optional[dict[str, np.ndarray]] = None,
-    p_buy_hat_imt: Optional[np.ndarray] = None,
     p_buy_oracle_imt: Optional[np.ndarray] = None,
     mcmc: Optional[dict[str, Any]] = None,
     eps: float = 1e-12,
-    assume_stockout: bool = True,
-    **_unused: Any,  # accept legacy args (P_price, I_max, pi_I0, waste_cost, tol, max_iter, etc.)
 ) -> dict[str, Any]:
     """
-    Evaluation wrapper.
+    Evaluate predictive fit and (optionally) parameter recovery and MCMC diagnostics.
 
-    Returns:
-      {
-        "fit": {...},
-        "oracle": {...},   # only if available
-        "param": {...},    # only if theta_true provided
-        "mcmc": {...},     # only if mcmc provided
-      }
+    Required:
+      - a_imt: (M,N,T)
+      - p_buy_hat_imt: (M,N,T)
 
-    Predictive fit source:
-      - If p_buy_hat_imt is provided: use it directly.
-      - Else: compute a myopic approximation from (theta_hat, u_m, price_vals, p_state_mt).
+    Optional:
+      - p_state_mt: (M,T) for by-state summaries
+      - theta_true + theta_hat for parameter recovery
+      - p_buy_oracle_imt: (M,N,T) for oracle predictive metrics
+      - mcmc: dict passed through from estimator.get_results()
     """
     out: dict[str, Any] = {}
-
-    # Fitted predictive metrics
-    if p_buy_hat_imt is None:
-        if theta_hat is None or u_m is None or price_vals is None or p_state_mt is None:
-            raise ValueError(
-                "Need either p_buy_hat_imt or (theta_hat, u_m, price_vals, p_state_mt) "
-                "to compute fitted predictive metrics."
-            )
-        p_buy_hat_imt = myopic_buy_probabilities(
-            a_imt=a_imt,
-            p_state_mt=p_state_mt,
-            u_m=u_m,
-            price_vals=price_vals,
-            theta=theta_hat,
-            assume_stockout=assume_stockout,
-        )
 
     out["fit"] = predictive_metrics_from_probs(
         a_imt=a_imt,
@@ -308,54 +312,18 @@ def evaluate_stockpiling(
         eps=eps,
     )
 
-    # Parameter recovery
-    if theta_true is not None and theta_hat is not None:
-        out["param"] = parameter_metrics(theta_true, theta_hat)
-
-    # Oracle predictive metrics (optional)
-    oracle_available = False
     if p_buy_oracle_imt is not None:
-        oracle_available = True
         out["oracle"] = predictive_metrics_from_probs(
             a_imt=a_imt,
             p_buy_imt=p_buy_oracle_imt,
             p_state_mt=p_state_mt,
             eps=eps,
         )
-    elif (
-        theta_true is not None
-        and u_m is not None
-        and price_vals is not None
-        and p_state_mt is not None
-    ):
-        # If theta_true provided, allow oracle predictive metrics via the same myopic fallback.
-        theta_oracle = dict(theta_true)
-        if (
-            theta_hat is not None
-            and "u_scale" in theta_hat
-            and "u_scale" not in theta_oracle
-        ):
-            theta_oracle["u_scale"] = np.ones_like(
-                np.asarray(theta_hat["u_scale"]), dtype=np.float64
-            )
-        # Require the blocks used by the myopic predictor.
-        needed = {"alpha", "fc", "v"}
-        if needed.issubset(theta_oracle.keys()):
-            oracle_available = True
-            p_buy_oracle = myopic_buy_probabilities(
-                a_imt=a_imt,
-                p_state_mt=p_state_mt,
-                u_m=u_m,
-                price_vals=price_vals,
-                theta=theta_oracle,
-                assume_stockout=assume_stockout,
-            )
-            out["oracle"] = predictive_metrics_from_probs(
-                a_imt=a_imt,
-                p_buy_imt=p_buy_oracle,
-                p_state_mt=p_state_mt,
-                eps=eps,
-            )
+
+    if theta_true is not None:
+        if theta_hat is None:
+            raise ValueError("theta_true provided but theta_hat is None")
+        out["param"] = parameter_metrics(theta_true, theta_hat)
 
     if mcmc is not None:
         out["mcmc"] = mcmc
@@ -364,7 +332,7 @@ def evaluate_stockpiling(
 
 
 # =============================================================================
-# Formatting helper (optional)
+# Formatting helper
 # =============================================================================
 
 
@@ -372,6 +340,12 @@ def format_evaluation_summary(
     eval_out: dict[str, Any],
     param_order: Optional[list[str]] = None,
 ) -> str:
+    """
+    Format evaluation output into a reviewer-friendly text report.
+
+    Expects eval_out from evaluate_stockpiling(...), with at least:
+      - eval_out["fit"]
+    """
     fit = eval_out["fit"]
     oracle = eval_out.get("oracle")
     params = eval_out.get("param")
@@ -393,12 +367,10 @@ def format_evaluation_summary(
 
     lines: list[str] = []
 
-    # Header
     if M is not None and N is not None and T is not None:
         lines.append(f"data: M={M} N={N} T={T} | n_obs={n_obs}")
     lines.append("")
 
-    # Main metrics table
     header = (
         f"{'model':<10}"
         f"{'nll':>10} "
@@ -418,19 +390,11 @@ def format_evaluation_summary(
             f"{f4(d['buy_rate_pred'])}"
         )
 
-    baseline_row = (
-        f"{'baseline':<10}"
-        f"{f6(base['nll_per_obs'])} "
-        f"{f6(base['rmse_prob'])} "
-        f"{f4(base['p0'])} "
-        f"{'':>8}"
-    )
-    lines.append(baseline_row)
+    lines.append(row("baseline", base))
     lines.append(row("fitted", fit))
     if oracle is not None:
         lines.append(row("oracle", oracle))
 
-    # Deltas
     lines.append("")
     nll_gain = base["nll_per_obs"] - fit["nll_per_obs"]
     rmse_gain = base["rmse_prob"] - fit["rmse_prob"]
@@ -441,7 +405,6 @@ def format_evaluation_summary(
             f"Δrmse={(fit['rmse_prob'] - oracle['rmse_prob']):.6f}"
         )
 
-    # By-state table
     emp_s = fit.get("buy_rate_by_state_emp", {})
     pred_s = fit.get("buy_rate_by_state_pred", {})
     if emp_s:
@@ -457,7 +420,6 @@ def format_evaluation_summary(
             lines.append(f"{str(s):<8}{f6(emp)} {f6(pred)} {f6(diff)}")
         lines.append(f"rmse across states: {fit['rmse_buy_rate_by_state']:.6f}")
 
-    # Parameter recovery table
     if params is not None and isinstance(params, dict) and params:
         if param_order is None:
             param_order = ["beta", "alpha", "v", "fc", "lambda_c", "u_scale"]
@@ -487,7 +449,6 @@ def format_evaluation_summary(
                 f"{f6(bias)}"
             )
 
-    # MCMC acceptance (elementwise)
     if isinstance(mcmc, dict):
         accept = mcmc.get("accept", {})
         rates = accept.get("rates", {})
