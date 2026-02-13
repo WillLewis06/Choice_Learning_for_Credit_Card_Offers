@@ -137,15 +137,6 @@ class StockpilingEstimator:
         self.rng = tf.random.Generator.from_seed(int(seed))
 
         # ---- initialize z explicitly from init_theta (defaults to the old implicit init) ----
-        if init_theta is None:
-            init_theta = {
-                "beta": 0.5,
-                "alpha": 1.0,
-                "v": 1.0,
-                "fc": 1.0,
-                "lambda": 0.5,
-                "u_scale": 1.0,
-            }
 
         # Scalars -> float64 tensors
         beta0 = tf.convert_to_tensor(float(init_theta["beta"]), dtype=tf.float64)
@@ -263,33 +254,44 @@ class StockpilingEstimator:
 
     def get_results(self) -> dict[str, object]:
         """
-        Return posterior means and acceptance rates as Python/numpy objects.
+        Return final (last) parameter values and acceptance rates as Python/numpy objects.
 
         Returns:
           {
-            "theta_hat": {"beta","alpha","v","fc","lambda","u_scale"},
+            "theta_hat": {"beta","alpha","v","fc","lambda","u_scale"},  # LAST draw (not posterior mean)
             "n_saved": int,
-            "accept": {"beta","alpha","v","fc","lambda","u_scale"}  # rates only
+            "accept": {"beta","alpha","v","fc","lambda","u_scale"}      # acceptance rates
           }
         """
-        n_saved = int(self.saved.numpy())
-        if n_saved <= 0:
-            raise RuntimeError("No saved iterations (n_saved == 0). Call fit().")
-
-        saved_f = tf.cast(self.saved, tf.float64)
+        # Final (current) constrained parameters from the current unconstrained state self.z
+        theta_last = model.unconstrained_to_theta(
+            {
+                "z_beta": self.z["z_beta"],
+                "z_alpha": self.z["z_alpha"],
+                "z_v": self.z["z_v"],
+                "z_fc": self.z["z_fc"],
+                "z_lambda": self.z["z_lambda"],
+                "z_u_scale": self.z["z_u_scale"],
+            }
+        )
 
         theta_hat = {
-            "beta": (self.sums["beta"] / saved_f).numpy(),
-            "alpha": (self.sums["alpha"] / saved_f).numpy(),
-            "v": (self.sums["v"] / saved_f).numpy(),
-            "fc": (self.sums["fc"] / saved_f).numpy(),
-            "lambda": (self.sums["lambda"] / saved_f).numpy(),
-            "u_scale": (self.sums["u_scale"] / saved_f).numpy(),
+            "beta": theta_last["beta"].numpy(),
+            "alpha": theta_last["alpha"].numpy(),
+            "v": theta_last["v"].numpy(),
+            "fc": theta_last["fc"].numpy(),
+            "lambda": theta_last["lambda"].numpy(),
+            "u_scale": theta_last["u_scale"].numpy(),
         }
 
+        n_saved = int(self.saved.numpy())
         counts = {k: int(v.numpy()) for k, v in self.accept.items()}
+
+        # Safe denominator if you call get_results() before any saves
+        denom_saved = max(1, n_saved)
         rates = {
-            k: counts[k] / max(1, n_saved * self._block_sizes[k]) for k in counts.keys()
+            k: counts[k] / max(1, denom_saved * self._block_sizes[k])
+            for k in counts.keys()
         }
 
         return {"theta_hat": theta_hat, "n_saved": n_saved, "accept": rates}

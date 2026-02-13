@@ -118,7 +118,7 @@ CFG_PHASE3 = {
     "mcmc_n_iter": 20,
     # Theta init values, std deviation and step size
     "init_theta": {
-        "beta": 0.5,
+        "beta": 1.0,
         "alpha": 1.0,
         "v": 1.0,
         "fc": 1.0,
