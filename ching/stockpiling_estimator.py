@@ -33,16 +33,17 @@ from typing import Any
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.dtypes import int32
 
 from ching import stockpiling_model as model
+
 from ching.stockpiling_updates import (
-    update_z_alpha_mj,
-    update_z_beta_mj,
-    update_z_fc_mj,
+    update_z_beta_alpha_fc_mj,
     update_z_lambda_mn,
     update_z_u_scale_m,
     update_z_v_mj,
 )
+
 from ching.stockpiling_diagnostics import report_iteration_progress
 
 
@@ -322,9 +323,13 @@ class StockpilingEstimator:
 
         # ---- Parameter-block updates (RW-MH, elementwise acceptance) ----
 
-        z_new, accepted = update_z_beta_mj(
+        # ---- Joint RW-MH update for (z_beta, z_alpha, z_fc) with one accept per (m,j) ----
+
+        z_beta_new, z_alpha_new, z_fc_new, accepted = update_z_beta_alpha_fc_mj(
             rng=self.rng,
-            k=self.k["beta"],
+            k_beta=self.k["beta"],
+            k_alpha=self.k["alpha"],
+            k_fc=self.k["fc"],
             inputs=inputs,
             sigma_z=sigma_z,
             z_beta=z_beta,
@@ -334,29 +339,22 @@ class StockpilingEstimator:
             z_lambda=z_lambda,
             z_u_scale=z_u_scale,
         )
-        self.z["z_beta"].assign(z_new)
-        self.accept["beta"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_alpha_mj(
-            rng=self.rng,
-            k=self.k["alpha"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
-        )
-        self.z["z_alpha"].assign(z_new)
-        self.accept["alpha"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        self.z["z_beta"].assign(z_beta_new)
+        self.z["z_alpha"].assign(z_alpha_new)
+        self.z["z_fc"].assign(z_fc_new)
 
-        # Frozen blocks for debugging (re-enable by uncommenting).
-        #
-        # z_new, accepted = update_z_v_mj(
+        acc = tf.reduce_sum(tf.cast(accepted, tf.int32))
+        self.accept["beta"].assign_add(acc)
+        self.accept["alpha"].assign_add(acc)
+        self.accept["fc"].assign_add(acc)
+
+        # -----------------------------------------------------------------------------
+        # Legacy single-block updates for beta/alpha/fc (commented out for easy revert)
+        # -----------------------------------------------------------------------------
+        # z_new, accepted = update_z_beta_mj(
         #     rng=self.rng,
-        #     k=self.k["v"],
+        #     k=self.k["beta"],
         #     inputs=inputs,
         #     sigma_z=sigma_z,
         #     z_beta=z_beta,
@@ -366,8 +364,23 @@ class StockpilingEstimator:
         #     z_lambda=z_lambda,
         #     z_u_scale=z_u_scale,
         # )
-        # self.z["z_v"].assign(z_new)
-        # self.accept["v"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        # self.z["z_beta"].assign(z_new)
+        # self.accept["beta"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        #
+        # z_new, accepted = update_z_alpha_mj(
+        #     rng=self.rng,
+        #     k=self.k["alpha"],
+        #     inputs=inputs,
+        #     sigma_z=sigma_z,
+        #     z_beta=z_beta,
+        #     z_alpha=z_alpha,
+        #     z_v=z_v,
+        #     z_fc=z_fc,
+        #     z_lambda=z_lambda,
+        #     z_u_scale=z_u_scale,
+        # )
+        # self.z["z_alpha"].assign(z_new)
+        # self.accept["alpha"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
         #
         # z_new, accepted = update_z_fc_mj(
         #     rng=self.rng,
@@ -383,36 +396,51 @@ class StockpilingEstimator:
         # )
         # self.z["z_fc"].assign(z_new)
         # self.accept["fc"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_lambda_mn(
-        #     rng=self.rng,
-        #     k=self.k["lambda"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_lambda"].assign(z_new)
-        # self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_u_scale_m(
-        #     rng=self.rng,
-        #     k=self.k["u_scale"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_u_scale"].assign(z_new)
-        # self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        z_new, accepted = update_z_v_mj(
+            rng=self.rng,
+            k=self.k["v"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z_beta=z_beta,
+            z_alpha=z_alpha,
+            z_v=z_v,
+            z_fc=z_fc,
+            z_lambda=z_lambda,
+            z_u_scale=z_u_scale,
+        )
+        self.z["z_v"].assign(z_new)
+        self.accept["v"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        z_new, accepted = update_z_lambda_mn(
+            rng=self.rng,
+            k=self.k["lambda"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z_beta=z_beta,
+            z_alpha=z_alpha,
+            z_v=z_v,
+            z_fc=z_fc,
+            z_lambda=z_lambda,
+            z_u_scale=z_u_scale,
+        )
+        self.z["z_lambda"].assign(z_new)
+        self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        z_new, accepted = update_z_u_scale_m(
+            rng=self.rng,
+            k=self.k["u_scale"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z_beta=z_beta,
+            z_alpha=z_alpha,
+            z_v=z_v,
+            z_fc=z_fc,
+            z_lambda=z_lambda,
+            z_u_scale=z_u_scale,
+        )
+        self.z["z_u_scale"].assign(z_new)
+        self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
         # ---- Accumulate posterior means (no burn-in/thinning) ----
         self.saved.assign_add(1)

@@ -115,10 +115,10 @@ CFG_PHASE3 = {
     "price_noise_sd": 0.02,
     # MCMC config
     "mcmc_seed": 0,
-    "mcmc_n_iter": 20,
+    "mcmc_n_iter": 500,
     # Theta init values, std deviation and step size
     "init_theta": {
-        "beta": 1.0,
+        "beta": 0.5,
         "alpha": 1.0,
         "v": 1.0,
         "fc": 1.0,
@@ -134,7 +134,7 @@ CFG_PHASE3 = {
         "z_u_scale": 2.0,
     },
     "k": {
-        "beta": 1,
+        "beta": 0.1,
         "alpha": 0.05,
         "v": 0.2,
         "fc": 0.05,

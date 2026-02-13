@@ -208,3 +208,28 @@ def logpost_z_u_scale_m(
     return _logpost_view(
         z=z, z_key="z_u_scale", view="m", inputs=inputs, sigma_z=sigma_z
     )
+
+
+def logpost_z_beta_alpha_fc_mj(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+) -> tf.Tensor:
+    """
+    (M,J) joint log posterior view for jointly updating (z_beta, z_alpha, z_fc).
+
+    This view:
+      - computes the likelihood ONCE (DP + forward filter) and reduces to (M,J)
+      - adds priors for z_beta, z_alpha, and z_fc (and only those moving blocks)
+
+    Other blocks (z_v, z_lambda, z_u_scale) are treated as fixed but must be present
+    in `z` so the likelihood can be evaluated.
+    """
+    ll_mnj = loglik_mnj(z=z, inputs=inputs)
+    ll_mj = _reduce_ll(ll_mnj, view="mj")
+
+    lp_beta = logprior_normal(z["z_beta"], sigma_z["z_beta"])
+    lp_alpha = logprior_normal(z["z_alpha"], sigma_z["z_alpha"])
+    lp_fc = logprior_normal(z["z_fc"], sigma_z["z_fc"])
+
+    return ll_mj + lp_beta + lp_alpha + lp_fc

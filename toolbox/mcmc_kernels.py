@@ -64,6 +64,92 @@ def rw_mh_step(
 
 
 @tf.function(reduce_retracing=True)
+def rw_mh_step_joint(
+    theta0: tf.Tensor,
+    logp_fn: Callable[[tf.Tensor], tf.Tensor],
+    k: tf.Tensor,
+    rng: tf.random.Generator,
+) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Joint random-walk Metropolis–Hastings update for a vector block.
+
+    theta0 has shape (..., K). logp_fn(theta) must return shape (...),
+    i.e. one log-density per site, not per-coordinate.
+    k can be:
+      - scalar (): isotropic RW
+      - vector (K,): diagonal RW
+      - matrix (K,K): correlated RW with covariance k
+    """
+    theta0 = tf.convert_to_tensor(theta0, dtype=tf.float64)
+    k = tf.convert_to_tensor(k, dtype=tf.float64)
+
+    K = tf.shape(theta0)[-1]
+    eps = rng.normal(tf.shape(theta0), dtype=tf.float64)
+
+    # Prefer static rank when available (avoids bad tf.cond branching).
+    k_rank_static = k.shape.rank
+
+    if k_rank_static == 0:
+        delta = eps * k
+
+    elif k_rank_static == 1:
+        tf.debugging.assert_equal(
+            tf.shape(k)[0], K, message="If k is (K,), it must have length K."
+        )
+        delta = eps * k  # broadcast over leading dims
+
+    elif k_rank_static == 2:
+        tf.debugging.assert_equal(
+            tf.shape(k)[0], K, message="If k is (K,K), it must be square with side K."
+        )
+        tf.debugging.assert_equal(
+            tf.shape(k)[1], K, message="If k is (K,K), it must be square with side K."
+        )
+        L = tf.linalg.cholesky(k)  # k = L L^T
+        # delta = eps @ L^T  -> Cov(delta)=k
+        delta = tf.einsum("...k,lk->...l", eps, L)
+
+    else:
+        # Dynamic fallback (rare): use tf.rank(k) only if static rank unknown.
+        k_rank = tf.rank(k)
+
+        def _scalar():
+            return eps * k
+
+        def _diag():
+            tf.debugging.assert_equal(tf.shape(k)[0], K)
+            return eps * k
+
+        def _chol():
+            tf.debugging.assert_equal(tf.shape(k)[0], K)
+            tf.debugging.assert_equal(tf.shape(k)[1], K)
+            L = tf.linalg.cholesky(k)
+            return tf.einsum("...k,lk->...l", eps, L)
+
+        delta = tf.case(
+            [
+                (tf.equal(k_rank, 0), _scalar),
+                (tf.equal(k_rank, 1), _diag),
+                (tf.equal(k_rank, 2), _chol),
+            ],
+            exclusive=True,
+            default=_diag,
+        )
+
+    theta_prop = theta0 + delta
+
+    logp_curr = logp_fn(theta0)  # shape (...)
+    logp_prop = logp_fn(theta_prop)  # shape (...)
+    log_alpha = logp_prop - logp_curr
+
+    u = rng.uniform(tf.shape(log_alpha), dtype=tf.float64)  # shape (...)
+    accepted = tf.math.log(u) < log_alpha  # shape (...)
+
+    theta_new = tf.where(accepted[..., None], theta_prop, theta0)  # shape (...,K)
+    return theta_new, accepted
+
+
+@tf.function(reduce_retracing=True)
 def tmh_step(
     theta0: tf.Tensor,
     logp_fn: Callable[[tf.Tensor], tf.Tensor],
