@@ -408,12 +408,12 @@ def generate_dgp(
     theta_true = sample_theta_true(rng=rng, M=M, N=N, J=J)
 
     validate_stockpiling_dgp_inputs(
+        seed=seed,
         delta_true=delta_true,
         E_bar_true=E_bar_true,
         njt_true=njt_true,
         N=N,
         T=T,
-        theta_true=theta_true,
         I_max=I_max,
         P_price_mj=P_price_mj,
         price_vals_mj=price_vals_mj,

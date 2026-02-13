@@ -2,7 +2,7 @@
 End-to-end orchestration for:
 
 - Phase 1: feature-based baseline choice model (delta_hat)
-- Phase 2: Lu-style shrinkage on market-product shocks (E_bar_hat, njt_hat, alpha_hat)
+- Phase 2: Lu-style shrinkage on market-product shocks (E_bar_hat, njt_hat)
 - Phase 3 (stockpiling): generate seller-observed purchases under a forward-looking
   inventory model for all products, with market×product-specific price dynamics and
   market×product-specific price levels, then estimate stockpiling parameters treating
@@ -13,7 +13,7 @@ Phase-3 target model (high level):
   - Fixed utilities from Phase 1–2: u_mj = delta_j + E_bar_m + n_mj
   - Parameters:
       per market-product:  beta_mj, alpha_mj, v_mj, fc_mj
-      per market:          u_scale_m
+      per market:          u_scale_m     (estimator-only nuisance scale; no "true" u_scale in DGP)
       per market-consumer: lambda_mn
 """
 
@@ -52,11 +52,12 @@ from ching.stockpiling_model import (  # noqa: E402
 # Phase 1: baseline choice model
 CFG_PHASE1 = {
     "seed": 123,
-    "num_products": 15,
-    "num_groups": 5,
+    "num_products": 10,
+    "num_groups": 2,
     "num_markets": 5,
     "N_base": 2_000,
     "N_shock": 1_000,
+    "num_features": 4,
     "x_sd": 1.0,
     "coef_sd": 1.0,
     "p_g_active": 0.2,
@@ -64,8 +65,8 @@ CFG_PHASE1 = {
     "sd_E": 0.5,
     "p_active": 0.25,
     "sd_u": 0.5,
-    "depth": 10,
-    "width": 64,
+    "depth": 5,
+    "width": 32,
     "heads": 8,
     "epochs": 5,
     "batch_size": 64,
@@ -91,8 +92,8 @@ CFG_PHASE2 = {
 # Phase 3 (stockpiling): DGP + estimation
 CFG_PHASE3 = {
     # panel size
-    "N": 50,
-    "T": 1000,
+    "N": 200,
+    "T": 500,
     # inventory state
     "I_max": 10,
     # price state space
@@ -100,7 +101,7 @@ CFG_PHASE3 = {
     # DGP/likelihood config
     "waste_cost": 1.0,
     "dp_tol": 1e-10,
-    "dp_max_iter": 50_000,
+    "dp_max_iter": 5_000,
     "eps": 1e-12,
     # exogenous price process construction
     "price_seed": 777,
@@ -114,14 +115,15 @@ CFG_PHASE3 = {
     "price_noise_sd": 0.02,
     # MCMC config
     "mcmc_seed": 0,
-    "mcmc_n_iter": 3,
-    "k": {
-        "beta": 1,
-        "alpha": 0.2,
-        "v": 0.3,
-        "fc": 0.15,
-        "lambda": 0.3,
-        "u_scale": 0.02,
+    "mcmc_n_iter": 20,
+    # Theta init values, std deviation and step size
+    "init_theta": {
+        "beta": 0.5,
+        "alpha": 1.0,
+        "v": 1.0,
+        "fc": 1.0,
+        "lambda": 0.5,
+        "u_scale": 1.0,
     },
     "sigmas": {
         "z_beta": 2.0,
@@ -130,6 +132,14 @@ CFG_PHASE3 = {
         "z_fc": 2.0,
         "z_lambda": 2.0,
         "z_u_scale": 2.0,
+    },
+    "k": {
+        "beta": 1,
+        "alpha": 0.05,
+        "v": 0.2,
+        "fc": 0.05,
+        "lambda": 0.2,
+        "u_scale": 0.01,
     },
 }
 
@@ -294,8 +304,11 @@ def build_price_processes(
     return P_price_mj, price_vals_mj
 
 
-def summarize_stockpiling_panel(panel: dict[str, object]) -> None:
-    """Lightweight prints for Phase-3 data objects."""
+def summarize_stockpiling_panel(
+    panel: dict[str, object],
+    init_theta: dict[str, float] | None = None,
+) -> None:
+    """Print Phase-3 panel summary + true means + estimator init means."""
     a_mnjt = panel["a_mnjt"]  # (M,N,J,T)
     p_state_mjt = panel["p_state_mjt"]  # (M,J,T)
     u_mj = panel["u_mj"]  # (M,J)
@@ -307,6 +320,44 @@ def summarize_stockpiling_panel(panel: dict[str, object]) -> None:
         f"a_mnjt={a_mnjt.shape} | p_state_mjt={p_state_mjt.shape} | u_mj={u_mj.shape}"
     )
     print(f"overall buy rate: {buy_rate:.4f}")
+
+    # True parameter means (DGP; no u_scale in DGP)
+    theta_true = panel.get("theta_true", None)
+    if isinstance(theta_true, dict):
+        mean_beta = float(np.mean(theta_true["beta"]))
+        mean_alpha = float(np.mean(theta_true["alpha"]))
+        mean_v = float(np.mean(theta_true["v"]))
+        mean_fc = float(np.mean(theta_true["fc"]))
+        mean_lambda = float(np.mean(theta_true["lambda"]))
+        print(
+            "[Stockpiling] True | "
+            f'mean(beta)= "{mean_beta:.4f}" , '
+            f'mean(alpha)= "{mean_alpha:.4f}" , '
+            f'mean(v)= "{mean_v:.4f}" , '
+            f'mean(fc)= "{mean_fc:.4f}" , '
+            f'mean(lambda)= "{mean_lambda:.4f}"'
+        )
+
+    # Estimator initialization (defaults match the old implicit init)
+    if init_theta is None:
+        init_theta = {
+            "beta": 0.5,
+            "alpha": 1.0,
+            "v": 1.0,
+            "fc": 1.0,
+            "lambda": 0.5,
+            "u_scale": 1.0,
+        }
+
+    print(
+        "[Stockpiling] Init | "
+        f'mean(beta)= "{float(init_theta["beta"]):.4f}" , '
+        f'mean(alpha)= "{float(init_theta["alpha"]):.4f}" , '
+        f'mean(v)= "{float(init_theta["v"]):.4f}" , '
+        f'mean(fc)= "{float(init_theta["fc"]):.4f}" , '
+        f'mean(lambda)= "{float(init_theta["lambda"]):.4f}" , '
+        f'mean(u_scale)= "{float(init_theta["u_scale"]):.4f}"'
+    )
 
 
 # =============================================================================
@@ -325,6 +376,7 @@ def run_phase1(cfg: dict[str, object]) -> dict[str, object]:
         num_markets=int(cfg["num_markets"]),
         N_base=int(cfg["N_base"]),
         N_shock=int(cfg["N_shock"]),
+        num_features=int(cfg["num_features"]),
         x_sd=float(cfg["x_sd"]),
         coef_sd=float(cfg["coef_sd"]),
         p_g_active=float(cfg["p_g_active"]),
@@ -406,23 +458,22 @@ def build_phase3_inputs(
     """
     Build Phase-3 utility objects from Phase-2 outputs.
 
+    IMPORTANT:
+      - Phase-3 uses u_mj = delta + E_bar + n (no additional scaling here).
+      - Any scale mismatch between Phase-1/2 utilities and the stockpiling layer
+        is handled by the estimator-only u_scale parameter.
+
     Returns:
       dict with:
         - delta_used: (J,) float64
         - E_bar_used: (M,) float64
         - njt_used:   (M,J) float64
-        - alpha_hat:  scalar float64 (returned for debugging)
     """
-    alpha_hat = float(res2["alpha_hat"])
     E_bar_used = np.asarray(res2["E_bar_hat"], dtype=np.float64)
     njt_used = np.asarray(res2["njt_hat"], dtype=np.float64)
-
-    # Rescale Phase-1 utilities by the Phase-2 normalization so Phase-3 sees
-    # utilities on the intended scale.
-    delta_used = alpha_hat * np.asarray(delta_hat, dtype=np.float64)
+    delta_used = np.asarray(delta_hat, dtype=np.float64)
 
     return {
-        "alpha_hat": np.asarray(alpha_hat, dtype=np.float64),
         "delta_used": delta_used,
         "E_bar_used": E_bar_used,
         "njt_used": njt_used,
@@ -447,7 +498,7 @@ def run_phase3_dgp(
         - a_mnjt      (M,N,J,T) int64 purchases
         - p_state_mjt (M,J,T)   int64 price states
         - u_mj        (M,J)     float64 intercepts (unscaled)
-        - theta_true  dict of true parameters
+        - theta_true  dict of true parameters (no u_scale in DGP)
     """
     a_mnjt, p_state_mjt, u_mj, theta_true = generate_dgp(
         seed=int(seed_dgp),
@@ -499,6 +550,7 @@ def run_phase3_estimation(
         eps=float(cfg["eps"]),
         tol=float(cfg["dp_tol"]),
         max_iter=int(cfg["dp_max_iter"]),
+        init_theta=cfg["init_theta"],
         sigmas=cfg["sigmas"],
         seed=int(cfg["mcmc_seed"]),
     )
@@ -534,7 +586,6 @@ def run_phase3_evaluation(
 ) -> dict[str, object]:
     """Compute predictive probabilities and run the stockpiling evaluation."""
     I_max = int(cfg["I_max"])
-
     maps = build_inventory_maps(tf.constant(I_max, dtype=tf.int32))
 
     # Fixed TF inputs (shared across oracle and fitted predictions)
@@ -573,9 +624,16 @@ def run_phase3_evaluation(
             maps=maps,
         ).numpy()
 
+    # Fitted prediction uses theta_hat (includes u_scale)
     p_buy_hat_mnjt = predict(theta_hat)
-    p_buy_oracle_mnjt = predict(theta_true)
 
+    # Oracle prediction: DGP has no u_scale; explicitly set u_scale = 1 to match DGP intercept usage.
+    M = int(np.asarray(panel["u_mj"]).shape[0])
+    theta_true_oracle = dict(theta_true)
+    theta_true_oracle["u_scale"] = np.ones((M,), dtype=np.float64)
+    p_buy_oracle_mnjt = predict(theta_true_oracle)
+
+    # For reporting "true parameters", keep theta_true as returned by the DGP (no u_scale).
     return evaluate_stockpiling(
         a_mnjt=panel["a_mnjt"],
         p_buy_hat_mnjt=p_buy_hat_mnjt,
@@ -639,7 +697,8 @@ def main() -> None:
         price_vals_mj=price_vals_mj,
         seed_dgp=int(CFG_PHASE1["seed"]) + 999,
     )
-    summarize_stockpiling_panel(panel)
+
+    summarize_stockpiling_panel(panel, init_theta=CFG_PHASE3.get("init_theta"))
 
     # Phase 3: estimation
     print("=== Stockpiling estimation ===")

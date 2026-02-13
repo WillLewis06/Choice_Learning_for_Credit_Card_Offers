@@ -3,7 +3,7 @@ Minimal DGP for the "Zhang baseline logits + Lu market/product shocks" experimen
 with a fixed choice set (same J products in every market) and NO exogenous context.
 
 Observed (shared features):
-- xj:        (num_products,)                      product feature
+- xj:        (num_products, num_features)         product feature matrix
 - group_id:  (num_products,) int                  product -> group mapping
 
 Observed (counts):
@@ -28,8 +28,12 @@ Truth (shocks):
 - njt_true:   (num_markets, num_products) product shocks implied by groups
 
 Baseline utility (fixed across markets):
-  let S = sum_k xk, and S_{-j} = S - xj
-  delta_true[j] = a*xj[j] + b*xj[j]^2 + g_true[j] * xj[j] * S_{-j}
+  For baseline "truth", we use a scalar index x_scalar[j] derived from xj:
+    - if xj is 1D (J,), x_scalar = xj
+    - if xj is 2D (J, d_x), x_scalar = xj[:, 0]  (first feature only)
+
+  let S = sum_k x_scalar[k], and S_{-j} = S - x_scalar[j]
+  delta_true[j] = a*x_scalar[j] + b*x_scalar[j]^2 + g_true[j] * x_scalar[j] * S_{-j}
 
 Shocked utilities for market t:
   u_shock[t, j] = delta_true[j] + E_bar_true[t] + njt_true[t, j]
@@ -60,6 +64,25 @@ def _assign_groups(num_products: int, num_groups: int) -> np.ndarray:
     return group_id
 
 
+def _x_scalar_from_xj(xj: np.ndarray) -> np.ndarray:
+    """
+    Map product feature matrix xj to a scalar feature per product.
+
+    - If xj is (J,), return as-is.
+    - If xj is (J, d_x), return xj[:, 0].
+
+    Returns x_scalar with shape (J,).
+    """
+    xj = np.asarray(xj)
+    if xj.ndim == 1:
+        return xj
+    if xj.ndim == 2:
+        if xj.shape[1] < 1:
+            raise ValueError("xj must have at least 1 feature column.")
+        return xj[:, 0]
+    raise ValueError(f"xj must be 1D or 2D. Got shape {xj.shape}.")
+
+
 def compute_delta_true(
     xj: np.ndarray,
     a_true: float,
@@ -69,16 +92,20 @@ def compute_delta_true(
     """
     Baseline utilities with product-sparse cross-product interactions.
 
-    delta_true[j] = a*xj[j] + b*xj[j]^2 + g_true[j] * xj[j] * sum_{k!=j} xj[k]
+    Uses scalar index x_scalar derived from xj (see _x_scalar_from_xj).
+
+    delta_true[j] = a*x_scalar[j] + b*x_scalar[j]^2
+                    + g_true[j] * x_scalar[j] * sum_{k!=j} x_scalar[k]
+
     Returns delta_true with shape (J,).
     """
-    xj = np.asarray(xj)
+    x_scalar = _x_scalar_from_xj(xj)
     g_true = np.asarray(g_true)
 
-    s_all = float(np.sum(xj))
-    s_excl = s_all - xj  # (J,)
+    s_all = float(np.sum(x_scalar))
+    s_excl = s_all - x_scalar  # (J,)
 
-    return a_true * xj + b_true * (xj**2) + g_true * xj * s_excl
+    return a_true * x_scalar + b_true * (x_scalar**2) + g_true * x_scalar * s_excl
 
 
 def compute_njt_true(
@@ -168,6 +195,7 @@ def generate_choice_learn_market_shocks_dgp(
     N_base: int,
     N_shock: int,
     # feature generation (normal)
+    num_features: int = 1,
     x_sd: float = 1.0,
     # baseline coefficient generation (normal)
     coef_sd: float = 1.0,
@@ -184,11 +212,19 @@ def generate_choice_learn_market_shocks_dgp(
 
     Baseline phase is a single multinomial draw with N_base.
     Shock phase draws num_markets markets with N_shock each.
+
+    Notes:
+      - xj is returned as (J, num_features).
+      - delta_true is computed from the scalar index x_scalar = xj[:, 0] when
+        num_features > 1 (see compute_delta_true).
     """
+    if int(num_features) < 1:
+        raise ValueError("num_features must be >= 1.")
+
     rng = np.random.default_rng(int(seed))
 
     # Shared observed features
-    xj = rng.normal(0.0, x_sd, size=(num_products,))
+    xj = rng.normal(0.0, x_sd, size=(num_products, int(num_features)))
     group_id = _assign_groups(num_products, num_groups)
 
     # Baseline coefficients (truth)

@@ -71,6 +71,7 @@ class StockpilingEstimator:
         eps: float,
         tol: float,
         max_iter: int,
+        init_theta: dict[str, float],
         sigmas: dict[str, float],
         seed: int,
     ) -> None:
@@ -135,18 +136,51 @@ class StockpilingEstimator:
         # ---- RNG (single stream) ----
         self.rng = tf.random.Generator.from_seed(int(seed))
 
-        # ---- initialize z at prior mode: zeros ----
-        z_mj = tf.zeros((self.M, self.J), dtype=tf.float64)
-        z_mn = tf.zeros((self.M, self.N), dtype=tf.float64)
-        z_m = tf.zeros((self.M,), dtype=tf.float64)
+        # ---- initialize z explicitly from init_theta (defaults to the old implicit init) ----
+        if init_theta is None:
+            init_theta = {
+                "beta": 0.5,
+                "alpha": 1.0,
+                "v": 1.0,
+                "fc": 1.0,
+                "lambda": 0.5,
+                "u_scale": 1.0,
+            }
+
+        # Scalars -> float64 tensors
+        beta0 = tf.convert_to_tensor(float(init_theta["beta"]), dtype=tf.float64)
+        alpha0 = tf.convert_to_tensor(float(init_theta["alpha"]), dtype=tf.float64)
+        v0 = tf.convert_to_tensor(float(init_theta["v"]), dtype=tf.float64)
+        fc0 = tf.convert_to_tensor(float(init_theta["fc"]), dtype=tf.float64)
+        lam0 = tf.convert_to_tensor(float(init_theta["lambda"]), dtype=tf.float64)
+        us0 = tf.convert_to_tensor(float(init_theta["u_scale"]), dtype=tf.float64)
+
+        # Fill to block shapes
+        beta0_mj = tf.fill((self.M, self.J), beta0)
+        alpha0_mj = tf.fill((self.M, self.J), alpha0)
+        v0_mj = tf.fill((self.M, self.J), v0)
+        fc0_mj = tf.fill((self.M, self.J), fc0)
+
+        lam0_mn = tf.fill((self.M, self.N), lam0)
+        us0_m = tf.fill((self.M,), us0)
+
+        # Inverse transforms: theta -> z
+        # logit(x) = log(x) - log(1-x) for beta, lambda; log(x) for positive blocks
+        z_beta0 = tf.math.log(beta0_mj) - tf.math.log1p(-beta0_mj)
+        z_alpha0 = tf.math.log(alpha0_mj)
+        z_v0 = tf.math.log(v0_mj)
+        z_fc0 = tf.math.log(fc0_mj)
+
+        z_lambda0 = tf.math.log(lam0_mn) - tf.math.log1p(-lam0_mn)
+        z_u_scale0 = tf.math.log(us0_m)
 
         self.z: dict[str, tf.Variable] = {
-            "z_beta": tf.Variable(z_mj, trainable=False, dtype=tf.float64),
-            "z_alpha": tf.Variable(z_mj, trainable=False, dtype=tf.float64),
-            "z_v": tf.Variable(z_mj, trainable=False, dtype=tf.float64),
-            "z_fc": tf.Variable(z_mj, trainable=False, dtype=tf.float64),
-            "z_lambda": tf.Variable(z_mn, trainable=False, dtype=tf.float64),
-            "z_u_scale": tf.Variable(z_m, trainable=False, dtype=tf.float64),
+            "z_beta": tf.Variable(z_beta0, trainable=False, dtype=tf.float64),
+            "z_alpha": tf.Variable(z_alpha0, trainable=False, dtype=tf.float64),
+            "z_v": tf.Variable(z_v0, trainable=False, dtype=tf.float64),
+            "z_fc": tf.Variable(z_fc0, trainable=False, dtype=tf.float64),
+            "z_lambda": tf.Variable(z_lambda0, trainable=False, dtype=tf.float64),
+            "z_u_scale": tf.Variable(z_u_scale0, trainable=False, dtype=tf.float64),
         }
 
         # ---- step sizes (set in fit) ----
@@ -359,11 +393,12 @@ class StockpilingEstimator:
         self.z["z_lambda"].assign(z_new)
         self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = rw_mh_step(
-            z_u_scale, logp_u_scale, self.k["u_scale"], self.rng
-        )
-        self.z["z_u_scale"].assign(z_new)
-        self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        # No u_scale update for testing
+        # z_new, accepted = rw_mh_step(
+        #    z_u_scale, logp_u_scale, self.k["u_scale"], self.rng
+        # )
+        # self.z["z_u_scale"].assign(z_new)
+        # self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
         # ---- Accumulate posterior means (no burn-in/thinning) ----
         self.saved.assign_add(1)

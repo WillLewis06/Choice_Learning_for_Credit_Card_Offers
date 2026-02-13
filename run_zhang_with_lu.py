@@ -1,4 +1,4 @@
-# run_cl_with_shocks.py
+# run_zhang_with_lu.py
 """
 Phase 1–2 orchestration for:
 - Feature-based choice model (baseline utilities)
@@ -18,9 +18,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 from datasets.zhang_with_lu_dgp import generate_choice_learn_market_shocks_dgp
 from models.featurebased import BaseFeatureBasedDeepHalo
-from lu.choice_learn.cl_shrinkage import (
-    ChoiceLearnShrinkageEstimator,
-)
+from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageEstimator
 
 # -----------------------------
 # Helpers (shared)
@@ -28,9 +26,23 @@ from lu.choice_learn.cl_shrinkage import (
 
 
 def build_items_tensor(xj: np.ndarray) -> tf.Tensor:
-    x = tf.convert_to_tensor(np.asarray(xj, dtype=np.float32))
-    items = tf.stack([x, tf.square(x)], axis=-1)
-    return items[None, :, :]
+    """
+    Convert product features xj into a single-items tensor for the choice model.
+
+    Expected:
+      xj: (J, d_x) or (J,)
+
+    Returns:
+      items_one: (1, J, d_x)
+    """
+    x = np.asarray(xj, dtype=np.float32)
+    if x.ndim == 1:
+        x = x[:, None]  # (J, 1)
+    elif x.ndim != 2:
+        raise ValueError(f"xj must be 1D or 2D. Got shape {x.shape}.")
+
+    items = tf.convert_to_tensor(x, dtype=tf.float32)  # (J, d_x)
+    return items[None, :, :]  # (1, J, d_x)
 
 
 def build_choice_index_tensor(qj_base: np.ndarray) -> tf.Tensor:
@@ -95,6 +107,7 @@ def run_choice_model(
     num_markets: int,
     N_base: int,
     N_shock: int,
+    num_features: int,
     x_sd: float,
     coef_sd: float,
     p_g_active: float,
@@ -117,6 +130,7 @@ def run_choice_model(
         num_groups=num_groups,
         N_base=N_base,
         N_shock=N_shock,
+        num_features=num_features,
         x_sd=x_sd,
         coef_sd=coef_sd,
         p_g_active=p_g_active,
@@ -271,8 +285,6 @@ def print_market_shock_diagnostics(
     nll_base = nll_post = nll_oracle = 0.0
 
     for t in range(T):
-        N_t = float(qjt[t].sum() + q0t[t])
-
         pb_j, pb_0 = probs_with_outside(delta_hat)
         pp_j, pp_0 = probs_with_outside(
             alpha_hat * delta_hat + E_bar_hat[t] + njt_hat[t]
@@ -305,7 +317,7 @@ def print_market_shock_diagnostics(
 
 
 def main() -> None:
-    # --- config (unchanged defaults) ---
+    # --- config ---
     seed = 123
     num_products = 15
     num_groups = 5
@@ -313,6 +325,9 @@ def main() -> None:
 
     N_base = 2_000
     N_shock = 1_000
+
+    # NEW: Phase-1 item feature dimension (d_x)
+    num_features = 4
 
     x_sd = 1.0
     coef_sd = 1.0
@@ -323,8 +338,8 @@ def main() -> None:
     p_active = 0.25
     sd_u = 0.5
 
-    depth = 10
-    width = 64
+    depth = 5
+    width = 32
     heads = 8
 
     epochs = 5
@@ -353,6 +368,7 @@ def main() -> None:
         num_markets=num_markets,
         N_base=N_base,
         N_shock=N_shock,
+        num_features=num_features,
         x_sd=x_sd,
         coef_sd=coef_sd,
         p_g_active=p_g_active,

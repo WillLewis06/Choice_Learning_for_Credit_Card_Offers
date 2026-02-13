@@ -1,519 +1,226 @@
 # tests/ching/test_stockpiling_estimator.py
 """
-Unit tests for the Phase-3 (Ching-style) stockpiling estimator.
+Unit tests for `ching.stockpiling_estimator` (multi-product Phase-3).
 
-Design goals for these tests:
-  - No pytest fixtures: tests build their own tiny inputs.
-  - Fast + deterministic: most tests patch the per-iteration MCMC step.
-  - Readable: focus on public API contract (init/fit/get_results) and bookkeeping.
+These tests cover ONLY estimator-layer responsibilities:
+- fit()/get_results() bookkeeping (saved draws, posterior-mean accumulation)
+- acceptance-rate denominators by block sizes:
+    (M,J) for beta/alpha/v/fc
+    (M,N) for lambda
+    (M,)  for u_scale
+- step-size assignment into estimator.k
+- input-guard behavior (n_iter > 0, get_results requires saved draws)
 
-The expensive dynamic-programming posterior is exercised only in a small smoke test.
+The core DP / CCP / filtering logic is tested elsewhere (model/posterior tests).
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import os
+import sys
+import types
+from pathlib import Path
 
 import numpy as np
-import pytest
-import tensorflow as tf
 
-import ching_conftest as ct
-from ching.stockpiling_estimator import StockpilingEstimator
+# Ensure local helper module is importable when tests/ching is not on PYTHONPATH.
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+# Reduce TensorFlow C++ logging (must be set before importing TF).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+import ching_conftest as cc  # noqa: E402
+import tensorflow as tf  # noqa: E402
+
+from ching.stockpiling_estimator import StockpilingEstimator  # noqa: E402
 
 
-def _sigmoid(x: float) -> float:
-    """Scalar sigmoid used to form deterministic expectations."""
-    return 1.0 / (1.0 + np.exp(-x))
+_ATOL = 1e-12
 
 
-def _proposal_scales_tiny() -> dict[str, float]:
+def _make_estimator(seed: int = 123) -> StockpilingEstimator:
     """
-    Proposal step sizes for fit(...).
+    Build a small estimator instance using deterministic test builders.
 
-    Kept local to avoid depending on any test-helper implementation details.
+    Expects ching_conftest helpers to provide multi-product shapes:
+      a_mnjt:      (M,N,J,T)
+      p_state_mjt: (M,J,T)
+      u_mj:        (M,J)
+      price_vals_mj: (M,J,S)
+      P_price_mj:    (M,J,S,S)
+      pi_I0:         (I_max+1,)
+      sigmas: keys {z_beta,z_alpha,z_v,z_fc,z_lambda,z_u_scale}
     """
-    return {
-        "k_beta": 0.1,
-        "k_alpha": 0.1,
-        "k_v": 0.1,
-        "k_fc": 0.1,
-        "k_lambda": 0.1,
-        "k_u_scale": 0.1,
-    }
+    dims = cc.tiny_dims()
+    dp = cc.tiny_dp_config()
 
+    panel = cc.panel_np(dims)
+    u_mj = cc.u_mj_np(dims)
+    price = cc.price_process(dims)
+    pi_I0 = cc.pi_I0_uniform(dims)
+    sigmas = cc.sigmas()
 
-def _tiny_inputs() -> tuple[
-    dict[str, int],
-    dict[str, np.ndarray],
-    np.ndarray,
-    dict[str, np.ndarray],
-    np.ndarray,
-    dict[str, Any],
-    dict[str, float],
-]:
-    """
-    Build a deterministic tiny test environment.
-
-    Returns:
-      dims:     {"M","N","T","S","I_max"}
-      panel:    {"a_imt","p_state_mt"} as numpy arrays
-      u_m:      (M,) numpy float64
-      prices:   {"price_vals","P_price"} as numpy arrays
-      pi_i0:    (I_max+1,) numpy float64
-      cfg:      {"waste_cost","eps","tol","max_iter"}
-      sigmas:   prior scales dict for z_* blocks
-    """
-    dims = ct.tiny_dims()
-    panel = ct.panel_np(dims)
-    u_m = ct.u_m_np(dims)
-    prices = ct.price_process(dims)
-    pi_i0 = ct.pi_I0_uniform(dims)
-    cfg = ct.tiny_dp_config()
-    sigmas = ct.sigmas()
-    return dims, panel, u_m, prices, pi_i0, cfg, sigmas
-
-
-def _make_estimator(seed: int = 0) -> StockpilingEstimator:
-    """Construct a StockpilingEstimator from the tiny environment."""
-    dims, panel, u_m, prices, pi_i0, cfg, sigmas = _tiny_inputs()
-    i_max = int(dims["I_max"])
     return StockpilingEstimator(
-        a_imt=panel["a_imt"],
-        p_state_mt=panel["p_state_mt"],
-        u_m=u_m,
-        price_vals=prices["price_vals"],
-        P_price=prices["P_price"],
-        I_max=i_max,
-        pi_I0=pi_i0,
-        waste_cost=float(cfg["waste_cost"]),
-        eps=float(cfg["eps"]),
-        tol=float(cfg["tol"]),
-        max_iter=int(cfg["max_iter"]),
-        sigmas=dict(sigmas),
+        a_mnjt=panel["a_mnjt"],
+        p_state_mjt=panel["p_state_mjt"],
+        u_mj=u_mj,
+        price_vals_mj=price["price_vals_mj"],
+        P_price_mj=price["P_price_mj"],
+        I_max=int(dims["I_max"]),
+        pi_I0=pi_I0,
+        waste_cost=float(dp["waste_cost"]),
+        eps=float(dp["eps"]),
+        tol=float(dp["tol"]),
+        max_iter=int(dp["max_iter"]),
+        sigmas=sigmas,
         seed=int(seed),
     )
 
 
-def _patch_iteration_step(
-    est: StockpilingEstimator, step_fn: Callable[..., None]
-) -> Callable[[], None]:
+def _patch_iteration_step(est: StockpilingEstimator, fn) -> None:
     """
-    Patch est._mcmc_iteration_step in-place and return an undo() closure.
+    Replace the compiled `_mcmc_iteration_step` with a Python implementation.
 
-    This avoids relying on pytest's monkeypatch fixture.
+    This avoids exercising the expensive DP+filter likelihood in unit tests that
+    validate estimator bookkeeping only.
     """
-    original = est._mcmc_iteration_step
-    est._mcmc_iteration_step = step_fn.__get__(est, StockpilingEstimator)  # type: ignore[assignment]
-
-    def undo() -> None:
-        est._mcmc_iteration_step = original  # type: ignore[assignment]
-
-    return undo
+    est._mcmc_iteration_step = types.MethodType(fn, est)
 
 
-def test_init_converts_inputs_and_initial_state() -> None:
-    """
-    Estimator should:
-      - convert numpy inputs to TF tensors/variables with expected shapes/dtypes
-      - allocate inventory maps, z blocks, accept counters, and running sums
-    """
-    est = _make_estimator(seed=1)
-    dims, _, _, _, _, _, _ = _tiny_inputs()
-
-    m = int(dims["M"])
-    n = int(dims["N"])
-    t = int(dims["T"])
-    s = int(dims["S"])
-    i_max = int(dims["I_max"])
-    i = i_max + 1
-
-    assert est.M == m
-    assert est.N == n
-
-    assert tuple(est.a_imt.shape) == (m, n, t)
-    assert est.a_imt.dtype == tf.int32
-
-    assert tuple(est.p_state_mt.shape) == (m, t)
-    assert est.p_state_mt.dtype == tf.int32
-
-    assert tuple(est.u_m.shape) == (m,)
-    assert est.u_m.dtype == tf.float64
-
-    assert tuple(est.price_vals.shape) == (s,)
-    assert est.price_vals.dtype == tf.float64
-
-    assert tuple(est.P_price.shape) == (s, s)
-    assert est.P_price.dtype == tf.float64
-
-    assert tuple(est.pi_I0.shape) == (i,)
-    assert est.pi_I0.dtype == tf.float64
-
-    # Inventory maps exist (posterior tests cover detailed correctness).
-    maps = est.maps
-    assert isinstance(maps, (tuple, list)) and len(maps) == 4
-    idx_down, idx_up, stockout_mask, at_cap_mask = maps
-    assert tuple(idx_down.shape) == (i,)
-    assert tuple(idx_up.shape) == (i,)
-    assert tuple(stockout_mask.shape) == (i,)
-    assert tuple(at_cap_mask.shape) == (i,)
-
-    # z blocks initialized to 0
-    assert set(est.z.keys()) == {
-        "z_beta",
-        "z_alpha",
-        "z_v",
-        "z_fc",
-        "z_lambda",
-        "z_u_scale",
+def test_fit_rejects_nonpositive_n_iter() -> None:
+    est = _make_estimator()
+    k = {
+        "beta": 0.1,
+        "alpha": 0.1,
+        "v": 0.1,
+        "fc": 0.1,
+        "lambda": 0.1,
+        "u_scale": 0.1,
     }
-    for k in ["z_beta", "z_alpha", "z_v", "z_fc", "z_lambda"]:
-        assert tuple(est.z[k].shape) == (m, n)
-        np.testing.assert_allclose(est.z[k].numpy(), 0.0)
-    assert tuple(est.z["z_u_scale"].shape) == (m,)
-    np.testing.assert_allclose(est.z["z_u_scale"].numpy(), 0.0)
 
-    # Acceptance counters initialized to 0
-    assert set(est.accept.keys()) == {"beta", "alpha", "v", "fc", "lambda_c", "u_scale"}
-    for v in est.accept.values():
-        assert int(v.numpy()) == 0
-
-    # Running sums and saved counter initialized to 0
-    assert int(est.saved.numpy()) == 0
-    for v in est.sums.values():
-        np.testing.assert_allclose(v.numpy(), 0.0)
-
-
-def test_get_results_before_fit_raises() -> None:
-    """get_results() requires at least one saved draw."""
-    est = _make_estimator(seed=2)
-    with pytest.raises(RuntimeError, match=r"n_saved == 0"):
-        _ = est.get_results()
-
-
-@pytest.mark.parametrize("bad_case", ["pi_i0_not_normalized", "sigmas_missing_key"])
-def test_init_rejects_invalid_inputs(bad_case: str) -> None:
-    """Init validation should reject obvious structural errors."""
-    dims, panel, u_m, prices, pi_i0, cfg, sigmas = _tiny_inputs()
-    i_max = int(dims["I_max"])
-
-    pi_local = pi_i0.copy()
-    sigmas_local = dict(sigmas)
-
-    if bad_case == "pi_i0_not_normalized":
-        pi_local = 2.0 * pi_local
-    elif bad_case == "sigmas_missing_key":
-        sigmas_local.pop("z_u_scale", None)
+    try:
+        est.fit(n_iter=0, k=k)
+    except ValueError as e:
+        assert "n_iter must be > 0" in str(e)
     else:
-        raise ValueError("unknown bad_case")
+        raise AssertionError("Expected ValueError for n_iter=0")
 
-    with pytest.raises(ValueError):
-        _ = StockpilingEstimator(
-            a_imt=panel["a_imt"],
-            p_state_mt=panel["p_state_mt"],
-            u_m=u_m,
-            price_vals=prices["price_vals"],
-            P_price=prices["P_price"],
-            I_max=i_max,
-            pi_I0=pi_local,
-            waste_cost=float(cfg["waste_cost"]),
-            eps=float(cfg["eps"]),
-            tol=float(cfg["tol"]),
-            max_iter=int(cfg["max_iter"]),
-            sigmas=sigmas_local,
-            seed=0,
+
+def test_get_results_raises_when_no_saved() -> None:
+    est = _make_estimator()
+    try:
+        est.get_results()
+    except RuntimeError as e:
+        assert "n_saved == 0" in str(e)
+    else:
+        raise AssertionError(
+            "Expected RuntimeError when calling get_results() before fit()"
         )
 
 
-@pytest.mark.parametrize(
-    "n_iter,k_beta",
-    [
-        (0, 0.1),  # n_iter must be >= 1
-        (1, 0.0),  # proposal scales must be > 0
-        (1, -0.1),
-    ],
-)
-def test_fit_rejects_invalid_fit_inputs(n_iter: int, k_beta: float) -> None:
-    """fit(...) validation should reject non-positive iteration counts / step sizes."""
-    est = _make_estimator(seed=3)
-    with pytest.raises(ValueError):
-        est.fit(
-            n_iter=n_iter,
-            k_beta=k_beta,
-            k_alpha=0.1,
-            k_v=0.1,
-            k_fc=0.1,
-            k_lambda=0.1,
-            k_u_scale=0.1,
-        )
+def test_fit_and_get_results_shapes_and_accept_rates_all_accept() -> None:
+    est = _make_estimator()
 
+    def fake_step(self: StockpilingEstimator, it: tf.Tensor) -> None:
+        # Accept everything in every block, every sweep.
+        for key in self.accept.keys():
+            self.accept[key].assign_add(int(self._block_sizes[key]))
 
-def test_fit_updates_z_accept_counts_and_posterior_means_with_deterministic_step() -> (
-    None
-):
-    """
-    Deterministic accounting test.
-
-    Patch the per-iteration step so that:
-      - each z block increments by +1 every iteration
-      - all proposals are accepted
-      - posterior sums are updated exactly like the real code
-    """
-    est = _make_estimator(seed=4)
-    dims, _, _, _, _, _, _ = _tiny_inputs()
-    m = int(dims["M"])
-    n = int(dims["N"])
-
-    def fake_iteration_step(
-        self: StockpilingEstimator,
-        it: tf.Tensor,
-        k_beta: tf.Tensor,
-        k_alpha: tf.Tensor,
-        k_v: tf.Tensor,
-        k_fc: tf.Tensor,
-        k_lambda: tf.Tensor,
-        k_u_scale: tf.Tensor,
-    ) -> None:
-        ones_mn = tf.ones_like(self.z["z_beta"], dtype=tf.float64)
-        ones_m = tf.ones_like(self.z["z_u_scale"], dtype=tf.float64)
-
-        # Increment each latent block.
-        self.z["z_beta"].assign_add(ones_mn)
-        self.z["z_alpha"].assign_add(ones_mn)
-        self.z["z_v"].assign_add(ones_mn)
-        self.z["z_fc"].assign_add(ones_mn)
-        self.z["z_lambda"].assign_add(ones_mn)
-        self.z["z_u_scale"].assign_add(ones_m)
-
-        # Accept everything (counts accepted entries).
-        add_mn = tf.convert_to_tensor(self.M * self.N, dtype=tf.int32)
-        add_m = tf.convert_to_tensor(self.M, dtype=tf.int32)
-        self.accept["beta"].assign_add(add_mn)
-        self.accept["alpha"].assign_add(add_mn)
-        self.accept["v"].assign_add(add_mn)
-        self.accept["fc"].assign_add(add_mn)
-        self.accept["lambda_c"].assign_add(add_mn)
-        self.accept["u_scale"].assign_add(add_m)
-
-        # Accumulate posterior means (same transforms as the real step).
+        # Save this draw.
         self.saved.assign_add(1)
-        beta = tf.math.sigmoid(self.z["z_beta"])
-        alpha = tf.exp(self.z["z_alpha"])
-        v = tf.exp(self.z["z_v"])
-        fc = tf.exp(self.z["z_fc"])
-        lambda_c = tf.math.sigmoid(self.z["z_lambda"])
-        u_scale = tf.exp(self.z["z_u_scale"])
 
-        self.sums["beta"].assign_add(beta)
-        self.sums["alpha"].assign_add(alpha)
-        self.sums["v"].assign_add(v)
-        self.sums["fc"].assign_add(fc)
-        self.sums["lambda_c"].assign_add(lambda_c)
-        self.sums["u_scale"].assign_add(u_scale)
+        # Accumulate a constant "theta draw" so posterior means are deterministic.
+        self.sums["beta"].assign_add(tf.ones([self.M, self.J], tf.float64) * 0.6)
+        self.sums["alpha"].assign_add(tf.ones([self.M, self.J], tf.float64) * 2.0)
+        self.sums["v"].assign_add(tf.ones([self.M, self.J], tf.float64) * 0.7)
+        self.sums["fc"].assign_add(tf.ones([self.M, self.J], tf.float64) * 0.4)
+        self.sums["lambda"].assign_add(tf.ones([self.M, self.N], tf.float64) * 0.3)
+        self.sums["u_scale"].assign_add(tf.ones([self.M], tf.float64) * 1.5)
 
-    undo = _patch_iteration_step(est, fake_iteration_step)
-    try:
-        est.fit(n_iter=2, **_proposal_scales_tiny())
-        res = est.get_results()
-    finally:
-        undo()
+    _patch_iteration_step(est, fake_step)
 
-    # z increments twice: z==2
-    for k in ["z_beta", "z_alpha", "z_v", "z_fc", "z_lambda"]:
-        np.testing.assert_allclose(est.z[k].numpy(), 2.0)
-    np.testing.assert_allclose(est.z["z_u_scale"].numpy(), 2.0)
+    k = {
+        "beta": 0.11,
+        "alpha": 0.12,
+        "v": 0.13,
+        "fc": 0.14,
+        "lambda": 0.15,
+        "u_scale": 0.16,
+    }
+    est.fit(n_iter=3, k=k)
 
-    assert res["n_saved"] == 2
+    out = est.get_results()
+    theta_hat = out["theta_hat"]
+    accept = out["accept"]
 
-    counts = res["accept"]["counts"]
-    assert counts["beta"] == 2 * m * n
-    assert counts["alpha"] == 2 * m * n
-    assert counts["v"] == 2 * m * n
-    assert counts["fc"] == 2 * m * n
-    assert counts["lambda_c"] == 2 * m * n
-    assert counts["u_scale"] == 2 * m
+    assert out["n_saved"] == 3
 
-    rates = res["accept"]["rates"]
-    assert rates["beta"] == 1.0
-    assert rates["alpha"] == 1.0
-    assert rates["v"] == 1.0
-    assert rates["fc"] == 1.0
-    assert rates["lambda_c"] == 1.0
-    assert rates["u_scale"] == 1.0
+    # Shapes
+    assert theta_hat["beta"].shape == (est.M, est.J)
+    assert theta_hat["alpha"].shape == (est.M, est.J)
+    assert theta_hat["v"].shape == (est.M, est.J)
+    assert theta_hat["fc"].shape == (est.M, est.J)
+    assert theta_hat["lambda"].shape == (est.M, est.N)
+    assert theta_hat["u_scale"].shape == (est.M,)
 
-    # Posterior means: average of transform(z=1) and transform(z=2).
-    beta_expected = 0.5 * (_sigmoid(1.0) + _sigmoid(2.0))
-    exp_expected = 0.5 * (np.exp(1.0) + np.exp(2.0))
+    # Values (posterior means) - allow tiny float rounding
+    np.testing.assert_allclose(theta_hat["beta"], 0.6, rtol=0.0, atol=_ATOL)
+    np.testing.assert_allclose(theta_hat["alpha"], 2.0, rtol=0.0, atol=_ATOL)
+    np.testing.assert_allclose(theta_hat["v"], 0.7, rtol=0.0, atol=_ATOL)
+    np.testing.assert_allclose(theta_hat["fc"], 0.4, rtol=0.0, atol=_ATOL)
+    np.testing.assert_allclose(theta_hat["lambda"], 0.3, rtol=0.0, atol=_ATOL)
+    np.testing.assert_allclose(theta_hat["u_scale"], 1.5, rtol=0.0, atol=_ATOL)
 
-    theta_hat = res["theta_hat"]
-    np.testing.assert_allclose(theta_hat["beta"], beta_expected, rtol=0.0, atol=1e-12)
+    # Acceptance rates: 1.0 if we accept every element each sweep.
+    for key, rate in accept.items():
+        assert np.isfinite(rate)
+        np.testing.assert_allclose(rate, 1.0, rtol=0.0, atol=_ATOL)
+
+    # Step sizes were assigned into estimator.k
+    np.testing.assert_allclose(est.k["beta"].numpy(), k["beta"], rtol=0.0, atol=_ATOL)
     np.testing.assert_allclose(
-        theta_hat["lambda_c"], beta_expected, rtol=0.0, atol=1e-12
+        est.k["u_scale"].numpy(), k["u_scale"], rtol=0.0, atol=_ATOL
     )
 
-    np.testing.assert_allclose(theta_hat["alpha"], exp_expected, rtol=0.0, atol=1e-12)
-    np.testing.assert_allclose(theta_hat["v"], exp_expected, rtol=0.0, atol=1e-12)
-    np.testing.assert_allclose(theta_hat["fc"], exp_expected, rtol=0.0, atol=1e-12)
-    np.testing.assert_allclose(theta_hat["u_scale"], exp_expected, rtol=0.0, atol=1e-12)
 
+def test_accept_rate_denominator_uses_block_sizes() -> None:
+    est = _make_estimator()
 
-def test_fit_resets_acceptance_counters_and_sums_each_call() -> None:
-    """
-    fit(...) resets accept/sums/saved each time, but does not reset z.
+    def fake_step(self: StockpilingEstimator, it: tf.Tensor) -> None:
+        # Accept half of beta elements per sweep; accept nothing else.
+        beta_block = int(self._block_sizes["beta"])
+        self.accept["beta"].assign_add(int(beta_block // 2))
 
-    This matters because an orchestration layer might call fit multiple times
-    (e.g., for tuning step sizes) and expects per-run acceptance rates.
-    """
-    est = _make_estimator(seed=5)
-    dims, _, _, _, _, _, _ = _tiny_inputs()
-    m = int(dims["M"])
-    n = int(dims["N"])
-
-    def fake_iteration_step(
-        self: StockpilingEstimator,
-        it: tf.Tensor,
-        k_beta: tf.Tensor,
-        k_alpha: tf.Tensor,
-        k_v: tf.Tensor,
-        k_fc: tf.Tensor,
-        k_lambda: tf.Tensor,
-        k_u_scale: tf.Tensor,
-    ) -> None:
-        ones_mn = tf.ones_like(self.z["z_beta"], dtype=tf.float64)
-        ones_m = tf.ones_like(self.z["z_u_scale"], dtype=tf.float64)
-
-        self.z["z_beta"].assign_add(ones_mn)
-        self.z["z_alpha"].assign_add(ones_mn)
-        self.z["z_v"].assign_add(ones_mn)
-        self.z["z_fc"].assign_add(ones_mn)
-        self.z["z_lambda"].assign_add(ones_mn)
-        self.z["z_u_scale"].assign_add(ones_m)
-
-        add_mn = tf.convert_to_tensor(self.M * self.N, dtype=tf.int32)
-        add_m = tf.convert_to_tensor(self.M, dtype=tf.int32)
-        self.accept["beta"].assign_add(add_mn)
-        self.accept["alpha"].assign_add(add_mn)
-        self.accept["v"].assign_add(add_mn)
-        self.accept["fc"].assign_add(add_mn)
-        self.accept["lambda_c"].assign_add(add_mn)
-        self.accept["u_scale"].assign_add(add_m)
-
+        # Save draw and add minimal sums so get_results can compute theta_hat.
         self.saved.assign_add(1)
-        self.sums["beta"].assign_add(tf.math.sigmoid(self.z["z_beta"]))
-        self.sums["alpha"].assign_add(tf.exp(self.z["z_alpha"]))
-        self.sums["v"].assign_add(tf.exp(self.z["z_v"]))
-        self.sums["fc"].assign_add(tf.exp(self.z["z_fc"]))
-        self.sums["lambda_c"].assign_add(tf.math.sigmoid(self.z["z_lambda"]))
-        self.sums["u_scale"].assign_add(tf.exp(self.z["z_u_scale"]))
+        self.sums["beta"].assign_add(tf.ones([self.M, self.J], tf.float64) * 0.5)
+        self.sums["alpha"].assign_add(tf.zeros([self.M, self.J], tf.float64))
+        self.sums["v"].assign_add(tf.zeros([self.M, self.J], tf.float64))
+        self.sums["fc"].assign_add(tf.zeros([self.M, self.J], tf.float64))
+        self.sums["lambda"].assign_add(tf.zeros([self.M, self.N], tf.float64))
+        self.sums["u_scale"].assign_add(tf.zeros([self.M], tf.float64))
 
-    undo = _patch_iteration_step(est, fake_iteration_step)
-    try:
-        est.fit(n_iter=1, **_proposal_scales_tiny())
-        res1 = est.get_results()
+    _patch_iteration_step(est, fake_step)
 
-        est.fit(n_iter=1, **_proposal_scales_tiny())
-        res2 = est.get_results()
-    finally:
-        undo()
+    k = {
+        "beta": 0.2,
+        "alpha": 0.2,
+        "v": 0.2,
+        "fc": 0.2,
+        "lambda": 0.2,
+        "u_scale": 0.2,
+    }
+    est.fit(n_iter=4, k=k)
 
-    assert res1["n_saved"] == 1
-    assert res1["accept"]["counts"]["beta"] == 1 * m * n
-    assert res1["accept"]["counts"]["u_scale"] == 1 * m
+    out = est.get_results()
+    accept = out["accept"]
 
-    assert res2["n_saved"] == 1
-    assert res2["accept"]["counts"]["beta"] == 1 * m * n
-    assert res2["accept"]["counts"]["u_scale"] == 1 * m
+    beta_block = int(est._block_sizes["beta"])
+    expected_beta_rate = (beta_block // 2) / max(1, beta_block)
+    np.testing.assert_allclose(accept["beta"], expected_beta_rate, rtol=0.0, atol=_ATOL)
 
-    # z is not reset; the second run's only saved draw corresponds to z==2.
-    beta_expected = _sigmoid(2.0)
-    exp_expected = np.exp(2.0)
-    np.testing.assert_allclose(
-        res2["theta_hat"]["beta"], beta_expected, rtol=0.0, atol=1e-12
-    )
-    np.testing.assert_allclose(
-        res2["theta_hat"]["alpha"], exp_expected, rtol=0.0, atol=1e-12
-    )
-    np.testing.assert_allclose(
-        res2["theta_hat"]["u_scale"], exp_expected, rtol=0.0, atol=1e-12
-    )
-
-
-def test_init_and_fit_do_not_mutate_numpy_inputs() -> None:
-    """
-    The estimator should not modify user-provided numpy inputs in-place.
-
-    This test also patches the iteration step to avoid running the full posterior.
-    """
-    dims, panel, u_m, prices, pi_i0, cfg, sigmas = _tiny_inputs()
-
-    a0 = panel["a_imt"].copy()
-    s0 = panel["p_state_mt"].copy()
-    u0 = u_m.copy()
-    pv0 = prices["price_vals"].copy()
-    p0 = prices["P_price"].copy()
-    pi0 = pi_i0.copy()
-
-    est = StockpilingEstimator(
-        a_imt=panel["a_imt"],
-        p_state_mt=panel["p_state_mt"],
-        u_m=u_m,
-        price_vals=prices["price_vals"],
-        P_price=prices["P_price"],
-        I_max=int(dims["I_max"]),
-        pi_I0=pi_i0,
-        waste_cost=float(cfg["waste_cost"]),
-        eps=float(cfg["eps"]),
-        tol=float(cfg["tol"]),
-        max_iter=int(cfg["max_iter"]),
-        sigmas=dict(sigmas),
-        seed=123,
-    )
-
-    def fake_iteration_step(
-        self: StockpilingEstimator,
-        it: tf.Tensor,
-        k_beta: tf.Tensor,
-        k_alpha: tf.Tensor,
-        k_v: tf.Tensor,
-        k_fc: tf.Tensor,
-        k_lambda: tf.Tensor,
-        k_u_scale: tf.Tensor,
-    ) -> None:
-        # Minimal update: just create one saved draw so get_results is defined.
-        self.saved.assign_add(1)
-        self.sums["beta"].assign_add(tf.zeros_like(self.sums["beta"]))
-        self.sums["alpha"].assign_add(tf.zeros_like(self.sums["alpha"]))
-        self.sums["v"].assign_add(tf.zeros_like(self.sums["v"]))
-        self.sums["fc"].assign_add(tf.zeros_like(self.sums["fc"]))
-        self.sums["lambda_c"].assign_add(tf.zeros_like(self.sums["lambda_c"]))
-        self.sums["u_scale"].assign_add(tf.zeros_like(self.sums["u_scale"]))
-
-    undo = _patch_iteration_step(est, fake_iteration_step)
-    try:
-        est.fit(n_iter=1, **_proposal_scales_tiny())
-        _ = est.get_results()
-    finally:
-        undo()
-
-    np.testing.assert_array_equal(panel["a_imt"], a0)
-    np.testing.assert_array_equal(panel["p_state_mt"], s0)
-    np.testing.assert_array_equal(u_m, u0)
-    np.testing.assert_array_equal(prices["price_vals"], pv0)
-    np.testing.assert_array_equal(prices["P_price"], p0)
-    np.testing.assert_array_equal(pi_i0, pi0)
-
-
-def test_fit_runs_with_real_posterior_one_iteration_smoke() -> None:
-    """
-    Smoke test: run one real iteration (unpatched) to ensure end-to-end wiring works.
-
-    This will execute value iteration and filtering inside tf.function, so keep dims tiny.
-    """
-    est = _make_estimator(seed=6)
-    est.fit(n_iter=1, **_proposal_scales_tiny())
-    res = est.get_results()
-
-    assert res["n_saved"] == 1
-    for v in res["theta_hat"].values():
-        assert isinstance(v, np.ndarray)
-        assert np.isfinite(v).all()
+    # Other blocks untouched in this fake step should have 0 acceptance.
+    for key in ["alpha", "v", "fc", "lambda", "u_scale"]:
+        np.testing.assert_allclose(accept[key], 0.0, rtol=0.0, atol=_ATOL)

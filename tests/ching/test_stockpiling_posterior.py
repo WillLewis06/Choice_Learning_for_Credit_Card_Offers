@@ -1,14 +1,21 @@
-# tests/ching/test_stockpiling_posterior.py
+# test_stockpiling_posterior.py
 """
-Unit tests for `ching.stockpiling_posterior`.
+Pytests for ching.stockpiling_posterior (multi-product Phase-3).
 
-These tests cover ONLY posterior-layer responsibilities:
-- priors on unconstrained z-blocks
-- loglik_mn(z, ...) wrapper (delegates to stockpiling_model)
-- log-posterior "views" used by RW-MH block updates
+These tests assume the updated Phase-3 shapes:
+  a_mnjt        (M,N,J,T)
+  p_state_mjt   (M,J,T)
+  u_mj          (M,J)
+  price_vals_mj (M,J,S)
+  P_price_mj    (M,J,S,S)
 
-Core mechanics (DP, CCPs, inventory filter, maps, transforms) are tested in:
-  tests/ching/test_stockpiling_model.py
+Posterior API:
+  logprior_normal(z_block, sigma)
+  loglik_mnj(z, inputs) -> (M,N,J)
+  logpost_z_* views with shapes:
+    beta/alpha/v/fc : (M,J)
+    lambda          : (M,N)
+    u_scale         : (M,)
 """
 
 from __future__ import annotations
@@ -16,48 +23,41 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import numpy as np
-
-import ching_conftest as cc  # sets TF_CPP_MIN_LOG_LEVEL before importing TF
 import tensorflow as tf
 
-import ching.stockpiling_model as sm
-import ching.stockpiling_posterior as sp
+import ching_conftest as cc
+from ching import stockpiling_model as sm
+from ching import stockpiling_posterior as sp
+
+
+def _to_tf_float64_dict(d: dict[str, np.ndarray]) -> dict[str, tf.Tensor]:
+    return {
+        k: tf.convert_to_tensor(np.asarray(v), dtype=tf.float64) for k, v in d.items()
+    }
 
 
 def _sigmas_tf(sigmas: dict[str, float]) -> dict[str, tf.Tensor]:
-    """Convert prior scales to float64 TensorFlow tensors."""
     return {
         k: tf.convert_to_tensor(float(v), dtype=tf.float64) for k, v in sigmas.items()
     }
 
 
-def _to_tf_float64_dict(arrs: dict[str, np.ndarray]) -> dict[str, tf.Tensor]:
-    """Convert a dict of numpy arrays to float64 TensorFlow tensors."""
-    return {k: tf.convert_to_tensor(v, dtype=tf.float64) for k, v in arrs.items()}
-
-
 def _build_tf_inputs(
     panel_np: dict[str, np.ndarray],
-    u_m_np: np.ndarray,
+    u_mj_np: np.ndarray,
     price_proc: dict[str, np.ndarray],
     pi_i0_np: np.ndarray,
     dp_cfg: dict[str, float | int],
+    maps: sm.InventoryMaps,
 ) -> dict[str, tf.Tensor]:
-    """
-    Build canonical TF inputs for posterior calls.
-
-    Returns a dict containing:
-      a_imt, p_state_mt: int32
-      u_m, price_vals, P_price, pi_I0: float64
-      waste_cost, eps, tol: float64
-      max_iter: int32
-    """
     return {
-        "a_imt": tf.convert_to_tensor(panel_np["a_imt"], dtype=tf.int32),
-        "p_state_mt": tf.convert_to_tensor(panel_np["p_state_mt"], dtype=tf.int32),
-        "u_m": tf.convert_to_tensor(u_m_np, dtype=tf.float64),
-        "price_vals": tf.convert_to_tensor(price_proc["price_vals"], dtype=tf.float64),
-        "P_price": tf.convert_to_tensor(price_proc["P_price"], dtype=tf.float64),
+        "a_mnjt": tf.convert_to_tensor(panel_np["a_mnjt"], dtype=tf.int32),
+        "p_state_mjt": tf.convert_to_tensor(panel_np["p_state_mjt"], dtype=tf.int32),
+        "u_mj": tf.convert_to_tensor(u_mj_np, dtype=tf.float64),
+        "price_vals_mj": tf.convert_to_tensor(
+            price_proc["price_vals_mj"], dtype=tf.float64
+        ),
+        "P_price_mj": tf.convert_to_tensor(price_proc["P_price_mj"], dtype=tf.float64),
         "pi_I0": tf.convert_to_tensor(pi_i0_np, dtype=tf.float64),
         "waste_cost": tf.convert_to_tensor(
             float(dp_cfg["waste_cost"]), dtype=tf.float64
@@ -65,6 +65,7 @@ def _build_tf_inputs(
         "eps": tf.convert_to_tensor(float(dp_cfg["eps"]), dtype=tf.float64),
         "tol": tf.convert_to_tensor(float(dp_cfg["tol"]), dtype=tf.float64),
         "max_iter": tf.convert_to_tensor(int(dp_cfg["max_iter"]), dtype=tf.int32),
+        "maps": maps,
     }
 
 
@@ -72,118 +73,87 @@ def _tiny_env() -> tuple[
     dict[str, int],
     dict[str, tf.Tensor],
     dict[str, tf.Tensor],
-    dict[str, float],
-    sm.InventoryMaps,
+    dict[str, tf.Tensor],
 ]:
-    """
-    Build the small deterministic Phase-3 objects used by all posterior tests.
-
-    Returns:
-      tiny_dims:   dict with M,N,T,S,I_max
-      tf_inputs:   canonical TF inputs
-      z_blocks_tf: unconstrained blocks (float64) at the prior mode (all zeros)
-      sigmas:      prior scales (python floats)
-      maps:        inventory maps tuple (from stockpiling_model)
-    """
-    tf.random.set_seed(0)
-
-    tiny_dims = cc.tiny_dims()
+    dims = cc.tiny_dims()
     dp_cfg = cc.tiny_dp_config()
 
-    panel_np = cc.panel_np(tiny_dims)
-    u_m_np = cc.u_m_np(tiny_dims)
-    price_proc = cc.price_process(tiny_dims)
-    pi_i0_np = cc.pi_I0_uniform(tiny_dims)
-
-    tf_inputs = _build_tf_inputs(panel_np, u_m_np, price_proc, pi_i0_np, dp_cfg)
-    z_blocks_tf = _to_tf_float64_dict(cc.z_blocks_np(tiny_dims))
-    sigmas = cc.sigmas()
+    panel_np = cc.panel_np(dims)
+    u_mj_np = cc.u_mj_np(dims)
+    price_proc = cc.price_process(dims)
+    pi_i0_np = cc.pi_I0_uniform(dims)
 
     maps = sm.build_inventory_maps(
-        tf.convert_to_tensor(int(tiny_dims["I_max"]), dtype=tf.int32)
-    )
-    return tiny_dims, tf_inputs, z_blocks_tf, sigmas, maps
-
-
-def test_loglik_mn_runs_end_to_end_and_is_finite() -> None:
-    """`loglik_mn` should run end-to-end and return finite (M,N) outputs."""
-    tiny_dims, tf_inputs, z_blocks_tf, _, maps = _tiny_env()
-
-    ll_mn = sp.loglik_mn(
-        z=z_blocks_tf,
-        a_imt=tf_inputs["a_imt"],
-        p_state_mt=tf_inputs["p_state_mt"],
-        u_m=tf_inputs["u_m"],
-        price_vals=tf_inputs["price_vals"],
-        P_price=tf_inputs["P_price"],
-        pi_I0=tf_inputs["pi_I0"],
-        waste_cost=tf_inputs["waste_cost"],
-        eps=tf_inputs["eps"],
-        tol=tf.constant(1.0e-6, tf.float64),
-        max_iter=tf.constant(60, tf.int32),
-        maps=maps,
+        tf.convert_to_tensor(int(dims["I_max"]), dtype=tf.int32)
     )
 
-    M, N = tiny_dims["M"], tiny_dims["N"]
-    assert tuple(ll_mn.shape) == (M, N)
-    ll_np = ll_mn.numpy()
+    inputs = _build_tf_inputs(panel_np, u_mj_np, price_proc, pi_i0_np, dp_cfg, maps)
+    z = _to_tf_float64_dict(cc.z_blocks_np(dims))
+    sigma_z = _sigmas_tf(cc.sigmas())
+
+    return dims, inputs, z, sigma_z
+
+
+def test_logprior_normal_matches_formula() -> None:
+    x = tf.constant([[0.0, 1.5], [-2.0, 3.0]], dtype=tf.float64)
+    sigma = tf.constant(2.0, dtype=tf.float64)
+
+    out = sp.logprior_normal(x, sigma).numpy()
+    expected = (-0.5 * (x.numpy() / 2.0) ** 2).astype(np.float64)
+    np.testing.assert_allclose(out, expected, rtol=0, atol=0)
+
+
+def test_loglik_mnj_runs_end_to_end_and_is_finite() -> None:
+    dims, inputs, z, _ = _tiny_env()
+
+    ll_mnj = sp.loglik_mnj(z=z, inputs=inputs)
+
+    M, N, J = int(dims["M"]), int(dims["N"]), int(dims["J"])
+    assert tuple(ll_mnj.shape) == (M, N, J)
+
+    ll_np = ll_mnj.numpy()
     assert np.isfinite(ll_np).all()
 
 
-def test_logpost_views_combine_ll_and_prior_correctly_with_patch() -> None:
-    """
-    The log-posterior "view" functions should equal:
-      loglik_mn(z) + logprior(z_block)                     (for MN blocks)
-      sum_n loglik_mn(z)[m,n] + logprior(z_u_scale[m])     (for market block)
-    """
-    tiny_dims, tf_inputs, z_blocks_tf, sigmas, maps = _tiny_env()
-    M, N = tiny_dims["M"], tiny_dims["N"]
-    sigmas_tf = _sigmas_tf(sigmas)
+def test_logpost_views_combine_reduced_ll_and_prior_with_patch() -> None:
+    dims, inputs, z, sigma_z = _tiny_env()
+    M, N, J = int(dims["M"]), int(dims["N"]), int(dims["J"])
 
     ll_fake = tf.reshape(
-        tf.linspace(tf.constant(-0.2, tf.float64), tf.constant(0.3, tf.float64), M * N),
-        [M, N],
+        tf.linspace(
+            tf.constant(-0.2, tf.float64), tf.constant(0.3, tf.float64), M * N * J
+        ),
+        [M, N, J],
     )
 
-    with patch.object(sp, "loglik_mn", return_value=ll_fake):
-        out_beta = sp.logpost_z_beta_mn(
-            z=z_blocks_tf,
-            a_imt=tf_inputs["a_imt"],
-            p_state_mt=tf_inputs["p_state_mt"],
-            u_m=tf_inputs["u_m"],
-            price_vals=tf_inputs["price_vals"],
-            P_price=tf_inputs["P_price"],
-            pi_I0=tf_inputs["pi_I0"],
-            waste_cost=tf_inputs["waste_cost"],
-            eps=tf_inputs["eps"],
-            tol=tf.constant(1.0e-6, tf.float64),
-            max_iter=tf.constant(10, tf.int32),
-            maps=maps,
-            sigmas=sigmas_tf,
-        )
-
-        prior_beta = sp.logprior_normal_mn(z_blocks_tf["z_beta"], sigmas_tf["z_beta"])
-        np.testing.assert_allclose(out_beta.numpy(), (ll_fake + prior_beta).numpy())
-
-        out_us = sp.logpost_u_scale_m(
-            z=z_blocks_tf,
-            a_imt=tf_inputs["a_imt"],
-            p_state_mt=tf_inputs["p_state_mt"],
-            u_m=tf_inputs["u_m"],
-            price_vals=tf_inputs["price_vals"],
-            P_price=tf_inputs["P_price"],
-            pi_I0=tf_inputs["pi_I0"],
-            waste_cost=tf_inputs["waste_cost"],
-            eps=tf_inputs["eps"],
-            tol=tf.constant(1.0e-6, tf.float64),
-            max_iter=tf.constant(10, tf.int32),
-            maps=maps,
-            sigmas=sigmas_tf,
-        )
-
-        prior_us = sp.logprior_normal_m(
-            z_blocks_tf["z_u_scale"], sigmas_tf["z_u_scale"]
-        )
+    with patch.object(sp, "loglik_mnj", return_value=ll_fake):
+        # (M,J) views: sum over N (axis=1)
+        out_beta = sp.logpost_z_beta_mj(z=z, inputs=inputs, sigma_z=sigma_z)
+        prior_beta = sp.logprior_normal(z["z_beta"], sigma_z["z_beta"])
+        expected_beta = tf.reduce_sum(ll_fake, axis=1) + prior_beta
         np.testing.assert_allclose(
-            out_us.numpy(), (tf.reduce_sum(ll_fake, axis=1) + prior_us).numpy()
+            out_beta.numpy(), expected_beta.numpy(), rtol=0, atol=0
+        )
+
+        out_alpha = sp.logpost_z_alpha_mj(z=z, inputs=inputs, sigma_z=sigma_z)
+        prior_alpha = sp.logprior_normal(z["z_alpha"], sigma_z["z_alpha"])
+        expected_alpha = tf.reduce_sum(ll_fake, axis=1) + prior_alpha
+        np.testing.assert_allclose(
+            out_alpha.numpy(), expected_alpha.numpy(), rtol=0, atol=0
+        )
+
+        # (M,N) view: sum over J (axis=2)
+        out_lambda = sp.logpost_z_lambda_mn(z=z, inputs=inputs, sigma_z=sigma_z)
+        prior_lambda = sp.logprior_normal(z["z_lambda"], sigma_z["z_lambda"])
+        expected_lambda = tf.reduce_sum(ll_fake, axis=2) + prior_lambda
+        np.testing.assert_allclose(
+            out_lambda.numpy(), expected_lambda.numpy(), rtol=0, atol=0
+        )
+
+        # (M,) view: sum over N,J (axes=[1,2])
+        out_u_scale = sp.logpost_z_u_scale_m(z=z, inputs=inputs, sigma_z=sigma_z)
+        prior_u_scale = sp.logprior_normal(z["z_u_scale"], sigma_z["z_u_scale"])
+        expected_u_scale = tf.reduce_sum(ll_fake, axis=[1, 2]) + prior_u_scale
+        np.testing.assert_allclose(
+            out_u_scale.numpy(), expected_u_scale.numpy(), rtol=0, atol=0
         )
