@@ -34,14 +34,16 @@ from typing import Any
 import numpy as np
 import tensorflow as tf
 
+from toolbox.mcmc_kernels import rw_mh_step
+
 from ching import stockpiling_model as model
-from ching.stockpiling_updates import (
-    update_z_alpha_mj,
-    update_z_beta_mj,
-    update_z_fc_mj,
-    update_z_lambda_mn,
-    update_z_u_scale_m,
-    update_z_v_mj,
+from ching.stockpiling_posterior import (
+    logpost_z_alpha_mj,
+    logpost_z_beta_mj,
+    logpost_z_fc_mj,
+    logpost_z_lambda_mn,
+    logpost_z_u_scale_m,
+    logpost_z_v_mj,
 )
 from ching.stockpiling_diagnostics import report_iteration_progress
 
@@ -134,8 +136,9 @@ class StockpilingEstimator:
         # ---- RNG (single stream) ----
         self.rng = tf.random.Generator.from_seed(int(seed))
 
-        # ---- initialize z explicitly from init_theta ----
+        # ---- initialize z explicitly from init_theta (defaults to the old implicit init) ----
 
+        # Scalars -> float64 tensors
         beta0 = tf.convert_to_tensor(float(init_theta["beta"]), dtype=tf.float64)
         alpha0 = tf.convert_to_tensor(float(init_theta["alpha"]), dtype=tf.float64)
         v0 = tf.convert_to_tensor(float(init_theta["v"]), dtype=tf.float64)
@@ -143,6 +146,7 @@ class StockpilingEstimator:
         lam0 = tf.convert_to_tensor(float(init_theta["lambda"]), dtype=tf.float64)
         us0 = tf.convert_to_tensor(float(init_theta["u_scale"]), dtype=tf.float64)
 
+        # Fill to block shapes
         beta0_mj = tf.fill((self.M, self.J), beta0)
         alpha0_mj = tf.fill((self.M, self.J), alpha0)
         v0_mj = tf.fill((self.M, self.J), v0)
@@ -151,6 +155,7 @@ class StockpilingEstimator:
         lam0_mn = tf.fill((self.M, self.N), lam0)
         us0_m = tf.fill((self.M,), us0)
 
+        # Inverse transforms: theta -> z
         # logit(x) = log(x) - log(1-x) for beta, lambda; log(x) for positive blocks
         z_beta0 = tf.math.log(beta0_mj) - tf.math.log1p(-beta0_mj)
         z_alpha0 = tf.math.log(alpha0_mj)
@@ -233,6 +238,7 @@ class StockpilingEstimator:
         if n_iter <= 0:
             raise ValueError("n_iter must be > 0")
 
+        # Assign step sizes once (avoids passing many args into the compiled step).
         self.k["beta"].assign(float(k["beta"]))
         self.k["alpha"].assign(float(k["alpha"]))
         self.k["v"].assign(float(k["v"]))
@@ -248,33 +254,44 @@ class StockpilingEstimator:
 
     def get_results(self) -> dict[str, object]:
         """
-        Return posterior means and acceptance rates as Python/numpy objects.
+        Return final (last) parameter values and acceptance rates as Python/numpy objects.
 
         Returns:
           {
-            "theta_hat": {"beta","alpha","v","fc","lambda","u_scale"},
+            "theta_hat": {"beta","alpha","v","fc","lambda","u_scale"},  # LAST draw (not posterior mean)
             "n_saved": int,
-            "accept": {"beta","alpha","v","fc","lambda","u_scale"}  # rates only
+            "accept": {"beta","alpha","v","fc","lambda","u_scale"}      # acceptance rates
           }
         """
-        n_saved = int(self.saved.numpy())
-        if n_saved <= 0:
-            raise RuntimeError("No saved iterations (n_saved == 0). Call fit().")
-
-        saved_f = tf.cast(self.saved, tf.float64)
+        # Final (current) constrained parameters from the current unconstrained state self.z
+        theta_last = model.unconstrained_to_theta(
+            {
+                "z_beta": self.z["z_beta"],
+                "z_alpha": self.z["z_alpha"],
+                "z_v": self.z["z_v"],
+                "z_fc": self.z["z_fc"],
+                "z_lambda": self.z["z_lambda"],
+                "z_u_scale": self.z["z_u_scale"],
+            }
+        )
 
         theta_hat = {
-            "beta": (self.sums["beta"] / saved_f).numpy(),
-            "alpha": (self.sums["alpha"] / saved_f).numpy(),
-            "v": (self.sums["v"] / saved_f).numpy(),
-            "fc": (self.sums["fc"] / saved_f).numpy(),
-            "lambda": (self.sums["lambda"] / saved_f).numpy(),
-            "u_scale": (self.sums["u_scale"] / saved_f).numpy(),
+            "beta": theta_last["beta"].numpy(),
+            "alpha": theta_last["alpha"].numpy(),
+            "v": theta_last["v"].numpy(),
+            "fc": theta_last["fc"].numpy(),
+            "lambda": theta_last["lambda"].numpy(),
+            "u_scale": theta_last["u_scale"].numpy(),
         }
 
+        n_saved = int(self.saved.numpy())
         counts = {k: int(v.numpy()) for k, v in self.accept.items()}
+
+        # Safe denominator if you call get_results() before any saves
+        denom_saved = max(1, n_saved)
         rates = {
-            k: counts[k] / max(1, n_saved * self._block_sizes[k]) for k in counts.keys()
+            k: counts[k] / max(1, denom_saved * self._block_sizes[k])
+            for k in counts.keys()
         }
 
         return {"theta_hat": theta_hat, "n_saved": n_saved, "accept": rates}
@@ -282,17 +299,6 @@ class StockpilingEstimator:
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
-
-    def _current_z_dict(self) -> dict[str, tf.Tensor]:
-        """Return the current unconstrained state z as a dict for model/posterior calls."""
-        return {
-            "z_beta": self.z["z_beta"],
-            "z_alpha": self.z["z_alpha"],
-            "z_v": self.z["z_v"],
-            "z_fc": self.z["z_fc"],
-            "z_lambda": self.z["z_lambda"],
-            "z_u_scale": self.z["z_u_scale"],
-        }
 
     def _reset_chain_state(self) -> None:
         """Reset acceptance counters and posterior-mean accumulators."""
@@ -313,6 +319,7 @@ class StockpilingEstimator:
         inputs = self.inputs
         sigma_z = self.sigma_z
 
+        # Current z blocks.
         z_beta = self.z["z_beta"]
         z_alpha = self.z["z_alpha"]
         z_v = self.z["z_v"]
@@ -320,96 +327,77 @@ class StockpilingEstimator:
         z_lambda = self.z["z_lambda"]
         z_u_scale = self.z["z_u_scale"]
 
-        # ---- Parameter-block updates (RW-MH, elementwise acceptance) ----
+        def z_from_parts(
+            z_beta_t: tf.Tensor,
+            z_alpha_t: tf.Tensor,
+            z_v_t: tf.Tensor,
+            z_fc_t: tf.Tensor,
+            z_lambda_t: tf.Tensor,
+            z_u_scale_t: tf.Tensor,
+        ) -> dict[str, tf.Tensor]:
+            return {
+                "z_beta": z_beta_t,
+                "z_alpha": z_alpha_t,
+                "z_v": z_v_t,
+                "z_fc": z_fc_t,
+                "z_lambda": z_lambda_t,
+                "z_u_scale": z_u_scale_t,
+            }
 
-        z_new, accepted = update_z_beta_mj(
-            rng=self.rng,
-            k=self.k["beta"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
-        )
+        def call_view(view_fn, z_dict: dict[str, tf.Tensor]) -> tf.Tensor:
+            return view_fn(z=z_dict, inputs=inputs, sigma_z=sigma_z)
+
+        # ---- logp closures (shape matches updated block) ----
+
+        def logp_beta(z_beta_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta_t, z_alpha, z_v, z_fc, z_lambda, z_u_scale)
+            return call_view(logpost_z_beta_mj, z)
+
+        def logp_alpha(z_alpha_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta, z_alpha_t, z_v, z_fc, z_lambda, z_u_scale)
+            return call_view(logpost_z_alpha_mj, z)
+
+        def logp_v(z_v_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta, z_alpha, z_v_t, z_fc, z_lambda, z_u_scale)
+            return call_view(logpost_z_v_mj, z)
+
+        def logp_fc(z_fc_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta, z_alpha, z_v, z_fc_t, z_lambda, z_u_scale)
+            return call_view(logpost_z_fc_mj, z)
+
+        def logp_lambda(z_lambda_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta, z_alpha, z_v, z_fc, z_lambda_t, z_u_scale)
+            return call_view(logpost_z_lambda_mn, z)
+
+        def logp_u_scale(z_u_scale_t: tf.Tensor) -> tf.Tensor:
+            z = z_from_parts(z_beta, z_alpha, z_v, z_fc, z_lambda, z_u_scale_t)
+            return call_view(logpost_z_u_scale_m, z)
+
+        # ---- RW-MH updates (elementwise acceptance) ----
+
+        z_new, accepted = rw_mh_step(z_beta, logp_beta, self.k["beta"], self.rng)
         self.z["z_beta"].assign(z_new)
         self.accept["beta"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_alpha_mj(
-            rng=self.rng,
-            k=self.k["alpha"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
-        )
+        z_new, accepted = rw_mh_step(z_alpha, logp_alpha, self.k["alpha"], self.rng)
         self.z["z_alpha"].assign(z_new)
         self.accept["alpha"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        # Frozen blocks for debugging (re-enable by uncommenting).
-        #
-        # z_new, accepted = update_z_v_mj(
-        #     rng=self.rng,
-        #     k=self.k["v"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_v"].assign(z_new)
-        # self.accept["v"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_fc_mj(
-        #     rng=self.rng,
-        #     k=self.k["fc"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_fc"].assign(z_new)
-        # self.accept["fc"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_lambda_mn(
-        #     rng=self.rng,
-        #     k=self.k["lambda"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_lambda"].assign(z_new)
-        # self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_u_scale_m(
-        #     rng=self.rng,
-        #     k=self.k["u_scale"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
+        z_new, accepted = rw_mh_step(z_v, logp_v, self.k["v"], self.rng)
+        self.z["z_v"].assign(z_new)
+        self.accept["v"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        z_new, accepted = rw_mh_step(z_fc, logp_fc, self.k["fc"], self.rng)
+        self.z["z_fc"].assign(z_new)
+        self.accept["fc"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        z_new, accepted = rw_mh_step(z_lambda, logp_lambda, self.k["lambda"], self.rng)
+        self.z["z_lambda"].assign(z_new)
+        self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+
+        # No u_scale update for testing
+        # z_new, accepted = rw_mh_step(
+        #    z_u_scale, logp_u_scale, self.k["u_scale"], self.rng
         # )
         # self.z["z_u_scale"].assign(z_new)
         # self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
@@ -417,16 +405,16 @@ class StockpilingEstimator:
         # ---- Accumulate posterior means (no burn-in/thinning) ----
         self.saved.assign_add(1)
 
-        z_dict = {
-            "z_beta": self.z["z_beta"],
-            "z_alpha": self.z["z_alpha"],
-            "z_v": self.z["z_v"],
-            "z_fc": self.z["z_fc"],
-            "z_lambda": self.z["z_lambda"],
-            "z_u_scale": self.z["z_u_scale"],
-        }
-
-        theta_curr = model.unconstrained_to_theta(z_dict)
+        theta_curr = model.unconstrained_to_theta(
+            {
+                "z_beta": self.z["z_beta"],
+                "z_alpha": self.z["z_alpha"],
+                "z_v": self.z["z_v"],
+                "z_fc": self.z["z_fc"],
+                "z_lambda": self.z["z_lambda"],
+                "z_u_scale": self.z["z_u_scale"],
+            }
+        )
 
         self.sums["beta"].assign_add(theta_curr["beta"])
         self.sums["alpha"].assign_add(theta_curr["alpha"])
@@ -435,4 +423,14 @@ class StockpilingEstimator:
         self.sums["lambda"].assign_add(theta_curr["lambda"])
         self.sums["u_scale"].assign_add(theta_curr["u_scale"])
 
-        report_iteration_progress(z=z_dict, it=it)
+        report_iteration_progress(
+            z={
+                "z_beta": self.z["z_beta"],
+                "z_alpha": self.z["z_alpha"],
+                "z_v": self.z["z_v"],
+                "z_fc": self.z["z_fc"],
+                "z_lambda": self.z["z_lambda"],
+                "z_u_scale": self.z["z_u_scale"],
+            },
+            it=it,
+        )
