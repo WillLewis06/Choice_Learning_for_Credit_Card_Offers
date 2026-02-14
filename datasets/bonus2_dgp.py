@@ -24,14 +24,16 @@ Habit:
 Peer exposure (count over last L periods of peers' purchases):
   P_{i,j,t} = sum_{k in N(i)} sum_{ell=1..L} 1{ y_{k,t-ell} = j }
 
-Time features:
-  d(t) = t mod 7
-  theta(t) = 2π/P * (t mod P)
-  S_m(t), S_j(t) are Fourier series with K harmonics.
+Time features (code naming)
+---------------------------
+- dow_t: d(t) = t mod 7
+- season_angle_t: theta(t) = 2π/P * (t mod P)
+- season_sin_kt, season_cos_kt: Fourier basis with K harmonics
+- season_period_P: P
 
 Parameter draws
 ---------------
-All hyperparameters are read from the dict `params_true` with no defaults.
+All hyperparameters are read from the dict `dgp_hyperparams` with no defaults.
 Expected keys:
   habit_mean, habit_sd
   peer_mean, peer_sd
@@ -63,42 +65,42 @@ def make_rng(seed: Any) -> np.random.Generator:
 # -----------------------------------------------------------------------------
 
 
-def generate_time_features(T: int, season_period: int, K: int):
+def generate_time_features(T: int, season_period_P: int, K: int):
     """
     Returns
     -------
-    dow : (T,) int64
+    dow_t : (T,) int64
         d(t) in {0..6} via t % 7.
-    theta : (T,) float64
-        2π/P * (t mod P).
-    sin_k_theta : (K,T) float64
-        sin((k+1)*theta_t).
-    cos_k_theta : (K,T) float64
-        cos((k+1)*theta_t).
+    season_angle_t : (T,) float64
+        theta(t) = 2π/P * (t mod P).
+    season_sin_kt : (K,T) float64
+        sin((k+1)*season_angle_t[t]).
+    season_cos_kt : (K,T) float64
+        cos((k+1)*season_angle_t[t]).
     """
     T = int(T)
-    P = int(season_period)
+    P = int(season_period_P)
     K = int(K)
 
     t = np.arange(T, dtype=np.int64)
-    dow = (t % 7).astype(np.int64)
+    dow_t = (t % 7).astype(np.int64)
 
     tau = (t % P).astype(np.float64)
-    theta = (2.0 * np.pi / float(P) * tau).astype(np.float64)
+    season_angle_t = (2.0 * np.pi / float(P) * tau).astype(np.float64)
 
     if K == 0:
         return (
-            dow,
-            theta,
+            dow_t,
+            season_angle_t,
             np.zeros((0, T), dtype=np.float64),
             np.zeros((0, T), dtype=np.float64),
         )
 
     k = np.arange(1, K + 1, dtype=np.float64)[:, None]  # (K,1)
-    ang = k * theta[None, :]  # (K,T)
-    sin_k_theta = np.sin(ang).astype(np.float64)
-    cos_k_theta = np.cos(ang).astype(np.float64)
-    return dow, theta, sin_k_theta, cos_k_theta
+    ang = k * season_angle_t[None, :]  # (K,T)
+    season_sin_kt = np.sin(ang).astype(np.float64)
+    season_cos_kt = np.cos(ang).astype(np.float64)
+    return dow_t, season_angle_t, season_sin_kt, season_cos_kt
 
 
 # -----------------------------------------------------------------------------
@@ -106,26 +108,26 @@ def generate_time_features(T: int, season_period: int, K: int):
 # -----------------------------------------------------------------------------
 
 
-def fourier_seasonality(a_coeff, b_coeff, sin_k_theta, cos_k_theta):
+def fourier_seasonality(a_coeff, b_coeff, season_sin_kt, season_cos_kt):
     """
-    S[r,t] = sum_k [a_coeff[r,k]*sin_k_theta[k,t] + b_coeff[r,k]*cos_k_theta[k,t]]
+    S[r,t] = sum_k [a_coeff[r,k]*season_sin_kt[k,t] + b_coeff[r,k]*season_cos_kt[k,t]]
     """
     a_coeff = np.asarray(a_coeff, dtype=np.float64)
     b_coeff = np.asarray(b_coeff, dtype=np.float64)
-    sin_k_theta = np.asarray(sin_k_theta, dtype=np.float64)
-    cos_k_theta = np.asarray(cos_k_theta, dtype=np.float64)
+    season_sin_kt = np.asarray(season_sin_kt, dtype=np.float64)
+    season_cos_kt = np.asarray(season_cos_kt, dtype=np.float64)
 
     K = a_coeff.shape[1] if a_coeff.size else 0
     if K == 0:
         R = a_coeff.shape[0] if a_coeff.ndim == 2 else 0
-        T = sin_k_theta.shape[1] if sin_k_theta.ndim == 2 else 0
+        T = season_sin_kt.shape[1] if season_sin_kt.ndim == 2 else 0
         return np.zeros((R, T), dtype=np.float64)
 
-    return (a_coeff @ sin_k_theta + b_coeff @ cos_k_theta).astype(np.float64)
+    return (a_coeff @ season_sin_kt + b_coeff @ season_cos_kt).astype(np.float64)
 
 
 # -----------------------------------------------------------------------------
-# Parameter draws (hyperparameters read from params_true dict, no defaults)
+# Parameter draws (hyperparameters read from dgp_hyperparams dict, no defaults)
 # -----------------------------------------------------------------------------
 
 
@@ -136,7 +138,7 @@ def _kappa_from_average_decay_rate(mu: float) -> float:
 
 
 def sample_core_product_params(
-    J: int, rng, average_decay_rate: float, params_true: dict
+    J: int, rng, average_decay_rate: float, dgp_hyperparams: dict
 ):
     """
     Sample:
@@ -147,11 +149,11 @@ def sample_core_product_params(
     """
     J = int(J)
 
-    habit_mean = float(params_true["habit_mean"])
-    habit_sd = float(params_true["habit_sd"])
-    peer_mean = float(params_true["peer_mean"])
-    peer_sd = float(params_true["peer_sd"])
-    decay_rate_eps = float(params_true["decay_rate_eps"])
+    habit_mean = float(dgp_hyperparams["habit_mean"])
+    habit_sd = float(dgp_hyperparams["habit_sd"])
+    peer_mean = float(dgp_hyperparams["peer_mean"])
+    peer_sd = float(dgp_hyperparams["peer_sd"])
+    decay_rate_eps = float(dgp_hyperparams["decay_rate_eps"])
 
     beta_habit_j = rng.normal(loc=habit_mean, scale=habit_sd, size=J).astype(np.float64)
     beta_peer_j = rng.normal(loc=peer_mean, scale=peer_sd, size=J).astype(np.float64)
@@ -166,15 +168,15 @@ def sample_core_product_params(
     return beta_habit_j, beta_peer_j, decay_rate, kappa
 
 
-def sample_market_product_intercepts(M: int, J: int, rng, params_true: dict):
+def sample_market_product_intercepts(M: int, J: int, rng, dgp_hyperparams: dict):
     """beta_market_mj (M,J)."""
     M = int(M)
     J = int(J)
-    mktprod_sd = float(params_true["mktprod_sd"])
+    mktprod_sd = float(dgp_hyperparams["mktprod_sd"])
     return rng.normal(loc=0.0, scale=mktprod_sd, size=(M, J)).astype(np.float64)
 
 
-def sample_time_market_params(M: int, K: int, rng, params_true: dict):
+def sample_time_market_params(M: int, K: int, rng, dgp_hyperparams: dict):
     """
     Market-level:
       beta_dow_m : (M,7)
@@ -183,8 +185,8 @@ def sample_time_market_params(M: int, K: int, rng, params_true: dict):
     M = int(M)
     K = int(K)
 
-    dow_mkt_sd = float(params_true["dow_mkt_sd"])
-    season_mkt_sd = float(params_true["season_mkt_sd"])
+    dow_mkt_sd = float(dgp_hyperparams["dow_mkt_sd"])
+    season_mkt_sd = float(dgp_hyperparams["season_mkt_sd"])
 
     beta_dow_m = rng.normal(loc=0.0, scale=dow_mkt_sd, size=(M, 7)).astype(np.float64)
 
@@ -461,19 +463,19 @@ def simulate_bonus2_dgp(
     rng = make_rng(seed)
 
     # Time features
-    dow, theta, sin_k_theta, cos_k_theta = generate_time_features(
-        T=T, season_period=season_period, K=K
+    dow, theta, season_sin_kt, season_cos_kt = generate_time_features(
+        T, season_period, K
     )
 
     # Draw parameters
     beta_habit_j, beta_peer_j, decay_rate_j, kappa_decay = sample_core_product_params(
-        J=J, rng=rng, average_decay_rate=average_decay_rate, params_true=params_true
+        J=J, rng=rng, average_decay_rate=average_decay_rate, dgp_hyperparams=params_true
     )
     beta_market_mj = sample_market_product_intercepts(
-        M=M, J=J, rng=rng, params_true=params_true
+        M=M, J=J, rng=rng, dgp_hyperparams=params_true
     )
     beta_dow_m, a_m, b_m = sample_time_market_params(
-        M=M, K=K, rng=rng, params_true=params_true
+        M=M, K=K, rng=rng, dgp_hyperparams=params_true
     )
     beta_dow_j, a_j, b_j = sample_time_product_params(
         J=J, K=K, rng=rng, params_true=params_true
@@ -484,8 +486,8 @@ def simulate_bonus2_dgp(
     )
 
     # Precompute seasonal series
-    S_m_all = fourier_seasonality(a_m, b_m, sin_k_theta, cos_k_theta)  # (M,T)
-    S_j_all = fourier_seasonality(a_j, b_j, sin_k_theta, cos_k_theta)  # (J,T)
+    S_m_all = fourier_seasonality(a_m, b_m, season_sin_kt, season_cos_kt)  # (M,T)
+    S_j_all = fourier_seasonality(a_j, b_j, season_sin_kt, season_cos_kt)  # (J,T)
 
     # Simulate markets
     y = np.zeros((M, N, T), dtype=np.int64)
@@ -517,8 +519,8 @@ def simulate_bonus2_dgp(
         "delta": delta,
         "dow": dow,
         "theta": theta,
-        "sin_k_theta": sin_k_theta,
-        "cos_k_theta": cos_k_theta,
+        "season_sin_kt": season_sin_kt,
+        "season_cos_kt": season_cos_kt,
         "nbrs": nbrs_list,
         # true parameters (for evaluation)
         "beta_habit_j": beta_habit_j,

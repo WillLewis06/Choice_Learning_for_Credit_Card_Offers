@@ -14,7 +14,8 @@ Conventions:
   - Validation is centralized here; downstream modules should not re-validate.
 
 Known / observed by the estimator (per model spec):
-  - Time features: dow_t (day-of-week), and seasonal Fourier features sin_k_theta/cos_k_theta.
+  - Time features: dow_t (day-of-week), and seasonal Fourier features
+      season_sin_kt / season_cos_kt.
     Seasonal features are accepted as either (K,T) or (T,K); the estimator may transpose internally.
   - Social network structure (neighbors) is known and validated here.
   - Decay prior hyperparameter kappa_decay is known (scalar > 0) and validated here.
@@ -166,7 +167,7 @@ def _validate_neighbors_structure(neighbors: Any, M: int, N: int) -> None:
 
 
 def _validate_seasonal_features(
-    sin_k_theta: Any, cos_k_theta: Any, T: int
+    season_sin_kt: Any, season_cos_kt: Any, T: int
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Validate seasonal feature matrices and return (sin, cos, K).
@@ -176,20 +177,20 @@ def _validate_seasonal_features(
       - (T,K)
 
     Requirement:
-      - sin and cos same shape
+      - season_sin_kt and season_cos_kt same shape
       - one axis equals T
       - finite float64 values
     """
-    sin = _as_np(sin_k_theta, "sin_k_theta", dtype=np.float64)
-    cos = _as_np(cos_k_theta, "cos_k_theta", dtype=np.float64)
-    _require_ndim(sin, 2, "sin_k_theta")
-    _require_ndim(cos, 2, "cos_k_theta")
-    _require_finite(sin, "sin_k_theta")
-    _require_finite(cos, "cos_k_theta")
+    sin = _as_np(season_sin_kt, "season_sin_kt", dtype=np.float64)
+    cos = _as_np(season_cos_kt, "season_cos_kt", dtype=np.float64)
+    _require_ndim(sin, 2, "season_sin_kt")
+    _require_ndim(cos, 2, "season_cos_kt")
+    _require_finite(sin, "season_sin_kt")
+    _require_finite(cos, "season_cos_kt")
 
     if sin.shape != cos.shape:
         raise ValueError(
-            f"sin_k_theta/cos_k_theta: expected same shape, got {sin.shape} vs {cos.shape}"
+            f"season_sin_kt/season_cos_kt: expected same shape, got {sin.shape} vs {cos.shape}"
         )
 
     if int(sin.shape[1]) == T:
@@ -200,11 +201,11 @@ def _validate_seasonal_features(
         K = int(sin.shape[1])
     else:
         raise ValueError(
-            f"sin_k_theta/cos_k_theta: expected one axis equal to T={T}, got shape={sin.shape}"
+            f"season_sin_kt/season_cos_kt: expected one axis equal to T={T}, got shape={sin.shape}"
         )
 
     if K < 0:
-        raise ValueError(f"sin_k_theta/cos_k_theta: expected K>=0, got K={K}")
+        raise ValueError(f"season_sin_kt/season_cos_kt: expected K>=0, got K={K}")
 
     return sin, cos, K
 
@@ -313,29 +314,29 @@ def validate_bonus2_estimator_init_inputs(
     y_mit: Any,
     delta_mj: Any,
     dow_t: Any,
-    sin_k_theta: Any,
-    cos_k_theta: Any,
+    season_sin_kt: Any,
+    season_cos_kt: Any,
     neighbors: Any,
     L: int,
     init_theta: dict[str, Any],
     sigmas: dict[str, Any],
     seed: int,
     kappa_decay: Any,
-    eps_decay: Any | None = None,
+    decay_rate_eps: Any | None = None,
 ) -> None:
     """
     Validate inputs to bonus2.bonus2_estimator.Bonus2Estimator.__init__.
 
     Shapes / conventions:
-      y_mit        (M,N,T) int in {0..J}
-      delta_mj     (M,J) float64 finite
-      dow_t        (T,)  int in {0..6}
-      sin_k_theta  (K,T) or (T,K) float64 finite
-      cos_k_theta  (K,T) or (T,K) float64 finite
-      neighbors    list-like length M of list-like length N of int arrays
-      L            int >= 1
-      kappa_decay  float > 0 (known hyperparameter for decay prior Beta(kappa,1))
-      eps_decay    optional float in [0,1)
+      y_mit          (M,N,T) int in {0..J}
+      delta_mj       (M,J) float64 finite
+      dow_t          (T,)  int in {0..6}
+      season_sin_kt  (K,T) or (T,K) float64 finite
+      season_cos_kt  (K,T) or (T,K) float64 finite
+      neighbors      list-like length M of list-like length N of int arrays
+      L              int >= 1
+      kappa_decay    float > 0 (known hyperparameter for decay prior Beta(kappa,1))
+      decay_rate_eps optional float in [0,1)
     """
     _require_int_scalar(seed, "seed", min_value=0)
 
@@ -344,10 +345,10 @@ def validate_bonus2_estimator_init_inputs(
     if kd <= 0.0:
         raise ValueError(f"kappa_decay: expected > 0, got {kd}")
 
-    if eps_decay is not None:
-        ed = _require_float_scalar(eps_decay, "eps_decay", min_value=0.0)
+    if decay_rate_eps is not None:
+        ed = _require_float_scalar(decay_rate_eps, "decay_rate_eps", min_value=0.0)
         if ed >= 1.0:
-            raise ValueError(f"eps_decay: expected < 1, got {ed}")
+            raise ValueError(f"decay_rate_eps: expected < 1, got {ed}")
 
     y, M, N, T = _panel_dims_from_y(y_mit)
 
@@ -391,7 +392,9 @@ def validate_bonus2_estimator_init_inputs(
             raise ValueError(f"dow_t: expected values in [0,6], got min={mn}, max={mx}")
 
     # Seasonal features: accept (K,T) or (T,K)
-    _validate_seasonal_features(sin_k_theta=sin_k_theta, cos_k_theta=cos_k_theta, T=T)
+    _validate_seasonal_features(
+        season_sin_kt=season_sin_kt, season_cos_kt=season_cos_kt, T=T
+    )
 
     _validate_neighbors_structure(neighbors=neighbors, M=M, N=N)
 

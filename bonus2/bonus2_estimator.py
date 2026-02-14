@@ -5,8 +5,11 @@ Bonus Q2 (habit + peer + DOW + seasonality) estimator, following the Ching-style
 RW-MH "orchestration + per-block update functions" architecture.
 
 Key conventions (must match bonus2_model.py and bonus2_posterior.py):
-  - Seasonal features are (K,T): sin_k_theta[k,t], cos_k_theta[k,t]
-  - Network is passed as peer_adj_m: tuple/list length M of tf.SparseTensor (N,N)
+  - Seasonal basis features are (K,T):
+      season_sin_kt[k,t], season_cos_kt[k,t]
+    (If provided as (T,K), this estimator transposes to (K,T).)
+  - Network is passed as neighbors[m][i] -> converted to peer_adj_m:
+      tuple length M of tf.SparseTensor (N,N)
   - Unconstrained sampler blocks are keyed by:
 
       z_beta_market_mj  (M,J)
@@ -28,7 +31,11 @@ Public API:
   - fit(n_iter, k): k is a dict of RW step sizes keyed by:
       {"beta_market","beta_habit","beta_peer","decay_rate",
        "beta_dow_m","beta_dow_j","a_m","b_m","a_j","b_j"}
-  - get_results(): returns theta_hat (LAST draw), n_saved, accept (rates)
+  - get_results(): returns theta_init, theta_hat (LAST draw), n_saved, accept (rates)
+
+Notes:
+  - No traces are stored; only the last draw is returned.
+  - Returned theta_* are in the identified (centered) form consistent with the DGP.
 """
 
 from __future__ import annotations
@@ -78,7 +85,6 @@ def _neighbors_to_peer_adj_m(
     Returns:
       peer_adj_m: tuple length M of SparseTensor (N,N) with 1.0 entries.
     """
-    # Convert to nested Python lists early (one-time cost, estimator init only).
     nb = neighbors
     if isinstance(nb, tf.RaggedTensor):
         nb = nb.to_list()
@@ -99,16 +105,14 @@ def _neighbors_to_peer_adj_m(
             neigh_i = rows[i]
             if neigh_i is None:
                 continue
-            # Make robust to ragged-like inputs.
+
             if isinstance(neigh_i, (np.ndarray,)):
                 neigh_i = neigh_i.tolist()
             if isinstance(neigh_i, (list, tuple)):
                 neigh_iter: Iterable[int] = neigh_i
             else:
-                # e.g. a scalar -> treat as one neighbor
                 neigh_iter = [int(neigh_i)]
 
-            # De-dup within row; drop self.
             seen = set()
             for k in neigh_iter:
                 kk = int(k)
@@ -156,15 +160,15 @@ class Bonus2Estimator:
         y_mit: Any,
         delta_mj: Any,
         dow_t: Any,
-        sin_k_theta: Any,
-        cos_k_theta: Any,
+        season_sin_kt: Any,
+        season_cos_kt: Any,
         neighbors: Any,
         L: int,
         init_theta: dict[str, float],
         sigmas: dict[str, float],
         seed: int,
         kappa_decay: float,
-        eps_decay: float = 0.0,
+        decay_rate_eps: float = 0.0,
     ) -> None:
         # ---- infer dimensions ----
         y_np = np.asarray(y_mit)
@@ -179,13 +183,15 @@ class Bonus2Estimator:
             raise ValueError("delta_mj first axis must match y_mit markets (M)")
         self.J = int(delta_np.shape[1])
 
-        # ---- seasonal features: accept (K,T) or transpose from (T,K) ----
-        sin_np = np.asarray(sin_k_theta, dtype=np.float64)
-        cos_np = np.asarray(cos_k_theta, dtype=np.float64)
+        # ---- seasonal basis: accept (K,T) or transpose from (T,K) ----
+        sin_np = np.asarray(season_sin_kt, dtype=np.float64)
+        cos_np = np.asarray(season_cos_kt, dtype=np.float64)
         if sin_np.ndim != 2 or cos_np.ndim != 2:
-            raise ValueError("sin_k_theta and cos_k_theta must be 2D")
+            raise ValueError("season_sin_kt and season_cos_kt must be 2D")
         if sin_np.shape != cos_np.shape:
-            raise ValueError("sin_k_theta and cos_k_theta must have identical shape")
+            raise ValueError(
+                "season_sin_kt and season_cos_kt must have identical shape"
+            )
 
         if int(sin_np.shape[1]) == self.T:
             # (K,T)
@@ -199,7 +205,8 @@ class Bonus2Estimator:
             cos_np_kt = cos_np.T
         else:
             raise ValueError(
-                "sin_k_theta/cos_k_theta must have T on one axis (shape (K,T) or (T,K))"
+                "season_sin_kt/season_cos_kt must have T on one axis "
+                "(shape (K,T) or (T,K))"
             )
 
         # ---- convert to TF tensors ----
@@ -211,8 +218,8 @@ class Bonus2Estimator:
             raise ValueError("dow_t must be 1D with length T")
         self.dow_t = tf.convert_to_tensor(dow_np, dtype=tf.int32)  # (T,)
 
-        self.sin_k_theta = tf.convert_to_tensor(sin_np_kt, dtype=tf.float64)  # (K,T)
-        self.cos_k_theta = tf.convert_to_tensor(cos_np_kt, dtype=tf.float64)  # (K,T)
+        self.season_sin_kt = tf.convert_to_tensor(sin_np_kt, dtype=tf.float64)  # (K,T)
+        self.season_cos_kt = tf.convert_to_tensor(cos_np_kt, dtype=tf.float64)  # (K,T)
 
         # ---- network: build peer_adj_m ----
         self.peer_adj_m = _neighbors_to_peer_adj_m(neighbors, M=self.M, N=self.N)
@@ -221,7 +228,10 @@ class Bonus2Estimator:
         self.kappa_decay = tf.convert_to_tensor(float(kappa_decay), dtype=tf.float64)
         if float(kappa_decay) <= 0.0:
             raise ValueError("kappa_decay must be > 0")
-        self.eps_decay = tf.convert_to_tensor(float(eps_decay), dtype=tf.float64)
+
+        self.decay_rate_eps = tf.convert_to_tensor(
+            float(decay_rate_eps), dtype=tf.float64
+        )
 
         # ---- prior scales over z (scalar float64 tensors) ----
         # Expected sigma_z keys (z-space):
@@ -237,14 +247,14 @@ class Bonus2Estimator:
             "y_mit": self.y_mit,
             "delta_mj": self.delta_mj,
             "dow_t": self.dow_t,
-            "sin_k_theta": self.sin_k_theta,
-            "cos_k_theta": self.cos_k_theta,
+            "season_sin_kt": self.season_sin_kt,
+            "season_cos_kt": self.season_cos_kt,
             "peer_adj_m": self.peer_adj_m,
             "L": self.L,
             "kappa_decay": self.kappa_decay,
         }
-        if float(eps_decay) != 0.0:
-            self.inputs["eps_decay"] = self.eps_decay
+        if float(decay_rate_eps) != 0.0:
+            self.inputs["decay_rate_eps"] = self.decay_rate_eps
 
         # ---- RNG ----
         self.rng = tf.random.Generator.from_seed(int(seed))
@@ -306,6 +316,11 @@ class Bonus2Estimator:
             "z_b_j": tf.Variable(z_b_j0, trainable=False, dtype=tf.float64),
         }
 
+        # ---- store theta_init (identified form) for evaluation printouts ----
+        self.theta_init = self._theta_identified_from_z(
+            self._current_z_dict(), as_numpy=True
+        )
+
         # ---- step sizes (set in fit) ----
         self.k: dict[str, tf.Variable] = {
             "beta_market": tf.Variable(0.0, dtype=tf.float64, trainable=False),
@@ -334,32 +349,8 @@ class Bonus2Estimator:
             "b_j": tf.Variable(0, dtype=tf.int32, trainable=False),
         }
 
-        # ---- running sums for posterior means (not returned by get_results) ----
+        # ---- sweep counter (used for acceptance-rate denominators) ----
         self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
-        self.sums: dict[str, tf.Variable] = {
-            "beta_market_mj": tf.Variable(
-                tf.zeros((self.M, self.J), tf.float64), trainable=False
-            ),
-            "beta_habit_j": tf.Variable(
-                tf.zeros((self.J,), tf.float64), trainable=False
-            ),
-            "beta_peer_j": tf.Variable(
-                tf.zeros((self.J,), tf.float64), trainable=False
-            ),
-            "decay_rate_j": tf.Variable(
-                tf.zeros((self.J,), tf.float64), trainable=False
-            ),
-            "beta_dow_m": tf.Variable(
-                tf.zeros((self.M, 7), tf.float64), trainable=False
-            ),
-            "beta_dow_j": tf.Variable(
-                tf.zeros((self.J, 7), tf.float64), trainable=False
-            ),
-            "a_m": tf.Variable(tf.zeros((self.M, self.K), tf.float64), trainable=False),
-            "b_m": tf.Variable(tf.zeros((self.M, self.K), tf.float64), trainable=False),
-            "a_j": tf.Variable(tf.zeros((self.J, self.K), tf.float64), trainable=False),
-            "b_j": tf.Variable(tf.zeros((self.J, self.K), tf.float64), trainable=False),
-        }
 
         # ---- block sizes for acceptance-rate denominators ----
         self._block_sizes: dict[str, int] = {
@@ -411,22 +402,16 @@ class Bonus2Estimator:
 
     def get_results(self) -> dict[str, object]:
         """
-        Return LAST-draw parameters and acceptance rates as Python/numpy objects.
+        Return:
+          - theta_init: initial parameters (identified)
+          - theta_hat: last-draw parameters (identified)
+          - n_saved: number of sweeps completed
+          - accept: acceptance rates per block (accepted / (n_saved * block_size))
         """
-        theta_last = model.unconstrained_to_theta(self._current_z_dict())
-
-        theta_hat = {
-            "beta_market_mj": theta_last["beta_market_mj"].numpy(),
-            "beta_habit_j": theta_last["beta_habit_j"].numpy(),
-            "beta_peer_j": theta_last["beta_peer_j"].numpy(),
-            "decay_rate_j": theta_last["decay_rate_j"].numpy(),
-            "beta_dow_m": theta_last["beta_dow_m"].numpy(),
-            "beta_dow_j": theta_last["beta_dow_j"].numpy(),
-            "a_m": theta_last["a_m"].numpy(),
-            "b_m": theta_last["b_m"].numpy(),
-            "a_j": theta_last["a_j"].numpy(),
-            "b_j": theta_last["b_j"].numpy(),
-        }
+        theta_last = self._theta_identified_from_z(
+            self._current_z_dict(), as_numpy=False
+        )
+        theta_hat = {k: v.numpy() for k, v in theta_last.items()}
 
         n_saved = int(self.saved.numpy())
         counts = {kk: int(vv.numpy()) for kk, vv in self.accept.items()}
@@ -437,7 +422,12 @@ class Bonus2Estimator:
             for kk in counts.keys()
         }
 
-        return {"theta_hat": theta_hat, "n_saved": n_saved, "accept": rates}
+        return {
+            "theta_init": self.theta_init,
+            "theta_hat": theta_hat,
+            "n_saved": n_saved,
+            "accept": rates,
+        }
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -457,13 +447,44 @@ class Bonus2Estimator:
             "z_b_j": self.z["z_b_j"],
         }
 
+    def _theta_identified_from_z(
+        self, z_dict: dict[str, tf.Tensor], as_numpy: bool
+    ) -> dict[str, Any]:
+        """
+        Convert z -> theta and apply the DGP-identification centering constraints
+        in eager-safe form (so this can be called outside @tf.function).
+        """
+        theta = model.unconstrained_to_theta(z_dict)
+
+        # Optional numeric clip for decay_rate_j.
+        eps = self.inputs.get("decay_rate_eps", tf.constant(0.0, tf.float64))
+        eps_f = float(eps.numpy()) if isinstance(eps, tf.Tensor) else float(eps)
+        if eps_f > 0.0:
+            theta["decay_rate_j"] = tf.clip_by_value(
+                tf.cast(theta["decay_rate_j"], tf.float64),
+                eps_f,
+                1.0 - eps_f,
+            )
+
+        beta_dow_m, beta_dow_j, a_j, b_j = model.apply_identifiability_constraints_tf(
+            beta_dow_m=theta["beta_dow_m"],
+            beta_dow_j=theta["beta_dow_j"],
+            a_j=theta["a_j"],
+            b_j=theta["b_j"],
+        )
+        theta["beta_dow_m"] = beta_dow_m
+        theta["beta_dow_j"] = beta_dow_j
+        theta["a_j"] = a_j
+        theta["b_j"] = b_j
+
+        if as_numpy:
+            return {k: tf.cast(v, tf.float64).numpy() for k, v in theta.items()}
+        return {k: tf.cast(v, tf.float64) for k, v in theta.items()}
+
     def _reset_chain_state(self) -> None:
         for v in self.accept.values():
             v.assign(0)
-
         self.saved.assign(0)
-        for v in self.sums.values():
-            v.assign(tf.zeros_like(v))
 
     # -------------------------------------------------------------------------
     # Only compiled method
@@ -680,19 +701,6 @@ class Bonus2Estimator:
         self.z["z_b_j"].assign(z_new)
         self.accept["b_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        # ---- Accumulate posterior means (no burn-in/thinning; not returned) ----
+        # ---- sweep counter + diagnostics ----
         self.saved.assign_add(1)
-        theta_curr = model.unconstrained_to_theta(self._current_z_dict())
-
-        self.sums["beta_market_mj"].assign_add(theta_curr["beta_market_mj"])
-        self.sums["beta_habit_j"].assign_add(theta_curr["beta_habit_j"])
-        self.sums["beta_peer_j"].assign_add(theta_curr["beta_peer_j"])
-        self.sums["decay_rate_j"].assign_add(theta_curr["decay_rate_j"])
-        self.sums["beta_dow_m"].assign_add(theta_curr["beta_dow_m"])
-        self.sums["beta_dow_j"].assign_add(theta_curr["beta_dow_j"])
-        self.sums["a_m"].assign_add(theta_curr["a_m"])
-        self.sums["b_m"].assign_add(theta_curr["b_m"])
-        self.sums["a_j"].assign_add(theta_curr["a_j"])
-        self.sums["b_j"].assign_add(theta_curr["b_j"])
-
         report_iteration_progress(z=self._current_z_dict(), it=it)

@@ -20,7 +20,8 @@ Seller-observed outputs:
   - u_mj_true   (M, J)       fixed market-product intercepts (float64)
 
 True parameters (DGP draws):
-  - per (market, product) (M,J): beta, alpha, v, fc
+  - global: beta (scalar)
+  - per product (J,): alpha, v, fc
   - per (market, consumer) (M,N): lambda   (note: renamed from lambda_c)
 
 Model conventions:
@@ -56,7 +57,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 
 # Draw on an unconstrained z-scale then transform:
 #   beta, lambda: sigmoid(z)
-#   alpha, v, fc
+#   alpha, v, fc: exp(z)
 theta_z_hypers: dict[str, dict[str, float]] = {
     "beta": {"mu": _logit(0.71), "sd": 0.35},
     "alpha": {"mu": float(np.log(0.27)), "sd": 0.50},
@@ -77,20 +78,20 @@ def sample_theta_true(
 
     Returns:
       dict with:
-        - beta, alpha, v, fc: (M,J) float64
+        - beta:               scalar float64 stored as a 0-d ndarray
+        - alpha, v, fc:       (J,) float64
         - lambda:             (M,N) float64
     """
-    # Market-product blocks (M,J)
-    z_beta = rng.normal(
-        theta_z_hypers["beta"]["mu"], theta_z_hypers["beta"]["sd"], size=(M, J)
-    )
+    # Global scalar beta (0-d)
+    z_beta = rng.normal(theta_z_hypers["beta"]["mu"], theta_z_hypers["beta"]["sd"])
+    beta = _sigmoid(np.asarray(z_beta, dtype=np.float64)).astype(np.float64, copy=False)
+
+    # Product-level block (J,)
     z_alpha = rng.normal(
-        theta_z_hypers["alpha"]["mu"], theta_z_hypers["alpha"]["sd"], size=(M, J)
+        theta_z_hypers["alpha"]["mu"], theta_z_hypers["alpha"]["sd"], size=(J,)
     )
-    z_v = rng.normal(theta_z_hypers["v"]["mu"], theta_z_hypers["v"]["sd"], size=(M, J))
-    z_fc = rng.normal(
-        theta_z_hypers["fc"]["mu"], theta_z_hypers["fc"]["sd"], size=(M, J)
-    )
+    z_v = rng.normal(theta_z_hypers["v"]["mu"], theta_z_hypers["v"]["sd"], size=(J,))
+    z_fc = rng.normal(theta_z_hypers["fc"]["mu"], theta_z_hypers["fc"]["sd"], size=(J,))
 
     # Market-consumer block (M,N)
     z_lambda = rng.normal(
@@ -98,7 +99,7 @@ def sample_theta_true(
     )
 
     out: dict[str, np.ndarray] = {
-        "beta": _sigmoid(z_beta).astype(np.float64, copy=False),
+        "beta": beta,
         "alpha": np.exp(z_alpha).astype(np.float64, copy=False),
         "v": np.exp(z_v).astype(np.float64, copy=False),
         "fc": np.exp(z_fc).astype(np.float64, copy=False),
@@ -236,7 +237,7 @@ def solve_ccp_buy(
     # No buy: stockout penalty if inventory is zero.
     u0 = (-v * (I_grid == 0))[None, :]
 
-    # Buy: scaled intercept minus price disutility and fixed cost.
+    # Buy: intercept minus price disutility and fixed cost.
     base_buy_s = u_eff - alpha * price_vals - fc
     u1 = base_buy_s[:, None]
 
@@ -247,9 +248,7 @@ def solve_ccp_buy(
     v_fn = np.zeros((S, I_size), dtype=np.float64)
 
     def _compute_q(v_value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Compute choice-specific value functions q0(s,I), q1(s,I) given v(s,I).
-        """
+        """Compute choice-specific value functions q0(s,I), q1(s,I) given v(s,I)."""
         ev_next = P_price @ v_value
 
         cont0 = (1.0 - lambda_) * ev_next[:, I_a0_c0] + lambda_ * ev_next[:, I_a0_c1]
@@ -275,10 +274,10 @@ def solve_ccp_buy(
 
 def solve_market_product_ccps(
     u_eff: float,
-    beta_mj: float,
-    alpha_mj: float,
-    v_mj: float,
-    fc_mj: float,
+    beta: float,
+    alpha_j: float,
+    v_j: float,
+    fc_j: float,
     lambda_mn: np.ndarray,
     I_max: int,
     P_price: np.ndarray,
@@ -290,7 +289,8 @@ def solve_market_product_ccps(
     """
     Solve CCPs for all consumers for a single (market, product).
 
-    Market-product parameters are shared across consumers; only lambda varies by consumer.
+    Product parameters are shared across markets and consumers; only u_eff and the price
+    process vary by (m,j). Only lambda varies by consumer.
 
     Returns:
       ndarray: ccp_buy_n_s_i with shape (N, S, I_max+1), float64.
@@ -299,12 +299,12 @@ def solve_market_product_ccps(
     S = int(P_price.shape[0])
     ccp_buy_n_s_i = np.zeros((N, S, I_max + 1), dtype=np.float64)
 
-    # Cast market-product scalars once; only lambda changes across consumers.
+    # Cast scalars once; only lambda changes across consumers.
     u_eff_f = float(u_eff)
-    beta_f = float(beta_mj)
-    alpha_f = float(alpha_mj)
-    v_f = float(v_mj)
-    fc_f = float(fc_mj)
+    beta_f = float(beta)
+    alpha_f = float(alpha_j)
+    v_f = float(v_j)
+    fc_f = float(fc_j)
     waste_cost_f = float(waste_cost)
 
     for n in range(N):
@@ -397,7 +397,8 @@ def generate_dgp(
       p_state_mjt: (M, J, T) int64 price states
       u_mj_true: (M, J) float64 intercepts (unscaled)
       theta_true: dict of true parameters:
-        - beta, alpha, v, fc: (M,J) float64
+        - beta:               scalar float64 stored as a 0-d ndarray
+        - alpha, v, fc:       (J,) float64
         - lambda:             (M,N) float64
     """
     rng = np.random.default_rng(seed)
@@ -430,6 +431,7 @@ def generate_dgp(
     a_mnjt = np.zeros((M, N, J, T), dtype=np.int64)
 
     theta = theta_true
+    beta = float(theta["beta"])
 
     for m in range(M):
         # Per-market objects.
@@ -452,19 +454,18 @@ def generate_dgp(
             # Effective intercept for this (market, product).
             u_eff = u_mj_true[m, j]
 
-            # Market-product parameters for this (m,j).
-            beta_mj = float(theta["beta"][m, j])
-            alpha_mj = float(theta["alpha"][m, j])
-            v_mj = float(theta["v"][m, j])
-            fc_mj = float(theta["fc"][m, j])
+            # Product parameters (shared across markets).
+            alpha_j = float(theta["alpha"][j])
+            v_j = float(theta["v"][j])
+            fc_j = float(theta["fc"][j])
 
             # Solve per-consumer CCPs (only lambda varies across consumers).
             ccp_buy_n_s_i = solve_market_product_ccps(
                 u_eff=u_eff,
-                beta_mj=beta_mj,
-                alpha_mj=alpha_mj,
-                v_mj=v_mj,
-                fc_mj=fc_mj,
+                beta=beta,
+                alpha_j=alpha_j,
+                v_j=v_j,
+                fc_j=fc_j,
                 lambda_mn=lambda_mn,
                 I_max=I_max,
                 P_price=P_price,

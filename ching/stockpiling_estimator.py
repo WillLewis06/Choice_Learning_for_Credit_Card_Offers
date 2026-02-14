@@ -1,466 +1,369 @@
 """
 ching/stockpiling_estimator.py
 
-Phase-3 (Ching-style) stockpiling estimator for the multi-product model.
-
-This estimator:
-  - assumes all input validation is handled upstream (validation module / caller)
-  - runs elementwise RW-MH on unconstrained blocks z_* and accumulates posterior means
-  - delegates all constraint transforms (z -> theta) to ching.stockpiling_model
+MCMC estimator for the Phase-3 stockpiling (Ching-style) model.
 
 Observed inputs:
-  a_mnjt        (M,N,J,T)  actions {0,1}
-  p_state_mjt   (M,J,T)    price states in {0,...,S-1}
-  u_mj          (M,J)      fixed utilities from Phase 1–2
-  price_vals_mj (M,J,S)    price levels by state
-  P_price_mj    (M,J,S,S)  price transitions
-  pi_I0         (I,)       initial inventory prior
+  a_mnjt:        (M, N, J, T)  purchase indicator a ∈ {0,1}
+  p_state_mjt:   (M, J, T)     observed price state s ∈ {0,...,S-1}
+  u_mj:          (M, J)        fixed Phase-1/2 intercept u_mj = δ_j + Ē_m + n_mj
+  lambda_mn:     (M, N)        known consumption probability (passed, not inferred)
 
-Unconstrained blocks z:
-  z_beta, z_alpha, z_v, z_fc : (M,J)
-  z_lambda                   : (M,N)
-  z_u_scale                  : (M,)
+Known price process:
+  P_price_mj:    (M, J, S, S)  Markov transition matrix over price states
+  price_vals_mj: (M, J, S)     price level for each state
+  pi_I0:         (I_max+1,)    initial inventory distribution (shared across m,n,j)
 
-Public API:
-  - fit(n_iter, k): k is a dict of RW step sizes keyed by:
-      {"beta","alpha","v","fc","lambda","u_scale"}
-  - get_results(): returns theta_hat, n_saved, accept (rates only)
+Estimated parameters θ:
+  beta:      (1,)   discount factor in (0,1), shared across markets/products
+  alpha:     (J,)   price sensitivity > 0
+  v:         (J,)   stockout penalty > 0
+  fc:        (J,)   fixed purchase cost > 0
+  u_scale:   (M,)   nuisance scale on u_mj during estimation > 0
+
+Unconstrained parameters z (RW-MH on z-space):
+  z_beta:    (1,)
+  z_alpha:   (J,)
+  z_v:       (J,)
+  z_fc:      (J,)
+  z_u_scale: (M,)
+
+Notes:
+  - lambda_mn is treated as known input data and is not estimated.
+  - u_scale can be "frozen" for testing by setting k["u_scale"] = 0.0 (skips the update).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.dtypes import int32
 
 from ching import stockpiling_model as model
-
-from ching.stockpiling_updates import (
-    update_z_beta_alpha_fc_mj,
-    update_z_lambda_mn,
-    update_z_u_scale_m,
-    update_z_v_mj,
-)
-
 from ching.stockpiling_diagnostics import report_iteration_progress
+from ching.stockpiling_posterior import StockpilingInputs
+from ching.stockpiling_updates import (
+    update_z_alpha_j,
+    update_z_beta_scalar,
+    update_z_fc_j,
+    update_z_u_scale_m,
+    update_z_v_j,
+)
 
 
 class StockpilingEstimator:
-    """
-    Estimate Phase-3 stockpiling parameters with elementwise RW-MH on z-parameters.
-
-    Block shapes:
-      - Market-product blocks (M,J): z_beta, z_alpha, z_v, z_fc
-      - Market-consumer block (M,N): z_lambda
-      - Market block (M,):          z_u_scale
-    """
+    """TensorFlow implementation of an MCMC estimator for the stockpiling model."""
 
     def __init__(
         self,
-        a_mnjt: Any,
-        p_state_mjt: Any,
-        u_mj: Any,
-        price_vals_mj: Any,
-        P_price_mj: Any,
+        a_mnjt: np.ndarray,
+        p_state_mjt: np.ndarray,
+        u_mj: np.ndarray,
+        lambda_mn: np.ndarray,
+        P_price_mj: np.ndarray,
+        price_vals_mj: np.ndarray,
+        pi_I0: np.ndarray,
         I_max: int,
-        pi_I0: Any,
         waste_cost: float,
-        eps: float,
-        tol: float,
-        max_iter: int,
-        init_theta: dict[str, float],
-        sigmas: dict[str, float],
-        seed: int,
+        sigmas: Mapping[str, float],
+        eps: float = 1.0,
+        tol: float = 1e-8,
+        max_iter: int = 10_000,
+        rng_seed: int = 0,
+        use_ccp_cache: bool = True,
     ) -> None:
-        # ---- infer dimensions (assumes inputs are consistent) ----
-        a_np = np.asarray(a_mnjt)
-        self.M, self.N, self.J, self.T = (int(x) for x in a_np.shape)
-
-        pv_np = np.asarray(price_vals_mj, dtype=np.float64)
-        self.S = int(pv_np.shape[2])
-
-        # ---- convert to TF tensors (posterior expects these dtypes) ----
-        self.a_mnjt = tf.convert_to_tensor(a_np, dtype=tf.int32)  # (M,N,J,T)
-
-        self.p_state_mjt = tf.convert_to_tensor(
-            np.asarray(p_state_mjt), dtype=tf.int32
-        )  # (M,J,T)
-
-        self.u_mj = tf.convert_to_tensor(
-            np.asarray(u_mj, dtype=np.float64), dtype=tf.float64
-        )  # (M,J)
-
-        self.price_vals_mj = tf.convert_to_tensor(pv_np, dtype=tf.float64)  # (M,J,S)
-
-        self.P_price_mj = tf.convert_to_tensor(
-            np.asarray(P_price_mj, dtype=np.float64), dtype=tf.float64
-        )  # (M,J,S,S)
-
-        self.pi_I0 = tf.convert_to_tensor(np.asarray(pi_I0), dtype=tf.float64)  # (I,)
-
-        self.waste_cost = tf.convert_to_tensor(float(waste_cost), dtype=tf.float64)
-        self.eps = tf.convert_to_tensor(float(eps), dtype=tf.float64)
-        self.tol = tf.convert_to_tensor(float(tol), dtype=tf.float64)
-        self.max_iter = tf.convert_to_tensor(int(max_iter), dtype=tf.int32)
-
-        # ---- prior scales over z (scalar float64 tensors) ----
-        # Assumes upstream provides the needed keys:
-        #   z_beta, z_alpha, z_v, z_fc, z_lambda, z_u_scale
-        self.sigma_z: dict[str, tf.Tensor] = {
-            k: tf.convert_to_tensor(float(v), dtype=tf.float64)
-            for k, v in sigmas.items()
-        }
-
-        # ---- inventory maps (precomputed once) ----
-        I_max_tf = tf.convert_to_tensor(int(I_max), dtype=tf.int32)
-        self.maps = model.build_inventory_maps(I_max_tf)
-
-        # ---- pack constant model inputs for posterior views ----
-        self.inputs: dict[str, tf.Tensor] = {
-            "a_mnjt": self.a_mnjt,
-            "p_state_mjt": self.p_state_mjt,
-            "u_mj": self.u_mj,
-            "price_vals_mj": self.price_vals_mj,
-            "P_price_mj": self.P_price_mj,
-            "pi_I0": self.pi_I0,
-            "waste_cost": self.waste_cost,
-            "eps": self.eps,
-            "tol": self.tol,
-            "max_iter": self.max_iter,
-            "maps": self.maps,
-        }
-
-        # ---- RNG (single stream) ----
-        self.rng = tf.random.Generator.from_seed(int(seed))
-
-        # ---- initialize z explicitly from init_theta ----
-
-        beta0 = tf.convert_to_tensor(float(init_theta["beta"]), dtype=tf.float64)
-        alpha0 = tf.convert_to_tensor(float(init_theta["alpha"]), dtype=tf.float64)
-        v0 = tf.convert_to_tensor(float(init_theta["v"]), dtype=tf.float64)
-        fc0 = tf.convert_to_tensor(float(init_theta["fc"]), dtype=tf.float64)
-        lam0 = tf.convert_to_tensor(float(init_theta["lambda"]), dtype=tf.float64)
-        us0 = tf.convert_to_tensor(float(init_theta["u_scale"]), dtype=tf.float64)
-
-        beta0_mj = tf.fill((self.M, self.J), beta0)
-        alpha0_mj = tf.fill((self.M, self.J), alpha0)
-        v0_mj = tf.fill((self.M, self.J), v0)
-        fc0_mj = tf.fill((self.M, self.J), fc0)
-
-        lam0_mn = tf.fill((self.M, self.N), lam0)
-        us0_m = tf.fill((self.M,), us0)
-
-        # logit(x) = log(x) - log(1-x) for beta, lambda; log(x) for positive blocks
-        z_beta0 = tf.math.log(beta0_mj) - tf.math.log1p(-beta0_mj)
-        z_alpha0 = tf.math.log(alpha0_mj)
-        z_v0 = tf.math.log(v0_mj)
-        z_fc0 = tf.math.log(fc0_mj)
-
-        z_lambda0 = tf.math.log(lam0_mn) - tf.math.log1p(-lam0_mn)
-        z_u_scale0 = tf.math.log(us0_m)
-
-        self.z: dict[str, tf.Variable] = {
-            "z_beta": tf.Variable(z_beta0, trainable=False, dtype=tf.float64),
-            "z_alpha": tf.Variable(z_alpha0, trainable=False, dtype=tf.float64),
-            "z_v": tf.Variable(z_v0, trainable=False, dtype=tf.float64),
-            "z_fc": tf.Variable(z_fc0, trainable=False, dtype=tf.float64),
-            "z_lambda": tf.Variable(z_lambda0, trainable=False, dtype=tf.float64),
-            "z_u_scale": tf.Variable(z_u_scale0, trainable=False, dtype=tf.float64),
-        }
-
-        # ---- step sizes (set in fit) ----
-        self.k: dict[str, tf.Variable] = {
-            "beta": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "alpha": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "v": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "fc": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "lambda": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "u_scale": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-        }
-
-        # ---- acceptance counters (counts accepted entries per block) ----
-        self.accept: dict[str, tf.Variable] = {
-            "beta": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "alpha": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "v": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "fc": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "lambda": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "u_scale": tf.Variable(0, dtype=tf.int32, trainable=False),
-        }
-
-        # ---- running sums for posterior means ----
-        self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
-        self.sums: dict[str, tf.Variable] = {
-            "beta": tf.Variable(
-                tf.zeros([self.M, self.J], tf.float64), trainable=False
-            ),
-            "alpha": tf.Variable(
-                tf.zeros([self.M, self.J], tf.float64), trainable=False
-            ),
-            "v": tf.Variable(tf.zeros([self.M, self.J], tf.float64), trainable=False),
-            "fc": tf.Variable(tf.zeros([self.M, self.J], tf.float64), trainable=False),
-            "lambda": tf.Variable(
-                tf.zeros([self.M, self.N], tf.float64), trainable=False
-            ),
-            "u_scale": tf.Variable(tf.zeros([self.M], tf.float64), trainable=False),
-        }
-
-        # ---- block sizes for acceptance-rate denominators ----
-        self._block_sizes: dict[str, int] = {
-            "beta": self.M * self.J,
-            "alpha": self.M * self.J,
-            "v": self.M * self.J,
-            "fc": self.M * self.J,
-            "lambda": self.M * self.N,
-            "u_scale": self.M,
-        }
-
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
-
-    def fit(self, n_iter: int, k: dict[str, float]) -> None:
         """
-        Run MCMC for n_iter iterations (Python loop), accumulating posterior means.
-
         Args:
-          n_iter: number of sweeps
-          k: RW step sizes keyed by:
-               {"beta","alpha","v","fc","lambda","u_scale"}
+          a_mnjt: Purchase indicators, shape (M,N,J,T).
+          p_state_mjt: Price states, shape (M,J,T), integer in {0,...,S-1}.
+          u_mj: Fixed intercept from Phase 1–2, shape (M,J).
+          lambda_mn: Known consumption probability, shape (M,N), in (0,1).
+          P_price_mj: Price Markov transitions, shape (M,J,S,S).
+          price_vals_mj: Price levels for each state, shape (M,J,S).
+          pi_I0: Initial inventory distribution, shape (I_max+1,).
+          I_max: Maximum inventory units.
+          waste_cost: Waste penalty coefficient in the buy utility.
+          sigmas: Prior scales on z-space blocks. Required keys:
+            {"z_beta","z_alpha","z_v","z_fc","z_u_scale"}.
+          eps: Included for backward compatibility with earlier configs (not used).
+          tol: Convergence tolerance for the CCP solver.
+          max_iter: Maximum iterations for the CCP solver.
+          rng_seed: RNG seed for MCMC proposals.
+          use_ccp_cache: If True, the posterior uses the CCP cache.
         """
-        n_iter = int(n_iter)
-        if n_iter <= 0:
-            raise ValueError("n_iter must be > 0")
+        a_mnjt = np.asarray(a_mnjt)
+        p_state_mjt = np.asarray(p_state_mjt)
+        u_mj = np.asarray(u_mj)
+        lambda_mn = np.asarray(lambda_mn)
+        P_price_mj = np.asarray(P_price_mj)
+        price_vals_mj = np.asarray(price_vals_mj)
+        pi_I0 = np.asarray(pi_I0)
 
-        self.k["beta"].assign(float(k["beta"]))
-        self.k["alpha"].assign(float(k["alpha"]))
-        self.k["v"].assign(float(k["v"]))
-        self.k["fc"].assign(float(k["fc"]))
-        self.k["lambda"].assign(float(k["lambda"]))
-        self.k["u_scale"].assign(float(k["u_scale"]))
+        _ = eps  # not used in the current model implementation
 
-        self._reset_chain_state()
+        M, N, J, T = a_mnjt.shape
+        S = int(price_vals_mj.shape[2])
 
-        for it in range(n_iter):
-            it_t = tf.constant(it, dtype=tf.int32)
-            self._mcmc_iteration_step(it=it_t)
+        self.M, self.N, self.J, self.T, self.S = int(M), int(N), int(J), int(T), int(S)
+        self.I_max = int(I_max)
 
-    def get_results(self) -> dict[str, object]:
-        """
-        Return posterior means and acceptance rates as Python/numpy objects.
+        self.rng = tf.random.Generator.from_seed(int(rng_seed))
+        inventory_maps = model.build_inventory_maps(self.I_max)
 
-        Returns:
-          {
-            "theta_hat": {"beta","alpha","v","fc","lambda","u_scale"},
-            "n_saved": int,
-            "accept": {"beta","alpha","v","fc","lambda","u_scale"}  # rates only
-          }
-        """
-        n_saved = int(self.saved.numpy())
-        if n_saved <= 0:
-            raise RuntimeError("No saved iterations (n_saved == 0). Call fit().")
+        self.inputs = StockpilingInputs(
+            a_mnjt=tf.convert_to_tensor(a_mnjt, dtype=tf.float64),
+            s_mjt=tf.convert_to_tensor(p_state_mjt, dtype=tf.int32),
+            u_mj=tf.convert_to_tensor(u_mj, dtype=tf.float64),
+            P_price_mj=tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
+            price_vals_mj=tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
+            lambda_mn=tf.convert_to_tensor(lambda_mn, dtype=tf.float64),
+            I_max=self.I_max,
+            waste_cost=float(waste_cost),
+            tol=float(tol),
+            max_iter=int(max_iter),
+            z=None,
+            init_I_dist=tf.convert_to_tensor(pi_I0, dtype=tf.float64),
+            inventory_maps=inventory_maps,
+            use_ccp_cache=bool(use_ccp_cache),
+        )
 
-        saved_f = tf.cast(self.saved, tf.float64)
-
-        theta_hat = {
-            "beta": (self.sums["beta"] / saved_f).numpy(),
-            "alpha": (self.sums["alpha"] / saved_f).numpy(),
-            "v": (self.sums["v"] / saved_f).numpy(),
-            "fc": (self.sums["fc"] / saved_f).numpy(),
-            "lambda": (self.sums["lambda"] / saved_f).numpy(),
-            "u_scale": (self.sums["u_scale"] / saved_f).numpy(),
+        self.sigma_z: dict[str, tf.Tensor] = {
+            "z_beta": tf.constant(float(sigmas["z_beta"]), dtype=tf.float64),
+            "z_alpha": tf.constant(float(sigmas["z_alpha"]), dtype=tf.float64),
+            "z_v": tf.constant(float(sigmas["z_v"]), dtype=tf.float64),
+            "z_fc": tf.constant(float(sigmas["z_fc"]), dtype=tf.float64),
+            "z_u_scale": tf.constant(float(sigmas["z_u_scale"]), dtype=tf.float64),
         }
 
-        counts = {k: int(v.numpy()) for k, v in self.accept.items()}
-        rates = {
-            k: counts[k] / max(1, n_saved * self._block_sizes[k]) for k in counts.keys()
+        self.z: dict[str, tf.Variable] = {}
+        self.k: dict[str, tf.Tensor] = {}
+        self.accept: dict[str, tf.Variable] = {}
+        self.sum_theta: dict[str, tf.Variable] = {}
+        self.saved = tf.Variable(0, dtype=tf.int32)
+
+    def _as_vec(self, x: Any, length: int, name: str, min_value: float) -> tf.Tensor:
+        """
+        Convert x to a float64 tensor of shape (length,).
+
+        If x is scalar, broadcasts to (length,).
+        If x is shape (length,), uses it directly.
+        """
+        a = np.asarray(x, dtype=np.float64)
+        if a.ndim == 0:
+            a = np.full((length,), float(a), dtype=np.float64)
+        if a.shape != (length,):
+            raise ValueError(
+                f"{name}: expected scalar or shape ({length},), got {a.shape}"
+            )
+        if not np.isfinite(a).all():
+            raise ValueError(f"{name}: expected finite values, got non-finite")
+        if (a <= min_value).any():
+            mn = float(a.min()) if a.size else float("nan")
+            raise ValueError(f"{name}: expected all > {min_value}, got min={mn}")
+        return tf.convert_to_tensor(a, dtype=tf.float64)
+
+    def _reset_chain_state(
+        self, init_theta: Mapping[str, Any], k: Mapping[str, float]
+    ) -> None:
+        """Initialize z, proposal scales, acceptance counters, and running sums."""
+        required_k = {"beta", "alpha", "v", "fc", "u_scale"}
+        missing_k = required_k - set(k.keys())
+        if missing_k:
+            raise ValueError(f"k: missing keys {sorted(missing_k)}")
+
+        self.k = {
+            "beta": tf.constant(float(k["beta"]), dtype=tf.float64),
+            "alpha": tf.constant(float(k["alpha"]), dtype=tf.float64),
+            "v": tf.constant(float(k["v"]), dtype=tf.float64),
+            "fc": tf.constant(float(k["fc"]), dtype=tf.float64),
+            "u_scale": tf.constant(float(k["u_scale"]), dtype=tf.float64),
         }
 
-        return {"theta_hat": theta_hat, "n_saved": n_saved, "accept": rates}
+        beta0 = float(init_theta["beta"])
+        if not np.isfinite(beta0) or beta0 <= 0.0 or beta0 >= 1.0:
+            raise ValueError(f"init_theta['beta']: expected in (0,1), got {beta0}")
 
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
+        alpha0 = self._as_vec(init_theta["alpha"], self.J, "init_theta['alpha']", 0.0)
+        v0 = self._as_vec(init_theta["v"], self.J, "init_theta['v']", 0.0)
+        fc0 = self._as_vec(init_theta["fc"], self.J, "init_theta['fc']", 0.0)
+        u_scale0 = self._as_vec(
+            init_theta["u_scale"], self.M, "init_theta['u_scale']", 0.0
+        )
 
-    def _current_z_dict(self) -> dict[str, tf.Tensor]:
-        """Return the current unconstrained state z as a dict for model/posterior calls."""
-        return {
-            "z_beta": self.z["z_beta"],
-            "z_alpha": self.z["z_alpha"],
-            "z_v": self.z["z_v"],
-            "z_fc": self.z["z_fc"],
-            "z_lambda": self.z["z_lambda"],
-            "z_u_scale": self.z["z_u_scale"],
+        beta0_tf = tf.constant(beta0, dtype=tf.float64)
+        z_beta0 = tf.reshape(tf.math.log(beta0_tf / (1.0 - beta0_tf)), (1,))
+        z_alpha0 = tf.math.log(alpha0)
+        z_v0 = tf.math.log(v0)
+        z_fc0 = tf.math.log(fc0)
+        z_u_scale0 = tf.math.log(u_scale0)
+
+        self.z = {
+            "z_beta": tf.Variable(z_beta0, dtype=tf.float64),
+            "z_alpha": tf.Variable(z_alpha0, dtype=tf.float64),
+            "z_v": tf.Variable(z_v0, dtype=tf.float64),
+            "z_fc": tf.Variable(z_fc0, dtype=tf.float64),
+            "z_u_scale": tf.Variable(z_u_scale0, dtype=tf.float64),
         }
 
-    def _reset_chain_state(self) -> None:
-        """Reset acceptance counters and posterior-mean accumulators."""
-        for v in self.accept.values():
-            v.assign(0)
+        self.accept = {
+            "beta": tf.Variable(0, dtype=tf.int32),
+            "alpha": tf.Variable(0, dtype=tf.int32),
+            "v": tf.Variable(0, dtype=tf.int32),
+            "fc": tf.Variable(0, dtype=tf.int32),
+            "u_scale": tf.Variable(0, dtype=tf.int32),
+        }
 
+        self.sum_theta = {
+            "beta": tf.Variable(tf.zeros((1,), dtype=tf.float64)),
+            "alpha": tf.Variable(tf.zeros((self.J,), dtype=tf.float64)),
+            "v": tf.Variable(tf.zeros((self.J,), dtype=tf.float64)),
+            "fc": tf.Variable(tf.zeros((self.J,), dtype=tf.float64)),
+            "u_scale": tf.Variable(tf.zeros((self.M,), dtype=tf.float64)),
+        }
         self.saved.assign(0)
-        for v in self.sums.values():
-            v.assign(tf.zeros_like(v))
-
-    # -------------------------------------------------------------------------
-    # Only compiled method
-    # -------------------------------------------------------------------------
 
     @tf.function(reduce_retracing=True)
     def _mcmc_iteration_step(self, it: tf.Tensor) -> None:
-        """One compiled MCMC sweep: update each z_* block with elementwise RW-MH."""
-        inputs = self.inputs
-        sigma_z = self.sigma_z
-
-        z_beta = self.z["z_beta"]
-        z_alpha = self.z["z_alpha"]
-        z_v = self.z["z_v"]
-        z_fc = self.z["z_fc"]
-        z_lambda = self.z["z_lambda"]
-        z_u_scale = self.z["z_u_scale"]
-
-        # ---- Parameter-block updates (RW-MH, elementwise acceptance) ----
-
-        # ---- Joint RW-MH update for (z_beta, z_alpha, z_fc) with one accept per (m,j) ----
-
-        z_beta_new, z_alpha_new, z_fc_new, accepted = update_z_beta_alpha_fc_mj(
-            rng=self.rng,
-            k_beta=self.k["beta"],
-            k_alpha=self.k["alpha"],
-            k_fc=self.k["fc"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
+        """Run one MCMC iteration (sequential block updates + running sums)."""
+        z_beta_new, acc_beta = update_z_beta_scalar(
+            self.z["z_beta"],
+            self.z["z_alpha"],
+            self.z["z_v"],
+            self.z["z_fc"],
+            self.z["z_u_scale"],
+            self.inputs,
+            self.sigma_z,
+            self.k["beta"],
+            self.rng,
         )
-
         self.z["z_beta"].assign(z_beta_new)
+        self.accept["beta"].assign_add(tf.reduce_sum(tf.cast(acc_beta, tf.int32)))
+
+        z_alpha_new, acc_alpha = update_z_alpha_j(
+            self.z["z_beta"],
+            self.z["z_alpha"],
+            self.z["z_v"],
+            self.z["z_fc"],
+            self.z["z_u_scale"],
+            self.inputs,
+            self.sigma_z,
+            self.k["alpha"],
+            self.rng,
+        )
         self.z["z_alpha"].assign(z_alpha_new)
+        self.accept["alpha"].assign_add(tf.reduce_sum(tf.cast(acc_alpha, tf.int32)))
+
+        z_v_new, acc_v = update_z_v_j(
+            self.z["z_beta"],
+            self.z["z_alpha"],
+            self.z["z_v"],
+            self.z["z_fc"],
+            self.z["z_u_scale"],
+            self.inputs,
+            self.sigma_z,
+            self.k["v"],
+            self.rng,
+        )
+        self.z["z_v"].assign(z_v_new)
+        self.accept["v"].assign_add(tf.reduce_sum(tf.cast(acc_v, tf.int32)))
+
+        z_fc_new, acc_fc = update_z_fc_j(
+            self.z["z_beta"],
+            self.z["z_alpha"],
+            self.z["z_v"],
+            self.z["z_fc"],
+            self.z["z_u_scale"],
+            self.inputs,
+            self.sigma_z,
+            self.k["fc"],
+            self.rng,
+        )
         self.z["z_fc"].assign(z_fc_new)
+        self.accept["fc"].assign_add(tf.reduce_sum(tf.cast(acc_fc, tf.int32)))
 
-        acc = tf.reduce_sum(tf.cast(accepted, tf.int32))
-        self.accept["beta"].assign_add(acc)
-        self.accept["alpha"].assign_add(acc)
-        self.accept["fc"].assign_add(acc)
+        def _do_u_scale_update() -> tuple[tf.Tensor, tf.Tensor]:
+            return update_z_u_scale_m(
+                self.z["z_beta"],
+                self.z["z_alpha"],
+                self.z["z_v"],
+                self.z["z_fc"],
+                self.z["z_u_scale"],
+                self.inputs,
+                self.sigma_z,
+                self.k["u_scale"],
+                self.rng,
+            )
 
-        # -----------------------------------------------------------------------------
-        # Legacy single-block updates for beta/alpha/fc (commented out for easy revert)
-        # -----------------------------------------------------------------------------
-        # z_new, accepted = update_z_beta_mj(
-        #     rng=self.rng,
-        #     k=self.k["beta"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_beta"].assign(z_new)
-        # self.accept["beta"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_alpha_mj(
-        #     rng=self.rng,
-        #     k=self.k["alpha"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_alpha"].assign(z_new)
-        # self.accept["alpha"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-        #
-        # z_new, accepted = update_z_fc_mj(
-        #     rng=self.rng,
-        #     k=self.k["fc"],
-        #     inputs=inputs,
-        #     sigma_z=sigma_z,
-        #     z_beta=z_beta,
-        #     z_alpha=z_alpha,
-        #     z_v=z_v,
-        #     z_fc=z_fc,
-        #     z_lambda=z_lambda,
-        #     z_u_scale=z_u_scale,
-        # )
-        # self.z["z_fc"].assign(z_new)
-        # self.accept["fc"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        def _skip_u_scale_update() -> tuple[tf.Tensor, tf.Tensor]:
+            acc = tf.zeros_like(self.z["z_u_scale"], dtype=tf.bool)
+            return self.z["z_u_scale"], acc
 
-        z_new, accepted = update_z_v_mj(
-            rng=self.rng,
-            k=self.k["v"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
+        z_u_new, acc_u = tf.cond(
+            self.k["u_scale"] > 0.0, _do_u_scale_update, _skip_u_scale_update
         )
-        self.z["z_v"].assign(z_new)
-        self.accept["v"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        self.z["z_u_scale"].assign(z_u_new)
+        self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(acc_u, tf.int32)))
 
-        z_new, accepted = update_z_lambda_mn(
-            rng=self.rng,
-            k=self.k["lambda"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
-        )
-        self.z["z_lambda"].assign(z_new)
-        self.accept["lambda"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-
-        z_new, accepted = update_z_u_scale_m(
-            rng=self.rng,
-            k=self.k["u_scale"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta=z_beta,
-            z_alpha=z_alpha,
-            z_v=z_v,
-            z_fc=z_fc,
-            z_lambda=z_lambda,
-            z_u_scale=z_u_scale,
-        )
-        self.z["z_u_scale"].assign(z_new)
-        self.accept["u_scale"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
-
-        # ---- Accumulate posterior means (no burn-in/thinning) ----
+        theta = model.unconstrained_to_theta(self.z)
+        self.sum_theta["beta"].assign_add(theta["beta"])
+        self.sum_theta["alpha"].assign_add(theta["alpha"])
+        self.sum_theta["v"].assign_add(theta["v"])
+        self.sum_theta["fc"].assign_add(theta["fc"])
+        self.sum_theta["u_scale"].assign_add(theta["u_scale"])
         self.saved.assign_add(1)
 
-        z_dict = {
-            "z_beta": self.z["z_beta"],
-            "z_alpha": self.z["z_alpha"],
-            "z_v": self.z["z_v"],
-            "z_fc": self.z["z_fc"],
-            "z_lambda": self.z["z_lambda"],
-            "z_u_scale": self.z["z_u_scale"],
+        report_iteration_progress(self.z, it)
+
+    def fit(
+        self,
+        n_iter: int,
+        init_theta: Mapping[str, Any],
+        k: Mapping[str, float],
+    ) -> dict[str, Any]:
+        """
+        Run MCMC and return posterior means and acceptance rates.
+
+        Args:
+          n_iter: Number of MCMC iterations (positive int).
+          init_theta: Dict with keys {"beta","alpha","v","fc","u_scale"}.
+            - beta: scalar in (0,1)
+            - alpha, v, fc: scalar or shape (J,)
+            - u_scale: scalar or shape (M,)
+          k: Proposal step sizes with required keys {"beta","alpha","v","fc","u_scale"}.
+            Setting k["u_scale"]=0.0 freezes the u_scale block.
+
+        Returns:
+          Dict with:
+            - "theta_mean": posterior means on theta-space
+            - "accept_rate": per-block acceptance rates
+            - "z_last": final z-space state
+        """
+        if int(n_iter) < 1:
+            raise ValueError(f"n_iter: expected >= 1, got {n_iter}")
+
+        self._reset_chain_state(init_theta=init_theta, k=k)
+
+        for it in range(int(n_iter)):
+            self._mcmc_iteration_step(tf.constant(it, dtype=tf.int32))
+
+        saved_f = tf.cast(tf.maximum(self.saved, 1), tf.float64)
+        theta_mean = {key: val / saved_f for key, val in self.sum_theta.items()}
+
+        block_sizes = {
+            "beta": tf.cast(tf.size(self.z["z_beta"]), tf.float64),
+            "alpha": tf.cast(tf.size(self.z["z_alpha"]), tf.float64),
+            "v": tf.cast(tf.size(self.z["z_v"]), tf.float64),
+            "fc": tf.cast(tf.size(self.z["z_fc"]), tf.float64),
+            "u_scale": tf.cast(tf.size(self.z["z_u_scale"]), tf.float64),
+        }
+        accept_rate = {
+            key: tf.cast(self.accept[key], tf.float64) / (saved_f * block_sizes[key])
+            for key in self.accept
         }
 
-        theta_curr = model.unconstrained_to_theta(z_dict)
-
-        self.sums["beta"].assign_add(theta_curr["beta"])
-        self.sums["alpha"].assign_add(theta_curr["alpha"])
-        self.sums["v"].assign_add(theta_curr["v"])
-        self.sums["fc"].assign_add(theta_curr["fc"])
-        self.sums["lambda"].assign_add(theta_curr["lambda"])
-        self.sums["u_scale"].assign_add(theta_curr["u_scale"])
-
-        report_iteration_progress(z=z_dict, it=it)
+        return {
+            "theta_mean": {k: v.numpy() for k, v in theta_mean.items()},
+            "accept_rate": {k: v.numpy() for k, v in accept_rate.items()},
+            "z_last": {k: v.numpy() for k, v in self.z.items()},
+        }

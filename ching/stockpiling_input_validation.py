@@ -135,55 +135,58 @@ def _validate_price_inputs(
 
 
 def validate_stockpiling_dgp_inputs(
-    *,
-    seed: int,
     delta_true: Any,
     E_bar_true: Any,
     njt_true: Any,
+    price_vals_mj: Any,
+    P_price_mj: Any,
     N: int,
     T: int,
     I_max: int,
-    P_price_mj: Any,
-    price_vals_mj: Any,
     waste_cost: float,
-    tol: float,
-    max_iter: int,
+    seed: int,
+    tol: float | None = None,
+    max_iter: int | None = None,
 ) -> None:
     """
-    Validate inputs to datasets.ching_dgp.generate_dgp.
+    Validate inputs to datasets/ching_dgp.generate_dgp(...) for Phase-3 stockpiling.
 
-    Shapes:
-      delta_true  (J,)
-      E_bar_true  (M,)
-      njt_true    (M,J)
-      P_price_mj  (M,J,S,S)
-      price_vals_mj (M,J,S)
+    This validator infers:
+      - M from E_bar_true
+      - J from delta_true
+      - S from P_price_mj / price_vals_mj
     """
-    _require_int_scalar(seed, "seed", min_value=0)
-    N = _require_int_scalar(N, "N", min_value=1)
-    T = _require_int_scalar(T, "T", min_value=1)
-    I_max = _require_int_scalar(I_max, "I_max", min_value=0)
-    _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
-    _require_float_scalar(tol, "tol", min_value=0.0)
-    _require_int_scalar(max_iter, "max_iter", min_value=1)
 
     delta = _as_np(delta_true, "delta_true", dtype=np.float64)
     _require_ndim(delta, 1, "delta_true")
     J = int(delta.shape[0])
-    _require_finite(delta, "delta_true")
 
     E_bar = _as_np(E_bar_true, "E_bar_true", dtype=np.float64)
     _require_ndim(E_bar, 1, "E_bar_true")
     M = int(E_bar.shape[0])
-    _require_finite(E_bar, "E_bar_true")
 
     njt = _as_np(njt_true, "njt_true", dtype=np.float64)
     _require_ndim(njt, 2, "njt_true")
     _require_shape(njt, (M, J), "njt_true")
     _require_finite(njt, "njt_true")
 
+    _require_finite(delta, "delta_true")
+    _require_finite(E_bar, "E_bar_true")
+
+    _require_int_scalar(N, "N", min_value=1)
+    _require_int_scalar(T, "T", min_value=1)
+    _require_int_scalar(I_max, "I_max", min_value=0)
+    _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
+    _require_int_scalar(seed, "seed")
+
+    # Price process shapes + row-stochastic validation; infers S internally.
     _validate_price_inputs(P_price_mj=P_price_mj, price_vals_mj=price_vals_mj, M=M, J=J)
-    _ = (N, T)  # used downstream; validated here
+
+    # DP solver controls (algorithmic, but passed through generate_dgp)
+    if tol is not None:
+        _require_float_scalar(tol, "tol", min_value=0.0)
+    if max_iter is not None:
+        _require_int_scalar(max_iter, "max_iter", min_value=1)
 
 
 def validate_stockpiling_estimator_init_inputs(
@@ -193,6 +196,7 @@ def validate_stockpiling_estimator_init_inputs(
     u_mj: Any,
     price_vals_mj: Any,
     P_price_mj: Any,
+    lambda_mn: Any,
     I_max: int,
     pi_I0: Any,
     waste_cost: float,
@@ -209,13 +213,14 @@ def validate_stockpiling_estimator_init_inputs(
       a_mnjt (M,N,J,T)
       p_state_mjt (M,J,T)
       u_mj (M,J)
+      lambda_mn (M,N)
       price_vals_mj (M,J,S)
       P_price_mj (M,J,S,S)
       pi_I0 (I_max+1,)
 
     Also validates:
       eps >= 0, tol >= 0, max_iter >= 1, seed int
-      sigmas contains required z_* keys with positive values (including z_u_scale)
+      sigmas contains required z_* keys with strictly positive values: {'z_beta','z_alpha','z_v','z_fc','z_u_scale'}
     """
     I_max = _require_int_scalar(I_max, "I_max", min_value=0)
     _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
@@ -234,6 +239,18 @@ def validate_stockpiling_estimator_init_inputs(
     _require_ndim(u, 2, "u_mj")
     _require_shape(u, (M, J), "u_mj")
     _require_finite(u, "u_mj")
+
+    lam = _as_np(lambda_mn, "lambda_mn", dtype=np.float64)
+    _require_ndim(lam, 2, "lambda_mn")
+    _require_shape(lam, (M, N), "lambda_mn")
+    _require_finite(lam, "lambda_mn")
+    if lam.size:
+        if (lam <= 0.0).any() or (lam >= 1.0).any():
+            mn = float(lam.min())
+            mx = float(lam.max())
+            raise ValueError(
+                f"lambda_mn: expected entries in (0,1), got min={mn}, max={mx}"
+            )
 
     # Price inputs + S
     P, pv, S = _validate_price_inputs(
@@ -255,7 +272,7 @@ def validate_stockpiling_estimator_init_inputs(
             raise ValueError(f"pi_I0: expected to sum to 1, got sum={s}")
 
     # Prior scales for z
-    required_sigma_keys = {"z_beta", "z_alpha", "z_v", "z_fc", "z_lambda", "z_u_scale"}
+    required_sigma_keys = {"z_beta", "z_alpha", "z_v", "z_fc", "z_u_scale"}
     missing = required_sigma_keys - set(sigmas.keys())
     if missing:
         raise ValueError(f"sigmas: missing keys {sorted(missing)}")
@@ -277,12 +294,13 @@ def validate_stockpiling_estimator_fit_inputs(
     Args:
       n_iter: positive int
       k: dict with required keys:
-         {"beta","alpha","v","fc","lambda","u_scale"}
-         each value must be a positive float.
+         {"beta","alpha","v","fc","u_scale"}
+         step sizes must be finite floats; beta/alpha/v/fc must be > 0,
+         and u_scale may be 0 to freeze its update step.
     """
-    n_iter = _require_int_scalar(n_iter, "n_iter", min_value=1)
+    _ = _require_int_scalar(n_iter, "n_iter", min_value=1)
 
-    required = {"beta", "alpha", "v", "fc", "lambda", "u_scale"}
+    required = {"beta", "alpha", "v", "fc", "u_scale"}
     if not isinstance(k, dict):
         raise ValueError(f"k: expected dict, got type={type(k)}")
 
@@ -296,5 +314,9 @@ def validate_stockpiling_estimator_fit_inputs(
 
     for key in sorted(required):
         v = _require_float_scalar(k[key], f"k['{key}']", min_value=0.0)
-        if v <= 0.0:
-            raise ValueError(f"k['{key}']: expected > 0, got {v}")
+        if key == "u_scale":
+            if v < 0.0:
+                raise ValueError(f"k['{key}']: expected >= 0, got {v}")
+        else:
+            if v <= 0.0:
+                raise ValueError(f"k['{key}']: expected > 0, got {v}")

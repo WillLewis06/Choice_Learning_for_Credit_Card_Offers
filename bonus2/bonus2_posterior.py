@@ -13,15 +13,15 @@ All core mechanics (parameter transforms, habit recursion, peer exposure, utilit
   bonus2.bonus2_model
 
 Observed inputs (in `inputs` dict):
-  y_mit        (M,N,T)   int32/int64   choices; 0=outside, j+1=inside product j
-  delta_mj     (M,J)     float64       Phase-1 baseline utilities (fixed)
-  dow_t        (T,)      int32/int64   weekday index in {0..6}
-  sin_k_theta  (K,T)     float64       sin((k+1)*theta(t))
-  cos_k_theta  (K,T)     float64       cos((k+1)*theta(t))
-  peer_adj_m   tuple[M]  tf.SparseTensor(N,N) known within-market adjacency
-  L            scalar    int32/int64   peer lookback window length
-  eps_decay    scalar    float64       optional numeric guard for decay_rate; e.g. 1e-6
-  kappa_decay  scalar    float64       Beta prior shape kappa for decay_rate_j ~ Beta(kappa, 1)
+  y_mit          (M,N,T)   int32/int64      choices; 0=outside, j+1=inside product j
+  delta_mj       (M,J)     float64          Phase-1 baseline utilities (fixed)
+  dow_t          (T,)      int32/int64      weekday index in {0..6}
+  season_sin_kt  (K,T)     float64          sin((k+1)*season_angle_t[t])
+  season_cos_kt  (K,T)     float64          cos((k+1)*season_angle_t[t])
+  peer_adj_m     tuple[M]  tf.SparseTensor  (N,N) known within-market adjacency
+  L              scalar    int32/int64      peer lookback window length
+  decay_rate_eps scalar    float64          optional numeric guard for decay_rate; e.g. 1e-6
+  kappa_decay    scalar    float64          Beta prior shape kappa for decay_rate_j ~ Beta(kappa, 1)
 
 Unconstrained sampler variables z (keys expected in `z` dict):
   z_beta_market_mj  (M,J)
@@ -74,7 +74,7 @@ def logprior_normal(z_block: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
 def logprior_decay_beta_kappa1_on_z(
     z_decay_rate_j: tf.Tensor,
     kappa_decay: tf.Tensor,
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> tf.Tensor:
     """
     Log prior for z_decay_rate_j when decay_rate_j ~ Beta(kappa, 1) in constrained space,
@@ -94,7 +94,7 @@ def logprior_decay_beta_kappa1_on_z(
     Args:
       z_decay_rate_j: (J,)
       kappa_decay: scalar > 0
-      eps_decay: scalar >= 0 numeric guard; used to clip decay into [eps, 1-eps]
+      decay_rate_eps: scalar >= 0 numeric guard; used to clip decay into [eps, 1-eps]
 
     Returns:
       (J,) float64 tensor of elementwise log prior contributions.
@@ -102,7 +102,7 @@ def logprior_decay_beta_kappa1_on_z(
     z = tf.cast(z_decay_rate_j, tf.float64)
     kappa = tf.cast(kappa_decay, tf.float64)
 
-    eps = tf.cast(eps_decay, tf.float64)
+    eps = tf.cast(decay_rate_eps, tf.float64)
     # Never allow exact 0/1 inside logs.
     eps_safe = tf.maximum(eps, tf.constant(1e-12, tf.float64))
 
@@ -137,11 +137,11 @@ def loglik_mnt(z: dict[str, tf.Tensor], inputs: dict[str, tf.Tensor]) -> tf.Tens
         y_mit=inputs["y_mit"],
         delta_mj=inputs["delta_mj"],
         dow_t=inputs["dow_t"],
-        sin_k_theta=inputs["sin_k_theta"],
-        cos_k_theta=inputs["cos_k_theta"],
+        season_sin_kt=inputs["season_sin_kt"],
+        season_cos_kt=inputs["season_cos_kt"],
         peer_adj_m=inputs["peer_adj_m"],
         L=inputs["L"],
-        eps_decay=inputs.get("eps_decay", tf.constant(0.0, tf.float64)),
+        decay_rate_eps=inputs.get("decay_rate_eps", tf.constant(0.0, tf.float64)),
     )
 
 
@@ -226,14 +226,14 @@ def _logpost_decay_rate_j_all(
     ll_mnt = loglik_mnt(z=z, inputs=inputs)
     ll = tf.reduce_sum(ll_mnt)
 
-    eps_decay = inputs.get("eps_decay", tf.constant(0.0, tf.float64))
+    decay_rate_eps = inputs.get("decay_rate_eps", tf.constant(0.0, tf.float64))
     kappa_decay = inputs["kappa_decay"]
 
     lp = tf.reduce_sum(
         logprior_decay_beta_kappa1_on_z(
             z_decay_rate_j=z["z_decay_rate_j"],
             kappa_decay=kappa_decay,
-            eps_decay=eps_decay,
+            decay_rate_eps=decay_rate_eps,
         )
     )
 

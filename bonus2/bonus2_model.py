@@ -11,13 +11,13 @@ This module is the "core model" layer (analogous to ching/stockpiling_model.py).
   - Utility construction and MNL log-likelihood / prediction probabilities
 
 Observed inputs (typically passed in an `inputs` dict by the posterior/estimator):
-  y_mit        (M,N,T) int   choices; 0=outside, j+1=inside product j
-  delta_mj     (M,J)   f64   Phase-1 baseline utilities (fixed)
-  dow_t        (T,)    int   weekday index in {0..6}
-  sin_k_theta  (K,T)   f64   sin((k+1)*theta(t))
-  cos_k_theta  (K,T)   f64   cos((k+1)*theta(t))
-  peer_adj_m   tuple of length M, each a tf.SparseTensor (N,N) adjacency
-  L            scalar int    peer lookback window length
+  y_mit          (M,N,T) int   choices; 0=outside, j+1=inside product j
+  delta_mj       (M,J)   f64   Phase-1 baseline utilities (fixed)
+  dow_t          (T,)    int   weekday index in {0..6}
+  season_sin_kt  (K,T)   f64   sin((k+1)*season_angle_t[t]) basis
+  season_cos_kt  (K,T)   f64   cos((k+1)*season_angle_t[t]) basis
+  peer_adj_m     tuple of length M, each a tf.SparseTensor (N,N) adjacency
+  L              scalar int    peer lookback window length
 
 Parameters (theta):
   beta_market_mj (M,J)
@@ -44,7 +44,7 @@ Choice model:
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import tensorflow as tf
 
@@ -93,7 +93,7 @@ def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
 
 def _ensure_theta(
     theta: dict[str, tf.Tensor],
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> dict[str, tf.Tensor]:
     """
     Ensure float64 and apply identifiability constraints consistent with the DGP.
@@ -107,13 +107,13 @@ def _ensure_theta(
     th = {k: tf.cast(v, tf.float64) for k, v in theta.items()}
 
     # Optional numerical guard for decay rates.
-    eps_decay = tf.cast(eps_decay, tf.float64)
-    if eps_decay.dtype != tf.float64:
-        eps_decay = tf.cast(eps_decay, tf.float64)
+    decay_rate_eps = tf.cast(decay_rate_eps, tf.float64)
+    if decay_rate_eps.dtype != tf.float64:
+        decay_rate_eps = tf.cast(decay_rate_eps, tf.float64)
 
-    if tf.reduce_any(eps_decay > 0.0):
+    if tf.reduce_any(decay_rate_eps > 0.0):
         th["decay_rate_j"] = tf.clip_by_value(
-            th["decay_rate_j"], eps_decay, ONE_F64 - eps_decay
+            th["decay_rate_j"], decay_rate_eps, ONE_F64 - decay_rate_eps
         )
 
     beta_dow_m, beta_dow_j, a_j, b_j = apply_identifiability_constraints_tf(
@@ -271,9 +271,7 @@ def compute_habit_stock_from_choices(
 
     H_next_t = tf.scan(_step, x_t, initializer=H0)  # (T,M,N,J) gives H_{t+1}
 
-    H_curr_t = tf.concat(
-        [H0[None, ...], H_next_t[:-1, ...]], axis=0
-    )  # (T,M,N,J) gives H_t
+    H_curr_t = tf.concat([H0[None, ...], H_next_t[:-1, ...]], axis=0)  # (T,M,N,J)
     return tf.transpose(H_curr_t, perm=[1, 2, 0, 3])  # (M,N,T,J)
 
 
@@ -348,27 +346,27 @@ def compute_peer_exposure_from_adj(
 def fourier_seasonality_tf(
     a_coeff: tf.Tensor,
     b_coeff: tf.Tensor,
-    sin_k_theta: tf.Tensor,
-    cos_k_theta: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
 ) -> tf.Tensor:
     """
     Compute Fourier seasonal series:
 
-      S[r,t] = sum_k a[r,k]*sin[k,t] + b[r,k]*cos[k,t]
+      S[r,t] = sum_k a[r,k]*season_sin_kt[k,t] + b[r,k]*season_cos_kt[k,t]
 
     Shapes:
       a_coeff, b_coeff: (R,K)
-      sin_k_theta, cos_k_theta: (K,T)
+      season_sin_kt, season_cos_kt: (K,T)
 
     Returns:
       S: (R,T)
     """
     a_coeff = tf.cast(a_coeff, tf.float64)
     b_coeff = tf.cast(b_coeff, tf.float64)
-    sin_k_theta = tf.cast(sin_k_theta, tf.float64)
-    cos_k_theta = tf.cast(cos_k_theta, tf.float64)
-    return tf.linalg.matmul(a_coeff, sin_k_theta) + tf.linalg.matmul(
-        b_coeff, cos_k_theta
+    season_sin_kt = tf.cast(season_sin_kt, tf.float64)
+    season_cos_kt = tf.cast(season_cos_kt, tf.float64)
+    return tf.linalg.matmul(a_coeff, season_sin_kt) + tf.linalg.matmul(
+        b_coeff, season_cos_kt
     )
 
 
@@ -377,11 +375,11 @@ def utilities_mntj_from_theta(
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
     dow_t: tf.Tensor,
-    sin_k_theta: tf.Tensor,
-    cos_k_theta: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> tf.Tensor:
     """
     Compute inside-option utilities v_{m,i,j,t} (no outside option column).
@@ -389,18 +387,19 @@ def utilities_mntj_from_theta(
     Returns:
       v_mntj: (M,N,T,J) float64
     """
-    theta = _ensure_theta(theta=theta, eps_decay=eps_decay)
+    theta = _ensure_theta(theta=theta, decay_rate_eps=decay_rate_eps)
 
     y_mit = tf.convert_to_tensor(y_mit)
     delta_mj = tf.cast(delta_mj, tf.float64)
     dow_t = tf.cast(dow_t, tf.int32)
 
-    M = tf.shape(delta_mj)[0]
-    J_int = tf.shape(delta_mj)[1]
-
     # Seasonality: S_m (M,T), S_j (J,T)
-    S_m = fourier_seasonality_tf(theta["a_m"], theta["b_m"], sin_k_theta, cos_k_theta)
-    S_j = fourier_seasonality_tf(theta["a_j"], theta["b_j"], sin_k_theta, cos_k_theta)
+    S_m = fourier_seasonality_tf(
+        theta["a_m"], theta["b_m"], season_sin_kt, season_cos_kt
+    )
+    S_j = fourier_seasonality_tf(
+        theta["a_j"], theta["b_j"], season_sin_kt, season_cos_kt
+    )
 
     # DOW terms: gather along weekday axis.
     dow_m_mt = tf.gather(theta["beta_dow_m"], dow_t, axis=1)  # (M,T)
@@ -415,6 +414,7 @@ def utilities_mntj_from_theta(
     base_mtj = base_mj[:, None, :] + dow_mtj + season_mtj  # (M,T,J)
 
     # Deterministic states from observed y:
+    J_int = tf.shape(delta_mj)[1]
     H_mntj = compute_habit_stock_from_choices(
         y_mit=y_mit, decay_rate_j=theta["decay_rate_j"], J=J_int
     )
@@ -425,10 +425,8 @@ def utilities_mntj_from_theta(
     beta_habit = theta["beta_habit_j"][None, None, None, :]  # (1,1,1,J)
     beta_peer = theta["beta_peer_j"][None, None, None, :]  # (1,1,1,J)
 
-    v_mntj = (
-        base_mtj[:, None, :, :] + beta_habit * H_mntj + beta_peer * P_mntj
-    )  # (M,N,T,J)
-    return v_mntj
+    v_mntj = base_mtj[:, None, :, :] + beta_habit * H_mntj + beta_peer * P_mntj
+    return tf.cast(v_mntj, tf.float64)  # (M,N,T,J)
 
 
 # =============================================================================
@@ -441,11 +439,11 @@ def loglik_mnt_from_theta(
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
     dow_t: tf.Tensor,
-    sin_k_theta: tf.Tensor,
-    cos_k_theta: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> tf.Tensor:
     """
     Per-(market, consumer, time) log-likelihood contributions under MNL with outside option.
@@ -458,11 +456,11 @@ def loglik_mnt_from_theta(
         y_mit=y_mit,
         delta_mj=delta_mj,
         dow_t=dow_t,
-        sin_k_theta=sin_k_theta,
-        cos_k_theta=cos_k_theta,
+        season_sin_kt=season_sin_kt,
+        season_cos_kt=season_cos_kt,
         peer_adj_m=peer_adj_m,
         L=L,
-        eps_decay=eps_decay,
+        decay_rate_eps=decay_rate_eps,
     )
 
     v_mntj = tf.cast(v_mntj, tf.float64)
@@ -484,11 +482,11 @@ def loglik_from_theta(
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
     dow_t: tf.Tensor,
-    sin_k_theta: tf.Tensor,
-    cos_k_theta: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> tf.Tensor:
     """
     Total log-likelihood scalar (sum over M,N,T).
@@ -498,11 +496,11 @@ def loglik_from_theta(
         y_mit=y_mit,
         delta_mj=delta_mj,
         dow_t=dow_t,
-        sin_k_theta=sin_k_theta,
-        cos_k_theta=cos_k_theta,
+        season_sin_kt=season_sin_kt,
+        season_cos_kt=season_cos_kt,
         peer_adj_m=peer_adj_m,
         L=L,
-        eps_decay=eps_decay,
+        decay_rate_eps=decay_rate_eps,
     )
     return tf.reduce_sum(ll_mnt)
 
@@ -512,11 +510,11 @@ def predict_choice_probs_from_theta(
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
     dow_t: tf.Tensor,
-    sin_k_theta: tf.Tensor,
-    cos_k_theta: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    eps_decay: tf.Tensor,
+    decay_rate_eps: tf.Tensor,
 ) -> tf.Tensor:
     """
     Predict choice probabilities under MNL with outside option.
@@ -529,11 +527,11 @@ def predict_choice_probs_from_theta(
         y_mit=y_mit,
         delta_mj=delta_mj,
         dow_t=dow_t,
-        sin_k_theta=sin_k_theta,
-        cos_k_theta=cos_k_theta,
+        season_sin_kt=season_sin_kt,
+        season_cos_kt=season_cos_kt,
         peer_adj_m=peer_adj_m,
         L=L,
-        eps_decay=eps_decay,
+        decay_rate_eps=decay_rate_eps,
     )
 
     v_mntj = tf.cast(v_mntj, tf.float64)
