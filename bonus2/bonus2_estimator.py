@@ -36,13 +36,13 @@ Public API:
 Notes:
   - No traces are stored; only the last draw is returned.
   - Returned theta_* are in the identified (centered) form consistent with the DGP.
-  - MCMC updates for large matrix blocks are row-wise (one market row / one product row
-    per call) while _mcmc_iteration_step remains a compiled tf.function graph.
+  - Each parameter block is updated as a single RW–MH proposal per sweep while
+    _mcmc_iteration_step remains a compiled tf.function graph.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import tensorflow as tf
@@ -50,16 +50,16 @@ import tensorflow as tf
 from bonus2 import bonus2_model as model
 
 from bonus2.bonus2_updates import (
-    update_z_beta_market_mj_row,
+    update_z_beta_market_mj,
     update_z_beta_habit_j,
     update_z_beta_peer_j,
     update_z_decay_rate_j,
-    update_z_beta_dow_m_row,
-    update_z_beta_dow_j_row,
-    update_z_a_m_row,
-    update_z_b_m_row,
-    update_z_a_j_row,
-    update_z_b_j_row,
+    update_z_beta_dow_m,
+    update_z_beta_dow_j,
+    update_z_a_m,
+    update_z_b_m,
+    update_z_a_j,
+    update_z_b_j,
 )
 
 try:
@@ -74,18 +74,8 @@ except Exception:  # pragma: no cover
         tf.print("[Bonus2] it=", it, "| mean(z)=", means)
 
 
-def _neighbors_to_peer_adj_m(
-    neighbors: Any, M: int, N: int
-) -> tuple[tf.SparseTensor, ...]:
-    """
-    Convert neighbor lists into per-market Sparse adjacency matrices.
-
-    Expected input shape: neighbors[m][i] is an iterable of neighbor indices k
-    (no cross-market edges). Self-edges are dropped if present.
-
-    Returns:
-      peer_adj_m: tuple length M of SparseTensor (N,N) with 1.0 entries.
-    """
+def _coerce_neighbors_to_list(neighbors: Any, M: int, N: int) -> list[list[list[int]]]:
+    """Coerce neighbor structure to nested Python lists: neighbors[m][i] -> list[int]."""
     nb = neighbors
     if isinstance(nb, tf.RaggedTensor):
         nb = nb.to_list()
@@ -95,67 +85,50 @@ def _neighbors_to_peer_adj_m(
     if not isinstance(nb, (list, tuple)) or len(nb) != M:
         raise ValueError("neighbors must be a nested list/tuple with outer length M")
 
-    peer_adj: list[tf.SparseTensor] = []
+    out: list[list[list[int]]] = []
     for m in range(M):
         rows = nb[m]
         if not isinstance(rows, (list, tuple)) or len(rows) != N:
             raise ValueError("neighbors[m] must have length N for each market m")
 
-        indices: list[list[int]] = []
+        rows_out: list[list[int]] = []
         for i in range(N):
             neigh_i = rows[i]
             if neigh_i is None:
+                rows_out.append([])
                 continue
 
-            if isinstance(neigh_i, (np.ndarray,)):
+            if isinstance(neigh_i, np.ndarray):
                 neigh_i = neigh_i.tolist()
             if isinstance(neigh_i, (list, tuple)):
-                neigh_iter: Iterable[int] = neigh_i
+                neigh_list = [int(k) for k in neigh_i]
             else:
-                neigh_iter = [int(neigh_i)]
+                neigh_list = [int(neigh_i)]
 
+            # Minimal sanitization: drop self-edges, drop out-of-range, de-duplicate.
+            clean: list[int] = []
             seen = set()
-            for k in neigh_iter:
-                kk = int(k)
-                if kk == i:
+            for k in neigh_list:
+                if k == i:
                     continue
-                if kk < 0 or kk >= N:
-                    raise ValueError(
-                        f"neighbors[{m}][{i}] contains out-of-range index {kk} "
-                        f"(valid: 0..{N-1})"
-                    )
-                if kk in seen:
+                if k < 0 or k >= N:
                     continue
-                seen.add(kk)
-                indices.append([i, kk])
+                if k in seen:
+                    continue
+                seen.add(k)
+                clean.append(k)
+            rows_out.append(clean)
 
-        if len(indices) == 0:
-            idx = tf.zeros((0, 2), dtype=tf.int64)
-            vals = tf.zeros((0,), dtype=tf.float64)
-        else:
-            idx = tf.convert_to_tensor(indices, dtype=tf.int64)
-            vals = tf.ones((idx.shape[0],), dtype=tf.float64)
+        out.append(rows_out)
 
-        A = tf.SparseTensor(indices=idx, values=vals, dense_shape=(N, N))
-        A = tf.sparse.reorder(A)
-        peer_adj.append(A)
-
-    return tuple(peer_adj)
+    return out
 
 
 class Bonus2Estimator:
     """
     Estimate Bonus Q2 parameters with RW-MH on unconstrained z-blocks.
 
-    Large matrix blocks are updated row-wise (within a compiled tf.function sweep):
-      - Market×Product (M,J): z_beta_market_mj updated one market row at a time
-      - Market×DOW (M,7):     z_beta_dow_m updated one market row at a time
-      - Market×K (M,K):       z_a_m, z_b_m updated one market row at a time
-      - Product×DOW (J,7):    z_beta_dow_j updated one product row at a time
-      - Product×K (J,K):      z_a_j, z_b_j updated one product row at a time
-
-    Small vector blocks are updated as single calls per sweep:
-      - Product (J,): z_beta_habit_j, z_beta_peer_j, z_decay_rate_j
+    Each parameter block is updated once per sweep (one RW–MH accept/reject per block).
     """
 
     def __init__(
@@ -223,7 +196,8 @@ class Bonus2Estimator:
         self.season_cos_kt = tf.convert_to_tensor(cos_np_kt, dtype=tf.float64)  # (K,T)
 
         # ---- network: build peer_adj_m ----
-        self.peer_adj_m = _neighbors_to_peer_adj_m(neighbors, M=self.M, N=self.N)
+        nbrs_m = _coerce_neighbors_to_list(neighbors, M=self.M, N=self.N)
+        self.peer_adj_m = model.build_peer_adjacency(nbrs_m=nbrs_m, N=self.N)
 
         self.L = tf.convert_to_tensor(int(L), dtype=tf.int32)
 
@@ -251,9 +225,8 @@ class Bonus2Estimator:
             "peer_adj_m": self.peer_adj_m,
             "L": self.L,
             "kappa_decay": self.kappa_decay,
+            "decay_rate_eps": self.decay_rate_eps,
         }
-        if float(decay_rate_eps) != 0.0:
-            self.inputs["decay_rate_eps"] = self.decay_rate_eps
 
         # ---- RNG ----
         self.rng = tf.random.Generator.from_seed(int(seed))
@@ -455,12 +428,10 @@ class Bonus2Estimator:
         """
         theta = model.unconstrained_to_theta(z_dict)
 
-        eps = self.inputs.get("decay_rate_eps", tf.constant(0.0, tf.float64))
-        eps_f = float(eps.numpy()) if isinstance(eps, tf.Tensor) else float(eps)
-        if eps_f > 0.0:
-            theta["decay_rate_j"] = tf.clip_by_value(
-                tf.cast(theta["decay_rate_j"], tf.float64), eps_f, 1.0 - eps_f
-            )
+        eps_f = float(self.decay_rate_eps.numpy())
+        theta["decay_rate_j"] = tf.clip_by_value(
+            theta["decay_rate_j"], eps_f, 1.0 - eps_f
+        )
 
         beta_dow_m, beta_dow_j, a_j, b_j = model.apply_identifiability_constraints_tf(
             beta_dow_m=theta["beta_dow_m"],
@@ -474,8 +445,8 @@ class Bonus2Estimator:
         theta["b_j"] = b_j
 
         if as_numpy:
-            return {k: tf.cast(v, tf.float64).numpy() for k, v in theta.items()}
-        return {k: tf.cast(v, tf.float64) for k, v in theta.items()}
+            return {k: v.numpy() for k, v in theta.items()}
+        return theta
 
     def _reset_chain_state(self) -> None:
         for v in self.accept.values():
@@ -491,24 +462,26 @@ class Bonus2Estimator:
         inputs = self.inputs
         sigma_z = self.sigma_z
 
+        def _acc(block: str, accepted: tf.Tensor) -> None:
+            # rw_mh_step may return a scalar bool or a mask with the same shape as the block.
+            # We count accepted *elements*; if accepted is scalar, reduce_sum returns 0 or 1.
+            inc = tf.reduce_sum(tf.cast(accepted, tf.int32))
+            self.accept[block].assign_add(inc)
+
+        # ---- Market×Product intercept ----
         z_dict = self._current_z_dict()
+        z_new, accepted = update_z_beta_market_mj(
+            rng=self.rng,
+            k=self.k["beta_market"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_beta_market_mj"].assign(z_new)
+        _acc("beta_market", accepted)
 
-        # ---- Market×Product intercept: update one market row at a time ----
-        for m in tf.range(self.M):
-            z_new, accepted = update_z_beta_market_mj_row(
-                rng=self.rng,
-                k=self.k["beta_market"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                m=m,
-            )
-            self.z["z_beta_market_mj"].assign(z_new)
-            self.accept["beta_market"].assign_add(
-                tf.reduce_sum(tf.cast(accepted, tf.int32))
-            )
-
-        # ---- Product vectors (single update each) ----
+        # ---- Product vectors ----
+        z_dict = self._current_z_dict()
         z_new, accepted = update_z_beta_habit_j(
             rng=self.rng,
             k=self.k["beta_habit"],
@@ -517,8 +490,9 @@ class Bonus2Estimator:
             z=z_dict,
         )
         self.z["z_beta_habit_j"].assign(z_new)
-        self.accept["beta_habit"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        _acc("beta_habit", accepted)
 
+        z_dict = self._current_z_dict()
         z_new, accepted = update_z_beta_peer_j(
             rng=self.rng,
             k=self.k["beta_peer"],
@@ -527,91 +501,85 @@ class Bonus2Estimator:
             z=z_dict,
         )
         self.z["z_beta_peer_j"].assign(z_new)
-        self.accept["beta_peer"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        _acc("beta_peer", accepted)
 
+        z_dict = self._current_z_dict()
         z_new, accepted = update_z_decay_rate_j(
             rng=self.rng,
             k=self.k["decay_rate"],
             inputs=inputs,
-            sigma_z=sigma_z,
             z=z_dict,
         )
         self.z["z_decay_rate_j"].assign(z_new)
-        self.accept["decay_rate"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        _acc("decay_rate", accepted)
 
-        # ---- Market-leading time blocks: one market row at a time ----
-        for m in tf.range(self.M):
-            z_new, accepted = update_z_beta_dow_m_row(
-                rng=self.rng,
-                k=self.k["beta_dow_m"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                m=m,
-            )
-            self.z["z_beta_dow_m"].assign(z_new)
-            self.accept["beta_dow_m"].assign_add(
-                tf.reduce_sum(tf.cast(accepted, tf.int32))
-            )
+        # ---- Market-level time blocks ----
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_beta_dow_m(
+            rng=self.rng,
+            k=self.k["beta_dow_m"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_beta_dow_m"].assign(z_new)
+        _acc("beta_dow_m", accepted)
 
-            z_new, accepted = update_z_a_m_row(
-                rng=self.rng,
-                k=self.k["a_m"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                m=m,
-            )
-            self.z["z_a_m"].assign(z_new)
-            self.accept["a_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_a_m(
+            rng=self.rng,
+            k=self.k["a_m"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_a_m"].assign(z_new)
+        _acc("a_m", accepted)
 
-            z_new, accepted = update_z_b_m_row(
-                rng=self.rng,
-                k=self.k["b_m"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                m=m,
-            )
-            self.z["z_b_m"].assign(z_new)
-            self.accept["b_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_b_m(
+            rng=self.rng,
+            k=self.k["b_m"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_b_m"].assign(z_new)
+        _acc("b_m", accepted)
 
-        # ---- Product-leading time blocks: one product row at a time ----
-        for j in tf.range(self.J):
-            z_new, accepted = update_z_beta_dow_j_row(
-                rng=self.rng,
-                k=self.k["beta_dow_j"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                j=j,
-            )
-            self.z["z_beta_dow_j"].assign(z_new)
-            self.accept["beta_dow_j"].assign_add(
-                tf.reduce_sum(tf.cast(accepted, tf.int32))
-            )
+        # ---- Product-level time blocks ----
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_beta_dow_j(
+            rng=self.rng,
+            k=self.k["beta_dow_j"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_beta_dow_j"].assign(z_new)
+        _acc("beta_dow_j", accepted)
 
-            z_new, accepted = update_z_a_j_row(
-                rng=self.rng,
-                k=self.k["a_j"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                j=j,
-            )
-            self.z["z_a_j"].assign(z_new)
-            self.accept["a_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_a_j(
+            rng=self.rng,
+            k=self.k["a_j"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_a_j"].assign(z_new)
+        _acc("a_j", accepted)
 
-            z_new, accepted = update_z_b_j_row(
-                rng=self.rng,
-                k=self.k["b_j"],
-                inputs=inputs,
-                sigma_z=sigma_z,
-                z=z_dict,
-                j=j,
-            )
-            self.z["z_b_j"].assign(z_new)
-            self.accept["b_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_b_j(
+            rng=self.rng,
+            k=self.k["b_j"],
+            inputs=inputs,
+            sigma_z=sigma_z,
+            z=z_dict,
+        )
+        self.z["z_b_j"].assign(z_new)
+        _acc("b_j", accepted)
 
         # ---- sweep counter + diagnostics ----
         self.saved.assign_add(1)

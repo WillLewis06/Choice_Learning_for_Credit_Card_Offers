@@ -31,7 +31,7 @@ Unconstrained parameters z (RW-MH on z-space):
 Notes:
   - lambda_mn is treated as known input data and is not estimated.
   - u_scale can be "frozen" for testing by setting k["u_scale"] = 0.0 (skips the update).
-  - `self.inputs` is a plain dict-like mapping (no dataclass); it contains only fixed data.
+  - `self.inputs` holds only fixed data tensors (no current parameter state).
 """
 
 from __future__ import annotations
@@ -68,11 +68,9 @@ class StockpilingEstimator:
         I_max: int,
         waste_cost: float,
         sigmas: Mapping[str, float],
-        eps: float = 1.0,
         tol: float = 1e-8,
         max_iter: int = 10_000,
         rng_seed: int = 0,
-        use_ccp_cache: bool = True,
     ) -> None:
         """
         Args:
@@ -87,21 +85,17 @@ class StockpilingEstimator:
           waste_cost: Waste penalty coefficient in the buy utility.
           sigmas: Prior scales on z-space blocks. Required keys:
             {"z_beta","z_alpha","z_v","z_fc","z_u_scale"}.
-          eps: Included for backward compatibility with earlier configs (not used).
           tol: Convergence tolerance for the CCP solver.
           max_iter: Maximum iterations for the CCP solver.
           rng_seed: RNG seed for MCMC proposals.
-          use_ccp_cache: If True, the posterior uses the CCP cache.
         """
-        a_mnjt = np.asarray(a_mnjt)
-        p_state_mjt = np.asarray(p_state_mjt)
-        u_mj = np.asarray(u_mj)
-        lambda_mn = np.asarray(lambda_mn)
-        P_price_mj = np.asarray(P_price_mj)
-        price_vals_mj = np.asarray(price_vals_mj)
-        pi_I0 = np.asarray(pi_I0)
-
-        _ = eps  # not used in the current model implementation
+        a_mnjt = np.asarray(a_mnjt, dtype=np.int32)
+        p_state_mjt = np.asarray(p_state_mjt, dtype=np.int32)
+        u_mj = np.asarray(u_mj, dtype=np.float64)
+        lambda_mn = np.asarray(lambda_mn, dtype=np.float64)
+        P_price_mj = np.asarray(P_price_mj, dtype=np.float64)
+        price_vals_mj = np.asarray(price_vals_mj, dtype=np.float64)
+        pi_I0 = np.asarray(pi_I0, dtype=np.float64)
 
         M, N, J, T = a_mnjt.shape
         S = int(price_vals_mj.shape[2])
@@ -115,19 +109,17 @@ class StockpilingEstimator:
         # Fixed inputs passed into the posterior/likelihood (dict-like mapping).
         # Do NOT attach any current parameter state (no "z" field).
         self.inputs: StockpilingInputs = {
-            "a_mnjt": tf.convert_to_tensor(a_mnjt, dtype=tf.float64),
+            "a_mnjt": tf.convert_to_tensor(a_mnjt, dtype=tf.int32),
             "s_mjt": tf.convert_to_tensor(p_state_mjt, dtype=tf.int32),
             "u_mj": tf.convert_to_tensor(u_mj, dtype=tf.float64),
             "P_price_mj": tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
             "price_vals_mj": tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
             "lambda_mn": tf.convert_to_tensor(lambda_mn, dtype=tf.float64),
-            "I_max": self.I_max,
-            "waste_cost": float(waste_cost),
+            "waste_cost": tf.constant(float(waste_cost), dtype=tf.float64),
             "tol": float(tol),
             "max_iter": int(max_iter),
             "init_I_dist": tf.convert_to_tensor(pi_I0, dtype=tf.float64),
             "inventory_maps": inventory_maps,
-            "use_ccp_cache": bool(use_ccp_cache),
         }
 
         self.sigma_z: dict[str, tf.Tensor] = {
@@ -235,7 +227,7 @@ class StockpilingEstimator:
             self.z["z_fc"],
             self.z["z_u_scale"],
             self.inputs,
-            self.sigma_z,
+            self.sigma_z["z_beta"],
             self.k["beta"],
             self.rng,
         )
@@ -249,7 +241,7 @@ class StockpilingEstimator:
             self.z["z_fc"],
             self.z["z_u_scale"],
             self.inputs,
-            self.sigma_z,
+            self.sigma_z["z_alpha"],
             self.k["alpha"],
             self.rng,
         )
@@ -263,7 +255,7 @@ class StockpilingEstimator:
             self.z["z_fc"],
             self.z["z_u_scale"],
             self.inputs,
-            self.sigma_z,
+            self.sigma_z["z_v"],
             self.k["v"],
             self.rng,
         )
@@ -277,7 +269,7 @@ class StockpilingEstimator:
             self.z["z_fc"],
             self.z["z_u_scale"],
             self.inputs,
-            self.sigma_z,
+            self.sigma_z["z_fc"],
             self.k["fc"],
             self.rng,
         )
@@ -292,7 +284,7 @@ class StockpilingEstimator:
                 self.z["z_fc"],
                 self.z["z_u_scale"],
                 self.inputs,
-                self.sigma_z,
+                self.sigma_z["z_u_scale"],
                 self.k["u_scale"],
                 self.rng,
             )
@@ -324,7 +316,7 @@ class StockpilingEstimator:
         k: Mapping[str, float],
     ) -> dict[str, Any]:
         """
-        Run MCMC and return posterior means and acceptance rates.
+        Run MCMC and return posterior means and per-block acceptance rates.
 
         Args:
           n_iter: Number of MCMC iterations (positive int).
@@ -338,7 +330,8 @@ class StockpilingEstimator:
         Returns:
           Dict with:
             - "theta_mean": posterior means on theta-space
-            - "accept_rate": per-block acceptance rates
+            - "accept": per-block acceptance rates
+            - "n_saved": number of saved draws
             - "z_last": final z-space state
         """
         if int(n_iter) < 1:
@@ -359,13 +352,14 @@ class StockpilingEstimator:
             "fc": tf.cast(tf.size(self.z["z_fc"]), tf.float64),
             "u_scale": tf.cast(tf.size(self.z["z_u_scale"]), tf.float64),
         }
-        accept_rate = {
+        accept = {
             key: tf.cast(self.accept[key], tf.float64) / (saved_f * block_sizes[key])
             for key in self.accept
         }
 
         return {
             "theta_mean": {k: v.numpy() for k, v in theta_mean.items()},
-            "accept_rate": {k: v.numpy() for k, v in accept_rate.items()},
+            "accept": {k: v.numpy() for k, v in accept.items()},
+            "n_saved": int(self.saved.numpy()),
             "z_last": {k: v.numpy() for k, v in self.z.items()},
         }

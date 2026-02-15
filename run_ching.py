@@ -39,6 +39,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import tensorflow as tf
 
+import ching.stockpiling_model as sp_model
 from datasets.ching_dgp import generate_dgp
 
 from ching.stockpiling_estimator import StockpilingEstimator
@@ -102,11 +103,8 @@ CFG_PHASE3: dict[str, Any] = {
     "I_max": 10,
     "S": 2,
     "waste_cost": 1.0,
-    "dp_tol": 1e-10,
-    "dp_max_iter": 5_000,
-    "eps": 1e-12,
-    # If True, avoids tf.function tracing issues in current estimator/updates stack.
-    "tf_run_eagerly": True,
+    "dp_tol": 1e-5,
+    "dp_max_iter": 200,
     # price process construction
     "price_seed": 777,
     "p_stay": 0.85,
@@ -119,12 +117,12 @@ CFG_PHASE3: dict[str, Any] = {
     "price_noise_sd": 0.02,
     # MCMC
     "mcmc_seed": 0,
-    "mcmc_n_iter": 5,
+    "mcmc_n_iter": 200,
     "init_theta": {
         "beta": 0.5,
-        "alpha": 1.0,
-        "v": 1.0,
-        "fc": 1.0,
+        "alpha": 0.5,
+        "v": 0.5,
+        "fc": 2.0,
         "u_scale": 1.0,
     },
     # NOTE: StockpilingEstimator requires z-space prior scales keyed by z_*.
@@ -413,14 +411,6 @@ def run_phase3_estimation(
     price_vals_mj: np.ndarray,
 ) -> dict[str, Any]:
     """Fit stockpiling parameters from observed data, treating lambda_mn as known."""
-    tf.config.run_functions_eagerly(bool(cfg.get("tf_run_eagerly", False)))
-
-    # Compatibility patch for current ching/stockpiling_diagnostics.py (uses diag.model).
-    import ching.stockpiling_diagnostics as sp_diag
-    import ching.stockpiling_model as sp_model
-
-    sp_diag.model = sp_model
-
     est = StockpilingEstimator(
         a_mnjt=np.asarray(panel["a_mnjt"]),
         p_state_mjt=np.asarray(panel["p_state_mjt"]),
@@ -432,11 +422,9 @@ def run_phase3_estimation(
         I_max=int(cfg["I_max"]),
         waste_cost=float(cfg["waste_cost"]),
         sigmas=dict(cfg["sigmas"]),
-        eps=float(cfg["eps"]),
         tol=float(cfg["dp_tol"]),
         max_iter=int(cfg["dp_max_iter"]),
         rng_seed=int(cfg["mcmc_seed"]),
-        use_ccp_cache=True,
     )
 
     res = est.fit(
@@ -447,8 +435,8 @@ def run_phase3_estimation(
 
     return {
         "theta_hat": res["theta_mean"],
-        "accept": res["accept_rate"],
-        "n_saved": int(cfg["mcmc_n_iter"]),
+        "accept": res["accept"],
+        "n_saved": res["n_saved"],
         "z_last": res["z_last"],
     }
 
@@ -467,7 +455,7 @@ def run_phase3_evaluation(
     pi0 = uniform_pi_I0(I_max)
 
     inputs: StockpilingInputs = {
-        "a_mnjt": tf.convert_to_tensor(np.asarray(panel["a_mnjt"]), dtype=tf.float64),
+        "a_mnjt": tf.convert_to_tensor(np.asarray(panel["a_mnjt"]), dtype=tf.int32),
         "s_mjt": tf.convert_to_tensor(np.asarray(panel["p_state_mjt"]), dtype=tf.int32),
         "u_mj": tf.convert_to_tensor(np.asarray(panel["u_mj"]), dtype=tf.float64),
         "P_price_mj": tf.convert_to_tensor(np.asarray(P_price_mj), dtype=tf.float64),
@@ -477,13 +465,11 @@ def run_phase3_evaluation(
         "lambda_mn": tf.convert_to_tensor(
             np.asarray(panel["lambda_mn"]), dtype=tf.float64
         ),
-        "I_max": I_max,
-        "waste_cost": float(cfg["waste_cost"]),
+        "waste_cost": tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
         "tol": float(cfg["dp_tol"]),
         "max_iter": int(cfg["dp_max_iter"]),
         "init_I_dist": tf.convert_to_tensor(pi0, dtype=tf.float64),
-        "inventory_maps": None,
-        "use_ccp_cache": True,
+        "inventory_maps": sp_model.build_inventory_maps(I_max),
     }
 
     theta_hat_tf = {
@@ -518,7 +504,6 @@ def run_phase3_evaluation(
         theta_true=theta_true_eval,
         p_buy_oracle_mnjt=p_buy_oracle,
         mcmc=mcmc_diag,
-        eps=float(cfg["eps"]),
     )
 
 

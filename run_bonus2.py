@@ -5,17 +5,15 @@ End-to-end orchestration for Bonus Q2:
 
 - Phase 1: Zhang feature-based baseline choice model -> delta_hat (J,)
 - Bonus2 DGP: simulate y_mit under habit + peer + DOW + seasonal MNL using delta_mj
-- Bonus2 estimation: RW-MH over z-blocks (Ching-style architecture) -> theta_hat
-- Bonus2 evaluation: clean summary via bonus2_evaluate.py
+- Bonus2 estimation: RW-MH over z-blocks -> theta_hat
+- Bonus2 evaluation: summary via bonus2_evaluate.py
 
 Notes:
 - We do NOT run the Lu market-shock phase.
 - The within-market social network (neighbors) is treated as known and passed to the estimator.
-- The decay prior hyperparameter kappa_decay is treated as known and passed to the estimator
-  (computed from average_decay_rate in the DGP; the estimator uses it in the Beta(kappa_decay,1) prior).
-- Time features naming:
+- The decay prior hyperparameter kappa_decay is treated as known and passed to the estimator.
+- Time feature naming:
     season_sin_kt, season_cos_kt  (K,T)
-  to avoid collision with theta_* parameter dicts.
 """
 
 from __future__ import annotations
@@ -158,29 +156,38 @@ def _tile_delta_mj(delta_hat: np.ndarray, M: int) -> np.ndarray:
     return np.tile(delta_hat[None, :], reps=(int(M), 1)).astype(np.float64)
 
 
-def _delta_only_baseline_probs(delta_mj: np.ndarray, N: int, T: int) -> np.ndarray:
+def _delta_only_baseline_probs_mc(delta_mj: np.ndarray) -> np.ndarray:
     """
     Construct δ-only baseline probabilities:
       p_m(c) = softmax([0, δ_m1, ..., δ_mJ]) over c=0..J,
-    then broadcast to (M,N,T,J+1).
+    returning (M,J+1).
     """
     delta_mj = np.asarray(delta_mj, dtype=np.float64)
     if delta_mj.ndim != 2:
         raise ValueError("delta_mj must be 2D (M,J)")
-    M, J = delta_mj.shape
+    M, J = (int(delta_mj.shape[0]), int(delta_mj.shape[1]))
     if M < 1 or J < 1:
         raise ValueError(f"delta_mj must have M>=1 and J>=1, got {delta_mj.shape}")
-    if N < 1 or T < 1:
-        raise ValueError(f"N and T must be >=1, got N={N}, T={T}")
 
     logits = np.concatenate(
         [np.zeros((M, 1), dtype=np.float64), delta_mj], axis=1
     )  # (M,J+1)
     logits = logits - logits.max(axis=1, keepdims=True)  # stable softmax
     exp_logits = np.exp(logits)
-    p_mc = exp_logits / exp_logits.sum(axis=1, keepdims=True)  # (M,J+1)
+    return exp_logits / exp_logits.sum(axis=1, keepdims=True)  # (M,J+1)
 
-    return np.broadcast_to(p_mc[:, None, None, :], (M, N, T, J + 1)).copy()
+
+def _broadcast_market_probs_to_mntc(p_mc: np.ndarray, N: int, T: int) -> np.ndarray:
+    """Broadcast market-level probs (M,C) to panel probs (M,N,T,C)."""
+    p_mc = np.asarray(p_mc, dtype=np.float64)
+    if p_mc.ndim != 2:
+        raise ValueError("p_mc must be 2D (M,C)")
+    M, C = (int(p_mc.shape[0]), int(p_mc.shape[1]))
+    if M < 1 or C < 1:
+        raise ValueError(f"p_mc must have M>=1 and C>=1, got {p_mc.shape}")
+    if int(N) < 1 or int(T) < 1:
+        raise ValueError(f"N and T must be >=1, got N={N}, T={T}")
+    return np.broadcast_to(p_mc[:, None, None, :], (M, int(N), int(T), C)).copy()
 
 
 def _theta_true_from_panel(panel: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -219,7 +226,6 @@ def summarize_bonus2_panel(panel: dict[str, Any], init_theta: dict[str, float]) 
 
     M, N, T = y.shape
     J = delta.shape[1]
-    K = season_sin_kt.shape[0]
 
     outside_share = float(np.mean(y == 0))
     inside_shares = np.array(
@@ -353,19 +359,7 @@ def run_bonus2_estimation(cfg: dict[str, Any], panel: dict[str, Any]) -> dict[st
     print("=== Bonus2 Estimator built ===")
 
     est.fit(
-        n_iter=int(cfg["mcmc_n_iter"]),
-        k={
-            "beta_market": float(cfg["k"]["beta_market"]),
-            "beta_habit": float(cfg["k"]["beta_habit"]),
-            "beta_peer": float(cfg["k"]["beta_peer"]),
-            "decay_rate": float(cfg["k"]["decay_rate"]),
-            "beta_dow_m": float(cfg["k"]["beta_dow_m"]),
-            "beta_dow_j": float(cfg["k"]["beta_dow_j"]),
-            "a_m": float(cfg["k"]["a_m"]),
-            "b_m": float(cfg["k"]["b_m"]),
-            "a_j": float(cfg["k"]["a_j"]),
-            "b_j": float(cfg["k"]["b_j"]),
-        },
+        n_iter=int(cfg["mcmc_n_iter"]), k={k: float(v) for k, v in cfg["k"].items()}
     )
 
     print("=== Bonus2 Estimator fitted ===")
@@ -395,34 +389,30 @@ def main() -> None:
     # Bonus2 DGP
     seed_dgp = int(CFG_PHASE1["seed"]) + 999
     panel = run_bonus2_dgp(CFG_BONUS2, delta_mj=delta_mj, seed=seed_dgp)
+
+    # Build peer adjacency once (reuse in evaluation)
+    N = int(panel["y"].shape[1])
+    panel["peer_adj_m"] = b2_model.build_peer_adjacency(nbrs_m=panel["nbrs"], N=N)
+
     summarize_bonus2_panel(panel, init_theta=CFG_BONUS2["init_theta"])
 
     # Bonus2 estimation
     res = run_bonus2_estimation(CFG_BONUS2, panel=panel)
 
     # Build probabilities for evaluation (fitted + oracle; baseline is δ-only in NumPy)
-    y_tf = tf.convert_to_tensor(np.asarray(panel["y"], dtype=np.int32), dtype=tf.int32)
-    delta_tf = tf.convert_to_tensor(
-        np.asarray(panel["delta"], dtype=np.float64), dtype=tf.float64
-    )
-    dow_tf = tf.convert_to_tensor(
-        np.asarray(panel["dow"], dtype=np.int32), dtype=tf.int32
-    )
-    season_sin_tf = tf.convert_to_tensor(
-        np.asarray(panel["season_sin_kt"], dtype=np.float64), dtype=tf.float64
-    )
-    season_cos_tf = tf.convert_to_tensor(
-        np.asarray(panel["season_cos_kt"], dtype=np.float64), dtype=tf.float64
-    )
+    y_tf = tf.convert_to_tensor(panel["y"], dtype=tf.int32)
+    delta_tf = tf.convert_to_tensor(panel["delta"], dtype=tf.float64)
+    dow_tf = tf.convert_to_tensor(panel["dow"], dtype=tf.int32)
+    season_sin_tf = tf.convert_to_tensor(panel["season_sin_kt"], dtype=tf.float64)
+    season_cos_tf = tf.convert_to_tensor(panel["season_cos_kt"], dtype=tf.float64)
 
-    N = int(panel["y"].shape[1])
     T = int(panel["y"].shape[2])
     L_tf = tf.convert_to_tensor(int(panel["peer_lookback_L"]), dtype=tf.int32)
     decay_rate_eps_tf = tf.convert_to_tensor(
         float(panel["params_true"]["decay_rate_eps"]), dtype=tf.float64
     )
 
-    peer_adj_m = b2_model.build_peer_adjacency(panel["nbrs"], N=N)
+    peer_adj_m = panel["peer_adj_m"]
 
     theta_hat = res["theta_hat"]
     theta_true = _theta_true_from_panel(panel)
@@ -451,11 +441,12 @@ def main() -> None:
         decay_rate_eps=decay_rate_eps_tf,
     ).numpy()
 
-    # δ-only baseline probabilities for evaluation
-    p_delta_only = _delta_only_baseline_probs(panel["delta"], N=N, T=T)
+    # δ-only baseline probabilities for evaluation (compact -> broadcast)
+    p_delta_only_mc = _delta_only_baseline_probs_mc(panel["delta"])  # (M,J+1)
+    p_delta_only = _broadcast_market_probs_to_mntc(p_delta_only_mc, N=N, T=T)
 
     # Bonus2 evaluation
-    mcmc = {}
+    mcmc: dict[str, Any] = {}
     if "n_saved" in res:
         mcmc["n_saved"] = int(res["n_saved"])
     if "accept" in res:
