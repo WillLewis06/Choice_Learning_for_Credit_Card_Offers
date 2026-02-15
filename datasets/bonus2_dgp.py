@@ -1,46 +1,68 @@
-"""
-datasets/bonus2_dgp.py
+"""datasets/bonus2_dgp.py
 
-Bonus Q2 DGP (updated model)
+Bonus Q2 DGP (updated spec)
 
 Conventions
 -----------
 - Outside option is encoded as choice 0.
 - Inside products j=1..J are encoded as (j+1) in the simulated y array.
 
+Observed time features
+----------------------
+- Weekend indicator: w(t) ∈ {0,1} derived from dow_t = t % 7 via w(t)=1{dow_t∈{5,6}}.
+- Seasonal angle: θ(t)=2π/P * (t mod P) and Fourier basis with K harmonics.
+
 Core model (inside options)
 ---------------------------
-v_{m,i,j,t} =
-    delta_{m,j}
-  + beta_market_mj[m,j]
-  + beta_habit_j[j] * H_{m,i,j,t}
-  + beta_peer_j[j]  * P_{m,i,j,t}
-  + beta_dow_m[m, d(t)] + beta_dow_j[j, d(t)]
-  + S_m(t) + S_j(t)
+For inside options j=1..J:
 
-Habit:
-  H_{t+1} = decay_rate_j * H_t + 1{ y_t = j }
+  v_{m,i,j,t} =
+      delta_{m,j}
+    + beta_market_j[j]
+    + beta_habit_j[j] * H_{m,i,j,t}
+    + beta_peer_j[j]  * P_{m,i,j,t}
+    + beta_dow_j[j, w(t)]
+    + S_m(t)
 
-Peer exposure (count over last L periods of peers' purchases):
+Outside option:
+  v_{m,i,0,t} = 0
+
+Habit
+-----
+  H_{t+1} = decay * H_t + 1{ y_t = j }
+where decay ∈ (0,1) is a known scalar passed to the DGP (and estimator).
+
+Peer exposure
+-------------
   P_{i,j,t} = sum_{k in N(i)} sum_{ell=1..L} 1{ y_{k,t-ell} = j }
 
-Time features (code naming)
----------------------------
-- dow_t: d(t) = t mod 7
-- season_angle_t: theta(t) = 2π/P * (t mod P)
-- season_sin_kt, season_cos_kt: Fourier basis with K harmonics
-- season_period_P: P
+Seasonality (market-only)
+-------------------------
+  S_m(t) = Σ_{k=1..K} [ a_mk sin(kθ(t)) + b_mk cos(kθ(t)) ]
+
+Day-of-week (product-only; binary)
+----------------------------------
+  w(t) ∈ {0,1} and DOW shift is beta_dow_j[j, w(t)].
+
+Product intercept (product-only)
+--------------------------------
+  beta_market_j[j] is an intercept shift beyond delta_{m,j}.
 
 Parameter draws
 ---------------
 All hyperparameters are read from the dict `dgp_hyperparams` with no defaults.
-Expected keys:
+This file expects (minimum):
   habit_mean, habit_sd
   peer_mean, peer_sd
-  mktprod_sd
-  dow_mkt_sd, dow_prod_sd
-  season_mkt_sd, season_prod_sd
-  decay_rate_eps
+  mktprod_sd        (used for beta_market_j; name kept to reduce downstream edits)
+  dow_prod_sd       (used for beta_dow_j over w∈{0,1})
+  season_mkt_sd     (used for market seasonality a_m,b_m)
+
+Notes
+-----
+- Market-level seasonality only (no product seasonality).
+- Product-level DOW only (binary weekday/weekend; no market DOW).
+- Product intercept shift only (no market×product intercept beyond delta).
 """
 
 from __future__ import annotations
@@ -66,17 +88,20 @@ def make_rng(seed: Any) -> np.random.Generator:
 
 
 def generate_time_features(T: int, season_period_P: int, K: int):
-    """
+    """Generate observed time features.
+
     Returns
     -------
-    dow_t : (T,) int64
-        d(t) in {0..6} via t % 7.
+    weekend_t : (T,) int64
+        w(t) in {0,1}, where w(t)=1 for weekend and 0 for weekday.
     season_angle_t : (T,) float64
         theta(t) = 2π/P * (t mod P).
     season_sin_kt : (K,T) float64
-        sin((k+1)*season_angle_t[t]).
+        sin((k+1) * season_angle_t[t]).
     season_cos_kt : (K,T) float64
-        cos((k+1)*season_angle_t[t]).
+        cos((k+1) * season_angle_t[t]).
+    dow_t : (T,) int64
+        d(t) in {0..6} via t % 7 (returned for debugging).
     """
     T = int(T)
     P = int(season_period_P)
@@ -84,23 +109,26 @@ def generate_time_features(T: int, season_period_P: int, K: int):
 
     t = np.arange(T, dtype=np.int64)
     dow_t = (t % 7).astype(np.int64)
+    weekend_t = (dow_t >= 5).astype(np.int64)
 
     tau = (t % P).astype(np.float64)
     season_angle_t = (2.0 * np.pi / float(P) * tau).astype(np.float64)
 
     if K == 0:
         return (
-            dow_t,
+            weekend_t,
             season_angle_t,
             np.zeros((0, T), dtype=np.float64),
             np.zeros((0, T), dtype=np.float64),
+            dow_t,
         )
 
     k = np.arange(1, K + 1, dtype=np.float64)[:, None]  # (K,1)
     ang = k * season_angle_t[None, :]  # (K,T)
     season_sin_kt = np.sin(ang).astype(np.float64)
     season_cos_kt = np.cos(ang).astype(np.float64)
-    return dow_t, season_angle_t, season_sin_kt, season_cos_kt
+
+    return weekend_t, season_angle_t, season_sin_kt, season_cos_kt, dow_t
 
 
 # -----------------------------------------------------------------------------
@@ -109,8 +137,10 @@ def generate_time_features(T: int, season_period_P: int, K: int):
 
 
 def fourier_seasonality(a_coeff, b_coeff, season_sin_kt, season_cos_kt):
-    """
-    S[r,t] = sum_k [a_coeff[r,k]*season_sin_kt[k,t] + b_coeff[r,k]*season_cos_kt[k,t]]
+    """Compute Fourier seasonality series.
+
+    For each row r and time t:
+      S[r,t] = sum_k [a_coeff[r,k] * sin_k[t] + b_coeff[r,k] * cos_k[t]]
     """
     a_coeff = np.asarray(a_coeff, dtype=np.float64)
     b_coeff = np.asarray(b_coeff, dtype=np.float64)
@@ -127,25 +157,17 @@ def fourier_seasonality(a_coeff, b_coeff, season_sin_kt, season_cos_kt):
 
 
 # -----------------------------------------------------------------------------
-# Parameter draws (hyperparameters read from dgp_hyperparams dict, no defaults)
+# Parameter draws
 # -----------------------------------------------------------------------------
 
 
-def _kappa_from_average_decay_rate(mu: float) -> float:
-    """kappa for Beta(kappa,1) given mean mu."""
-    mu = float(mu)
-    return mu / (1.0 - mu)
+def sample_core_product_params(J: int, rng, dgp_hyperparams: dict):
+    """Sample product-level habit and peer coefficients.
 
-
-def sample_core_product_params(
-    J: int, rng, average_decay_rate: float, dgp_hyperparams: dict
-):
-    """
-    Sample:
-      beta_habit_j : (J,)
-      beta_peer_j  : (J,)
-      decay_rate_j : (J,)  with Beta(kappa,1) skew toward 1, then clipped by decay_rate_eps
-      kappa_decay  : scalar
+    Returns
+    -------
+    beta_habit_j : (J,) float64
+    beta_peer_j  : (J,) float64
     """
     J = int(J)
 
@@ -153,42 +175,31 @@ def sample_core_product_params(
     habit_sd = float(dgp_hyperparams["habit_sd"])
     peer_mean = float(dgp_hyperparams["peer_mean"])
     peer_sd = float(dgp_hyperparams["peer_sd"])
-    decay_rate_eps = float(dgp_hyperparams["decay_rate_eps"])
 
     beta_habit_j = rng.normal(loc=habit_mean, scale=habit_sd, size=J).astype(np.float64)
     beta_peer_j = rng.normal(loc=peer_mean, scale=peer_sd, size=J).astype(np.float64)
 
-    kappa = float(_kappa_from_average_decay_rate(average_decay_rate))
-    u = rng.random(size=J).astype(np.float64)
-    decay_rate = np.power(u, 1.0 / kappa).astype(np.float64)  # Beta(kappa,1)
-
-    if decay_rate_eps > 0.0:
-        decay_rate = np.minimum(decay_rate, 1.0 - decay_rate_eps)
-
-    return beta_habit_j, beta_peer_j, decay_rate, kappa
+    return beta_habit_j, beta_peer_j
 
 
-def sample_market_product_intercepts(M: int, J: int, rng, dgp_hyperparams: dict):
-    """beta_market_mj (M,J)."""
-    M = int(M)
+def sample_product_intercepts(J: int, rng, dgp_hyperparams: dict):
+    """Sample product-only intercept shifts beta_market_j (J,)."""
     J = int(J)
-    mktprod_sd = float(dgp_hyperparams["mktprod_sd"])
-    return rng.normal(loc=0.0, scale=mktprod_sd, size=(M, J)).astype(np.float64)
+    mkt_sd = float(dgp_hyperparams["mktprod_sd"])  # name kept to reduce edits elsewhere
+    return rng.normal(loc=0.0, scale=mkt_sd, size=J).astype(np.float64)
 
 
 def sample_time_market_params(M: int, K: int, rng, dgp_hyperparams: dict):
-    """
-    Market-level:
-      beta_dow_m : (M,7)
-      a_m, b_m   : (M,K)
+    """Sample market-level seasonality coefficients.
+
+    Returns
+    -------
+    a_m, b_m : (M,K) float64
     """
     M = int(M)
     K = int(K)
 
-    dow_mkt_sd = float(dgp_hyperparams["dow_mkt_sd"])
     season_mkt_sd = float(dgp_hyperparams["season_mkt_sd"])
-
-    beta_dow_m = rng.normal(loc=0.0, scale=dow_mkt_sd, size=(M, 7)).astype(np.float64)
 
     if K == 0:
         a_m = np.zeros((M, 0), dtype=np.float64)
@@ -197,49 +208,14 @@ def sample_time_market_params(M: int, K: int, rng, dgp_hyperparams: dict):
         a_m = rng.normal(loc=0.0, scale=season_mkt_sd, size=(M, K)).astype(np.float64)
         b_m = rng.normal(loc=0.0, scale=season_mkt_sd, size=(M, K)).astype(np.float64)
 
-    return beta_dow_m, a_m, b_m
+    return a_m, b_m
 
 
-def sample_time_product_params(J: int, K: int, rng, params_true: dict):
-    """
-    Product-level:
-      beta_dow_j : (J,7)
-      a_j, b_j   : (J,K)
-    """
+def sample_time_product_params(J: int, rng, dgp_hyperparams: dict):
+    """Sample product-level weekday/weekend effects beta_dow_j (J,2)."""
     J = int(J)
-    K = int(K)
-
-    dow_prod_sd = float(params_true["dow_prod_sd"])
-    season_prod_sd = float(params_true["season_prod_sd"])
-
-    beta_dow_j = rng.normal(loc=0.0, scale=dow_prod_sd, size=(J, 7)).astype(np.float64)
-
-    if K == 0:
-        a_j = np.zeros((J, 0), dtype=np.float64)
-        b_j = np.zeros((J, 0), dtype=np.float64)
-    else:
-        a_j = rng.normal(loc=0.0, scale=season_prod_sd, size=(J, K)).astype(np.float64)
-        b_j = rng.normal(loc=0.0, scale=season_prod_sd, size=(J, K)).astype(np.float64)
-
-    return beta_dow_j, a_j, b_j
-
-
-def apply_identifiability_constraints(beta_dow_m, beta_dow_j, a_j, b_j):
-    """
-    Centering constraints for additive decompositions (in-place):
-      - market DOW: mean across weekdays is 0 within each market
-      - product DOW: mean across weekdays is 0 within each product, then mean across
-        products is 0 for each weekday
-      - product seasonal coeffs: centered across products for each harmonic
-    """
-    beta_dow_m -= beta_dow_m.mean(axis=1, keepdims=True)
-
-    beta_dow_j -= beta_dow_j.mean(axis=1, keepdims=True)
-    beta_dow_j -= beta_dow_j.mean(axis=0, keepdims=True)
-
-    if a_j.size:
-        a_j -= a_j.mean(axis=0, keepdims=True)
-        b_j -= b_j.mean(axis=0, keepdims=True)
+    dow_prod_sd = float(dgp_hyperparams["dow_prod_sd"])
+    return rng.normal(loc=0.0, scale=dow_prod_sd, size=(J, 2)).astype(np.float64)
 
 
 # -----------------------------------------------------------------------------
@@ -248,9 +224,10 @@ def apply_identifiability_constraints(beta_dow_m, beta_dow_j, a_j, b_j):
 
 
 def generate_sparse_network(N: int, avg_friends: float, friends_sd: float, rng):
-    """
-    Adjacency list nbrs[i] of out-neighbors consumer i observes (within a market).
+    """Generate adjacency list (within a market).
+
     Out-degree K_i ~ Normal(avg_friends, friends_sd^2), rounded, clipped to [0, N-1].
+    nbrs[i] is an int64 array of out-neighbors consumer i observes.
     """
     N = int(N)
     mu = float(avg_friends)
@@ -275,8 +252,7 @@ def generate_sparse_network(N: int, avg_friends: float, friends_sd: float, rng):
 
 
 def _update_recent_choice_counts_inplace(C_counts, y_vec, sign: int):
-    """
-    Update rolling counts (inside choices only).
+    """Update rolling inside-choice counts.
 
     - Outside option is encoded as 0 and does not contribute.
     - Inside product j is encoded as (j+1), so column index is (y-1).
@@ -290,11 +266,7 @@ def _update_recent_choice_counts_inplace(C_counts, y_vec, sign: int):
 
 
 def advance_peer_window(peer_buf, buf_pos: int, counts, y_new):
-    """
-    Maintain a length-L circular buffer of past choices and per-consumer inside counts.
-
-    counts[k,j] = number of times consumer k bought inside product (j+1) over last L periods.
-    """
+    """Advance a length-L circular buffer and maintain per-consumer inside counts."""
     y_expired = peer_buf[buf_pos]
     _update_recent_choice_counts_inplace(counts, y_expired, sign=-1)
     _update_recent_choice_counts_inplace(counts, y_new, sign=+1)
@@ -303,10 +275,7 @@ def advance_peer_window(peer_buf, buf_pos: int, counts, y_new):
 
 
 def peer_exposure_from_recent_counts(C_counts, nbrs):
-    """
-    P[i,:] = sum_{k in nbrs[i]} C_counts[k,:]
-    This equals the count of peers' inside purchases over the last L periods.
-    """
+    """Compute peer exposure P from recent inside-choice counts."""
     N = len(nbrs)
     P = np.zeros((N, C_counts.shape[1]), dtype=np.float64)
 
@@ -324,8 +293,7 @@ def peer_exposure_from_recent_counts(C_counts, nbrs):
 
 
 def sample_mnl(v, rng):
-    """
-    Sample MNL choices when outside option has utility 0.
+    """Sample MNL choices when outside option has utility 0.
 
     Returns y in {0..J}, where:
       - y=0 is outside
@@ -360,40 +328,31 @@ def sample_mnl(v, rng):
 
 def simulate_one_market(
     delta_mj,
-    dow,
-    beta_market_mj,
-    beta_dow_m,
+    beta_market_j,
     beta_dow_j,
+    weekend_t,
     S_m,
-    S_j,
     beta_habit_j,
     beta_peer_j,
-    decay_rate_j,
+    decay: float,
     nbrs,
     rng,
     peer_lookback_L: int,
 ):
-    """
-    Simulate one market panel y_{i,t}.
-
-    Choices:
-      - outside encoded as 0
-      - inside product j encoded as (j+1)
-    """
+    """Simulate one market panel y_{i,t}."""
     L = int(peer_lookback_L)
 
     delta_mj = np.asarray(delta_mj, dtype=np.float64)
-    beta_market_mj = np.asarray(beta_market_mj, dtype=np.float64)
-    beta_dow_m = np.asarray(beta_dow_m, dtype=np.float64)
+    beta_market_j = np.asarray(beta_market_j, dtype=np.float64)
     beta_dow_j = np.asarray(beta_dow_j, dtype=np.float64)
+    weekend_t = np.asarray(weekend_t, dtype=np.int64)
     S_m = np.asarray(S_m, dtype=np.float64)
-    S_j = np.asarray(S_j, dtype=np.float64)
     beta_habit_j = np.asarray(beta_habit_j, dtype=np.float64)
     beta_peer_j = np.asarray(beta_peer_j, dtype=np.float64)
-    decay_rate_j = np.asarray(decay_rate_j, dtype=np.float64)
+    decay = float(decay)
 
     J = int(delta_mj.shape[0])
-    T = int(dow.shape[0])
+    T = int(weekend_t.shape[0])
     N = len(nbrs)
 
     y_it = np.zeros((N, T), dtype=np.int64)
@@ -405,23 +364,17 @@ def simulate_one_market(
 
     for t in range(T):
         P = peer_exposure_from_recent_counts(recent_counts, nbrs)  # (N,J)
-        d = int(dow[t])
+        w = int(weekend_t[t])
 
-        base_j = (
-            delta_mj
-            + beta_market_mj
-            + (beta_dow_m[d] + beta_dow_j[:, d])
-            + S_m[t]
-            + S_j[:, t]
-        )
+        base_j = delta_mj + beta_market_j + beta_dow_j[:, w] + S_m[t]
         v = base_j[None, :] + beta_habit_j[None, :] * H + beta_peer_j[None, :] * P
 
         y = sample_mnl(v, rng)
         y_it[:, t] = y
 
         # Habit update: H_{t+1} = decay * H_t + 1{y_t == j}
-        H *= decay_rate_j[None, :]
-        chosen = np.where(y > 0)[0]  # outside encoded as 0
+        H *= decay
+        chosen = np.where(y > 0)[0]
         if chosen.size:
             prod = y[chosen] - 1
             np.add.at(H, (chosen, prod), 1.0)
@@ -437,21 +390,14 @@ def simulate_bonus2_dgp(
     T: int,
     avg_friends: float,
     params_true: dict,
-    average_decay_rate: float,
+    decay: float,
     seed: Any,
     season_period: int,
     friends_sd: float,
     K: int,
     peer_lookback_L: int,
 ):
-    """
-    Simulate multi-market data for Bonus Q2.
-
-    Notes
-    -----
-    - No input validation is performed here (handled elsewhere).
-    - All hyperparameters are read from params_true with no defaults.
-    """
+    """Simulate multi-market data for Bonus Q2 under the updated spec."""
     delta = np.asarray(delta, dtype=np.float64)
     M, J = delta.shape
 
@@ -462,34 +408,21 @@ def simulate_bonus2_dgp(
 
     rng = make_rng(seed)
 
-    # Time features
-    dow, theta, season_sin_kt, season_cos_kt = generate_time_features(
+    weekend_t, theta, season_sin_kt, season_cos_kt, dow = generate_time_features(
         T, season_period, K
     )
 
     # Draw parameters
-    beta_habit_j, beta_peer_j, decay_rate_j, kappa_decay = sample_core_product_params(
-        J=J, rng=rng, average_decay_rate=average_decay_rate, dgp_hyperparams=params_true
+    beta_habit_j, beta_peer_j = sample_core_product_params(
+        J=J, rng=rng, dgp_hyperparams=params_true
     )
-    beta_market_mj = sample_market_product_intercepts(
-        M=M, J=J, rng=rng, dgp_hyperparams=params_true
-    )
-    beta_dow_m, a_m, b_m = sample_time_market_params(
-        M=M, K=K, rng=rng, dgp_hyperparams=params_true
-    )
-    beta_dow_j, a_j, b_j = sample_time_product_params(
-        J=J, K=K, rng=rng, params_true=params_true
-    )
+    beta_market_j = sample_product_intercepts(J=J, rng=rng, dgp_hyperparams=params_true)
+    beta_dow_j = sample_time_product_params(J=J, rng=rng, dgp_hyperparams=params_true)
+    a_m, b_m = sample_time_market_params(M=M, K=K, rng=rng, dgp_hyperparams=params_true)
 
-    apply_identifiability_constraints(
-        beta_dow_m=beta_dow_m, beta_dow_j=beta_dow_j, a_j=a_j, b_j=b_j
-    )
-
-    # Precompute seasonal series
+    # Precompute market seasonal series
     S_m_all = fourier_seasonality(a_m, b_m, season_sin_kt, season_cos_kt)  # (M,T)
-    S_j_all = fourier_seasonality(a_j, b_j, season_sin_kt, season_cos_kt)  # (J,T)
 
-    # Simulate markets
     y = np.zeros((M, N, T), dtype=np.int64)
     nbrs_list = []
 
@@ -499,15 +432,13 @@ def simulate_bonus2_dgp(
 
         y[m] = simulate_one_market(
             delta_mj=delta[m],
-            dow=dow,
-            beta_market_mj=beta_market_mj[m],
-            beta_dow_m=beta_dow_m[m],
+            beta_market_j=beta_market_j,
             beta_dow_j=beta_dow_j,
+            weekend_t=weekend_t,
             S_m=S_m_all[m],
-            S_j=S_j_all,
             beta_habit_j=beta_habit_j,
             beta_peer_j=beta_peer_j,
-            decay_rate_j=decay_rate_j,
+            decay=decay,
             nbrs=nbrs,
             rng=rng,
             peer_lookback_L=peer_lookback_L,
@@ -517,25 +448,21 @@ def simulate_bonus2_dgp(
         # observed / known inputs
         "y": y,
         "delta": delta,
+        "w": weekend_t,
         "dow": dow,
         "theta": theta,
         "season_sin_kt": season_sin_kt,
         "season_cos_kt": season_cos_kt,
         "nbrs": nbrs_list,
+        "decay": float(decay),
         # true parameters (for evaluation)
+        "beta_market_j": beta_market_j,
         "beta_habit_j": beta_habit_j,
         "beta_peer_j": beta_peer_j,
-        "decay_rate_j": decay_rate_j,
-        "beta_market_mj": beta_market_mj,
-        "beta_dow_m": beta_dow_m,
         "beta_dow_j": beta_dow_j,
         "a_m": a_m,
         "b_m": b_m,
-        "a_j": a_j,
-        "b_j": b_j,
         # metadata
-        "kappa_decay": float(kappa_decay),
-        "average_decay_rate": float(average_decay_rate),
         "season_period": int(season_period),
         "K": int(K),
         "peer_lookback_L": int(peer_lookback_L),

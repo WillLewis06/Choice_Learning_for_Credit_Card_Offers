@@ -1,43 +1,36 @@
 """
 bonus2/bonus2_estimator.py
 
-Bonus Q2 (habit + peer + DOW + seasonality) estimator, following the Ching-style
-RW-MH "orchestration + per-block update functions" architecture.
+Bonus Q2 estimator (updated spec): RW-MH over unconstrained z blocks.
 
-Key conventions (must match bonus2_model.py and bonus2_posterior.py):
-  - Seasonal basis features are (K,T):
-      season_sin_kt[k,t], season_cos_kt[k,t]
-    (If provided as (T,K), this estimator transposes to (K,T).)
-  - Network is passed as neighbors[m][i] -> converted to peer_adj_m:
-      tuple length M of tf.SparseTensor (N,N)
-  - Unconstrained sampler blocks are keyed by:
+Updated model inputs (known to estimator):
+  y_mit          (M,N,T) int32  choices; 0=outside, c=j+1=inside product j
+  delta_mj       (M,J)   f64    Phase-1 baseline utilities (fixed)
+  weekend_t      (T,)    int32  weekend indicator in {0,1}
+  season_sin_kt  (K,T)   f64
+  season_cos_kt  (K,T)   f64
+  neighbors      neighbors[m][i] -> list[int] (within-market)
+  L              scalar int32    peer lookback window length (known)
+  decay          scalar f64      known habit decay in (0,1)
 
-      z_beta_market_mj  (M,J)
-      z_beta_habit_j    (J,)
-      z_beta_peer_j     (J,)
-      z_decay_rate_j    (J,)     -> constrained to (0,1) by sigmoid in model
-      z_beta_dow_m      (M,7)
-      z_beta_dow_j      (J,7)
-      z_a_m             (M,K)
-      z_b_m             (M,K)
-      z_a_j             (J,K)
-      z_b_j             (J,K)
+Unconstrained sampler blocks z (all float64):
+  z_beta_market_j  (J,)
+  z_beta_habit_j   (J,)
+  z_beta_peer_j    (J,)
+  z_beta_dow_j     (J,2)
+  z_a_m            (M,K)
+  z_b_m            (M,K)
 
-Decay prior hyperparameter:
-  - kappa_decay (scalar float64) is stored in inputs and used by the posterior
-    for the Beta(kappa_decay, 1) prior on decay_rate_j.
+Step sizes k passed to fit() keyed by:
+  {"beta_market","beta_habit","beta_peer","beta_dow_j","a_m","b_m"}
 
-Public API:
-  - fit(n_iter, k): k is a dict of RW step sizes keyed by:
-      {"beta_market","beta_habit","beta_peer","decay_rate",
-       "beta_dow_m","beta_dow_j","a_m","b_m","a_j","b_j"}
-  - get_results(): returns theta_init, theta_hat (LAST draw), n_saved, accept (rates)
+Acceptance accounting:
+  - One accept/reject per block per sweep.
+  - Reported acceptance rates are accept_count / n_saved per block.
 
 Notes:
-  - No traces are stored; only the last draw is returned.
-  - Returned theta_* are in the identified (centered) form consistent with the DGP.
-  - Each parameter block is updated as a single RW–MH proposal per sweep while
-    _mcmc_iteration_step remains a compiled tf.function graph.
+  - No traces are stored; get_results() returns theta_init and theta_hat (last draw).
+  - _mcmc_iteration_step remains a compiled tf.function graph.
 """
 
 from __future__ import annotations
@@ -48,18 +41,13 @@ import numpy as np
 import tensorflow as tf
 
 from bonus2 import bonus2_model as model
-
 from bonus2.bonus2_updates import (
-    update_z_beta_market_mj,
-    update_z_beta_habit_j,
-    update_z_beta_peer_j,
-    update_z_decay_rate_j,
-    update_z_beta_dow_m,
-    update_z_beta_dow_j,
     update_z_a_m,
     update_z_b_m,
-    update_z_a_j,
-    update_z_b_j,
+    update_z_beta_dow_j,
+    update_z_beta_habit_j,
+    update_z_beta_market_j,
+    update_z_beta_peer_j,
 )
 
 try:
@@ -105,7 +93,6 @@ def _coerce_neighbors_to_list(neighbors: Any, M: int, N: int) -> list[list[list[
             else:
                 neigh_list = [int(neigh_i)]
 
-            # Minimal sanitization: drop self-edges, drop out-of-range, de-duplicate.
             clean: list[int] = []
             seen = set()
             for k in neigh_list:
@@ -125,26 +112,21 @@ def _coerce_neighbors_to_list(neighbors: Any, M: int, N: int) -> list[list[list[
 
 
 class Bonus2Estimator:
-    """
-    Estimate Bonus Q2 parameters with RW-MH on unconstrained z-blocks.
-
-    Each parameter block is updated once per sweep (one RW–MH accept/reject per block).
-    """
+    """Estimate Bonus Q2 parameters with RW-MH on unconstrained z-blocks."""
 
     def __init__(
         self,
         y_mit: Any,
         delta_mj: Any,
-        dow_t: Any,
+        weekend_t: Any,
         season_sin_kt: Any,
         season_cos_kt: Any,
         neighbors: Any,
         L: int,
+        decay: float,
         init_theta: dict[str, float],
         sigmas: dict[str, float],
         seed: int,
-        kappa_decay: float,
-        decay_rate_eps: float = 0.0,
     ) -> None:
         # ---- infer dimensions ----
         y_np = np.asarray(y_mit)
@@ -183,31 +165,31 @@ class Bonus2Estimator:
                 "(shape (K,T) or (T,K))"
             )
 
+        # ---- weekend indicator ----
+        w_np = np.asarray(weekend_t)
+        if w_np.ndim != 1 or int(w_np.shape[0]) != self.T:
+            raise ValueError("weekend_t must be 1D with length T")
+        # minimal validation: values must be 0/1
+        if not np.all((w_np == 0) | (w_np == 1)):
+            raise ValueError("weekend_t must contain only 0/1 values")
+
         # ---- convert to TF tensors ----
         self.y_mit = tf.convert_to_tensor(y_np, dtype=tf.int32)  # (M,N,T)
         self.delta_mj = tf.convert_to_tensor(delta_np, dtype=tf.float64)  # (M,J)
-
-        dow_np = np.asarray(dow_t)
-        if dow_np.ndim != 1 or int(dow_np.shape[0]) != self.T:
-            raise ValueError("dow_t must be 1D with length T")
-        self.dow_t = tf.convert_to_tensor(dow_np, dtype=tf.int32)  # (T,)
-
+        self.weekend_t = tf.convert_to_tensor(w_np, dtype=tf.int32)  # (T,)
         self.season_sin_kt = tf.convert_to_tensor(sin_np_kt, dtype=tf.float64)  # (K,T)
         self.season_cos_kt = tf.convert_to_tensor(cos_np_kt, dtype=tf.float64)  # (K,T)
+
+        decay_f = float(decay)
+        if not (0.0 < decay_f < 1.0):
+            raise ValueError("decay must be in (0,1)")
+        self.decay = tf.convert_to_tensor(decay_f, dtype=tf.float64)
 
         # ---- network: build peer_adj_m ----
         nbrs_m = _coerce_neighbors_to_list(neighbors, M=self.M, N=self.N)
         self.peer_adj_m = model.build_peer_adjacency(nbrs_m=nbrs_m, N=self.N)
 
         self.L = tf.convert_to_tensor(int(L), dtype=tf.int32)
-
-        self.kappa_decay = tf.convert_to_tensor(float(kappa_decay), dtype=tf.float64)
-        if float(kappa_decay) <= 0.0:
-            raise ValueError("kappa_decay must be > 0")
-
-        self.decay_rate_eps = tf.convert_to_tensor(
-            float(decay_rate_eps), dtype=tf.float64
-        )
 
         # ---- prior scales over z (scalar float64 tensors) ----
         self.sigma_z: dict[str, tf.Tensor] = {
@@ -219,13 +201,12 @@ class Bonus2Estimator:
         self.inputs: dict[str, Any] = {
             "y_mit": self.y_mit,
             "delta_mj": self.delta_mj,
-            "dow_t": self.dow_t,
+            "weekend_t": self.weekend_t,
             "season_sin_kt": self.season_sin_kt,
             "season_cos_kt": self.season_cos_kt,
             "peer_adj_m": self.peer_adj_m,
             "L": self.L,
-            "kappa_decay": self.kappa_decay,
-            "decay_rate_eps": self.decay_rate_eps,
+            "decay": self.decay,
         }
 
         # ---- RNG ----
@@ -237,120 +218,71 @@ class Bonus2Estimator:
         )
         beta_habit0 = tf.convert_to_tensor(float(init_theta["beta_habit"]), tf.float64)
         beta_peer0 = tf.convert_to_tensor(float(init_theta["beta_peer"]), tf.float64)
-
-        decay0 = float(init_theta["decay_rate"])
-        decay0 = float(np.clip(decay0, 1e-6, 1.0 - 1e-6))
-        decay0_t = tf.convert_to_tensor(decay0, tf.float64)
-
-        beta_dow_m0 = tf.convert_to_tensor(float(init_theta["beta_dow_m"]), tf.float64)
         beta_dow_j0 = tf.convert_to_tensor(float(init_theta["beta_dow_j"]), tf.float64)
-
         a_m0 = tf.convert_to_tensor(float(init_theta["a_m"]), tf.float64)
         b_m0 = tf.convert_to_tensor(float(init_theta["b_m"]), tf.float64)
-        a_j0 = tf.convert_to_tensor(float(init_theta["a_j"]), tf.float64)
-        b_j0 = tf.convert_to_tensor(float(init_theta["b_j"]), tf.float64)
 
-        z_beta_market0 = tf.fill((self.M, self.J), beta_market0)
-        z_beta_habit0 = tf.fill((self.J,), beta_habit0)
-        z_beta_peer0 = tf.fill((self.J,), beta_peer0)
-
-        # logit for decay_rate in (0,1)
-        z_decay0 = tf.fill((self.J,), tf.math.log(decay0_t) - tf.math.log1p(-decay0_t))
-
-        z_beta_dow_m0 = tf.fill((self.M, 7), beta_dow_m0)
-        z_beta_dow_j0 = tf.fill((self.J, 7), beta_dow_j0)
-
+        z_beta_market_j0 = tf.fill((self.J,), beta_market0)
+        z_beta_habit_j0 = tf.fill((self.J,), beta_habit0)
+        z_beta_peer_j0 = tf.fill((self.J,), beta_peer0)
+        z_beta_dow_j0 = tf.fill((self.J, 2), beta_dow_j0)
         z_a_m0 = tf.fill((self.M, self.K), a_m0)
         z_b_m0 = tf.fill((self.M, self.K), b_m0)
-        z_a_j0 = tf.fill((self.J, self.K), a_j0)
-        z_b_j0 = tf.fill((self.J, self.K), b_j0)
 
         self.z: dict[str, tf.Variable] = {
-            "z_beta_market_mj": tf.Variable(
-                z_beta_market0, trainable=False, dtype=tf.float64
+            "z_beta_market_j": tf.Variable(
+                z_beta_market_j0, trainable=False, dtype=tf.float64
             ),
             "z_beta_habit_j": tf.Variable(
-                z_beta_habit0, trainable=False, dtype=tf.float64
+                z_beta_habit_j0, trainable=False, dtype=tf.float64
             ),
             "z_beta_peer_j": tf.Variable(
-                z_beta_peer0, trainable=False, dtype=tf.float64
-            ),
-            "z_decay_rate_j": tf.Variable(z_decay0, trainable=False, dtype=tf.float64),
-            "z_beta_dow_m": tf.Variable(
-                z_beta_dow_m0, trainable=False, dtype=tf.float64
+                z_beta_peer_j0, trainable=False, dtype=tf.float64
             ),
             "z_beta_dow_j": tf.Variable(
                 z_beta_dow_j0, trainable=False, dtype=tf.float64
             ),
             "z_a_m": tf.Variable(z_a_m0, trainable=False, dtype=tf.float64),
             "z_b_m": tf.Variable(z_b_m0, trainable=False, dtype=tf.float64),
-            "z_a_j": tf.Variable(z_a_j0, trainable=False, dtype=tf.float64),
-            "z_b_j": tf.Variable(z_b_j0, trainable=False, dtype=tf.float64),
         }
 
-        # ---- store theta_init (identified form) for evaluation printouts ----
-        self.theta_init = self._theta_identified_from_z(
-            self._current_z_dict(), as_numpy=True
-        )
+        # ---- store theta_init for evaluation printouts ----
+        self.theta_init = self._theta_from_z(self._current_z_dict(), as_numpy=True)
 
         # ---- step sizes (set in fit) ----
         self.k: dict[str, tf.Variable] = {
             "beta_market": tf.Variable(0.0, dtype=tf.float64, trainable=False),
             "beta_habit": tf.Variable(0.0, dtype=tf.float64, trainable=False),
             "beta_peer": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "decay_rate": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "beta_dow_m": tf.Variable(0.0, dtype=tf.float64, trainable=False),
             "beta_dow_j": tf.Variable(0.0, dtype=tf.float64, trainable=False),
             "a_m": tf.Variable(0.0, dtype=tf.float64, trainable=False),
             "b_m": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "a_j": tf.Variable(0.0, dtype=tf.float64, trainable=False),
-            "b_j": tf.Variable(0.0, dtype=tf.float64, trainable=False),
         }
 
-        # ---- acceptance counters ----
+        # ---- acceptance counters (one per block per sweep) ----
         self.accept: dict[str, tf.Variable] = {
             "beta_market": tf.Variable(0, dtype=tf.int32, trainable=False),
             "beta_habit": tf.Variable(0, dtype=tf.int32, trainable=False),
             "beta_peer": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "decay_rate": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "beta_dow_m": tf.Variable(0, dtype=tf.int32, trainable=False),
             "beta_dow_j": tf.Variable(0, dtype=tf.int32, trainable=False),
             "a_m": tf.Variable(0, dtype=tf.int32, trainable=False),
             "b_m": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "a_j": tf.Variable(0, dtype=tf.int32, trainable=False),
-            "b_j": tf.Variable(0, dtype=tf.int32, trainable=False),
         }
 
-        # ---- sweep counter (used for acceptance-rate denominators) ----
+        # ---- sweep counter ----
         self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
-
-        # ---- element counts for acceptance-rate denominators (elementwise rates) ----
-        self._block_sizes: dict[str, int] = {
-            "beta_market": self.M * self.J,
-            "beta_habit": self.J,
-            "beta_peer": self.J,
-            "decay_rate": self.J,
-            "beta_dow_m": self.M * 7,
-            "beta_dow_j": self.J * 7,
-            "a_m": self.M * self.K,
-            "b_m": self.M * self.K,
-            "a_j": self.J * self.K,
-            "b_j": self.J * self.K,
-        }
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
     def fit(self, n_iter: int, k: dict[str, float]) -> None:
-        """
-        Run MCMC for n_iter iterations (Python loop).
+        """Run MCMC for n_iter sweeps (Python loop).
 
         Args:
           n_iter: number of sweeps
           k: RW step sizes keyed by:
-             {"beta_market","beta_habit","beta_peer","decay_rate",
-              "beta_dow_m","beta_dow_j","a_m","b_m","a_j","b_j"}
+             {"beta_market","beta_habit","beta_peer","beta_dow_j","a_m","b_m"}
         """
         n_iter = int(n_iter)
         if n_iter <= 0:
@@ -359,13 +291,9 @@ class Bonus2Estimator:
         self.k["beta_market"].assign(float(k["beta_market"]))
         self.k["beta_habit"].assign(float(k["beta_habit"]))
         self.k["beta_peer"].assign(float(k["beta_peer"]))
-        self.k["decay_rate"].assign(float(k["decay_rate"]))
-        self.k["beta_dow_m"].assign(float(k["beta_dow_m"]))
         self.k["beta_dow_j"].assign(float(k["beta_dow_j"]))
         self.k["a_m"].assign(float(k["a_m"]))
         self.k["b_m"].assign(float(k["b_m"]))
-        self.k["a_j"].assign(float(k["a_j"]))
-        self.k["b_j"].assign(float(k["b_j"]))
 
         self._reset_chain_state()
 
@@ -373,26 +301,15 @@ class Bonus2Estimator:
             self._mcmc_iteration_step(it=tf.constant(it, dtype=tf.int32))
 
     def get_results(self) -> dict[str, object]:
-        """
-        Return:
-          - theta_init: initial parameters (identified)
-          - theta_hat: last-draw parameters (identified)
-          - n_saved: number of sweeps completed
-          - accept: acceptance rates per block (accepted_elements / (n_saved * block_size))
-        """
-        theta_last = self._theta_identified_from_z(
-            self._current_z_dict(), as_numpy=False
-        )
+        """Return theta_init, theta_hat (last draw), n_saved, accept (per-block rates)."""
+        theta_last = self._theta_from_z(self._current_z_dict(), as_numpy=False)
         theta_hat = {k: v.numpy() for k, v in theta_last.items()}
 
         n_saved = int(self.saved.numpy())
         counts = {kk: int(vv.numpy()) for kk, vv in self.accept.items()}
 
-        denom_saved = max(1, n_saved)
-        rates = {
-            kk: counts[kk] / max(1, denom_saved * self._block_sizes[kk])
-            for kk in counts.keys()
-        }
+        denom = max(1, n_saved)
+        rates = {kk: counts[kk] / denom for kk in counts.keys()}
 
         return {
             "theta_init": self.theta_init,
@@ -407,43 +324,19 @@ class Bonus2Estimator:
 
     def _current_z_dict(self) -> dict[str, tf.Tensor]:
         return {
-            "z_beta_market_mj": self.z["z_beta_market_mj"],
+            "z_beta_market_j": self.z["z_beta_market_j"],
             "z_beta_habit_j": self.z["z_beta_habit_j"],
             "z_beta_peer_j": self.z["z_beta_peer_j"],
-            "z_decay_rate_j": self.z["z_decay_rate_j"],
-            "z_beta_dow_m": self.z["z_beta_dow_m"],
             "z_beta_dow_j": self.z["z_beta_dow_j"],
             "z_a_m": self.z["z_a_m"],
             "z_b_m": self.z["z_b_m"],
-            "z_a_j": self.z["z_a_j"],
-            "z_b_j": self.z["z_b_j"],
         }
 
-    def _theta_identified_from_z(
+    def _theta_from_z(
         self, z_dict: dict[str, tf.Tensor], as_numpy: bool
     ) -> dict[str, Any]:
-        """
-        Convert z -> theta and apply the DGP-identification centering constraints
-        in eager-safe form (so this can be called outside @tf.function).
-        """
+        """Convert z -> theta (no centering/identifiability constraints in updated spec)."""
         theta = model.unconstrained_to_theta(z_dict)
-
-        eps_f = float(self.decay_rate_eps.numpy())
-        theta["decay_rate_j"] = tf.clip_by_value(
-            theta["decay_rate_j"], eps_f, 1.0 - eps_f
-        )
-
-        beta_dow_m, beta_dow_j, a_j, b_j = model.apply_identifiability_constraints_tf(
-            beta_dow_m=theta["beta_dow_m"],
-            beta_dow_j=theta["beta_dow_j"],
-            a_j=theta["a_j"],
-            b_j=theta["b_j"],
-        )
-        theta["beta_dow_m"] = beta_dow_m
-        theta["beta_dow_j"] = beta_dow_j
-        theta["a_j"] = a_j
-        theta["b_j"] = b_j
-
         if as_numpy:
             return {k: v.numpy() for k, v in theta.items()}
         return theta
@@ -463,124 +356,79 @@ class Bonus2Estimator:
         sigma_z = self.sigma_z
 
         def _acc(block: str, accepted: tf.Tensor) -> None:
-            # rw_mh_step may return a scalar bool or a mask with the same shape as the block.
-            # We count accepted *elements*; if accepted is scalar, reduce_sum returns 0 or 1.
-            inc = tf.reduce_sum(tf.cast(accepted, tf.int32))
-            self.accept[block].assign_add(inc)
+            self.accept[block].assign_add(tf.cast(accepted, tf.int32))
 
-        # ---- Market×Product intercept ----
+        # ---- beta_market_j ----
         z_dict = self._current_z_dict()
-        z_new, accepted = update_z_beta_market_mj(
-            rng=self.rng,
-            k=self.k["beta_market"],
+        z_new, accepted = update_z_beta_market_j(
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
+            step_size=self.k["beta_market"],
+            rng=self.rng,
         )
-        self.z["z_beta_market_mj"].assign(z_new)
+        self.z["z_beta_market_j"].assign(z_new["z_beta_market_j"])
         _acc("beta_market", accepted)
 
-        # ---- Product vectors ----
+        # ---- beta_habit_j ----
         z_dict = self._current_z_dict()
         z_new, accepted = update_z_beta_habit_j(
-            rng=self.rng,
-            k=self.k["beta_habit"],
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
+            step_size=self.k["beta_habit"],
+            rng=self.rng,
         )
-        self.z["z_beta_habit_j"].assign(z_new)
+        self.z["z_beta_habit_j"].assign(z_new["z_beta_habit_j"])
         _acc("beta_habit", accepted)
 
+        # ---- beta_peer_j ----
         z_dict = self._current_z_dict()
         z_new, accepted = update_z_beta_peer_j(
-            rng=self.rng,
-            k=self.k["beta_peer"],
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
+            step_size=self.k["beta_peer"],
+            rng=self.rng,
         )
-        self.z["z_beta_peer_j"].assign(z_new)
+        self.z["z_beta_peer_j"].assign(z_new["z_beta_peer_j"])
         _acc("beta_peer", accepted)
 
-        z_dict = self._current_z_dict()
-        z_new, accepted = update_z_decay_rate_j(
-            rng=self.rng,
-            k=self.k["decay_rate"],
-            inputs=inputs,
-            z=z_dict,
-        )
-        self.z["z_decay_rate_j"].assign(z_new)
-        _acc("decay_rate", accepted)
-
-        # ---- Market-level time blocks ----
-        z_dict = self._current_z_dict()
-        z_new, accepted = update_z_beta_dow_m(
-            rng=self.rng,
-            k=self.k["beta_dow_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z=z_dict,
-        )
-        self.z["z_beta_dow_m"].assign(z_new)
-        _acc("beta_dow_m", accepted)
-
-        z_dict = self._current_z_dict()
-        z_new, accepted = update_z_a_m(
-            rng=self.rng,
-            k=self.k["a_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z=z_dict,
-        )
-        self.z["z_a_m"].assign(z_new)
-        _acc("a_m", accepted)
-
-        z_dict = self._current_z_dict()
-        z_new, accepted = update_z_b_m(
-            rng=self.rng,
-            k=self.k["b_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z=z_dict,
-        )
-        self.z["z_b_m"].assign(z_new)
-        _acc("b_m", accepted)
-
-        # ---- Product-level time blocks ----
+        # ---- beta_dow_j ----
         z_dict = self._current_z_dict()
         z_new, accepted = update_z_beta_dow_j(
-            rng=self.rng,
-            k=self.k["beta_dow_j"],
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
+            step_size=self.k["beta_dow_j"],
+            rng=self.rng,
         )
-        self.z["z_beta_dow_j"].assign(z_new)
+        self.z["z_beta_dow_j"].assign(z_new["z_beta_dow_j"])
         _acc("beta_dow_j", accepted)
 
+        # ---- a_m ----
         z_dict = self._current_z_dict()
-        z_new, accepted = update_z_a_j(
-            rng=self.rng,
-            k=self.k["a_j"],
+        z_new, accepted = update_z_a_m(
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
-        )
-        self.z["z_a_j"].assign(z_new)
-        _acc("a_j", accepted)
-
-        z_dict = self._current_z_dict()
-        z_new, accepted = update_z_b_j(
+            step_size=self.k["a_m"],
             rng=self.rng,
-            k=self.k["b_j"],
+        )
+        self.z["z_a_m"].assign(z_new["z_a_m"])
+        _acc("a_m", accepted)
+
+        # ---- b_m ----
+        z_dict = self._current_z_dict()
+        z_new, accepted = update_z_b_m(
+            z=z_dict,
             inputs=inputs,
             sigma_z=sigma_z,
-            z=z_dict,
+            step_size=self.k["b_m"],
+            rng=self.rng,
         )
-        self.z["z_b_j"].assign(z_new)
-        _acc("b_j", accepted)
+        self.z["z_b_m"].assign(z_new["z_b_m"])
+        _acc("b_m", accepted)
 
-        # ---- sweep counter + diagnostics ----
         self.saved.assign_add(1)
         report_iteration_progress(z=self._current_z_dict(), it=it)

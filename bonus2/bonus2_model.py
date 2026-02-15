@@ -1,45 +1,48 @@
 """
 bonus2_model.py
 
-Pure TensorFlow core mechanics for Bonus Q2 (habit + peer + DOW + seasonality) with MNL choices.
+TensorFlow core mechanics for Bonus Q2 (updated spec):
+  - Habit + peer effects with deterministic state construction from observed choices
+  - Product-only intercept
+  - Product-only weekday/weekend (binary) shift
+  - Market-only seasonality (Fourier)
+  - Known scalar habit decay (passed to model; not estimated)
 
-This module is the "core model" layer. It contains:
-  - Parameter transforms (z -> theta)
-  - Deterministic state construction from observed choices:
-      * habit stock H_{m,i,j,t}
-      * peer exposure P_{m,i,j,t} using known social networks
-  - Utility construction and MNL log-likelihood / prediction probabilities
-
-Observed inputs (typically passed in an `inputs` dict by the posterior/estimator):
-  y_mit          (M,N,T) int32  choices; 0=outside, j+1=inside product j
+Observed inputs (typically passed by posterior/estimator):
+  y_mit          (M,N,T) int32  choices; 0=outside, c=j+1=inside product j
   delta_mj       (M,J)   f64    Phase-1 baseline utilities (fixed)
-  dow_t          (T,)    int32  weekday index in {0..6}
-  season_sin_kt  (K,T)   f64    sin((k+1)*season_angle_t[t]) basis
-  season_cos_kt  (K,T)   f64    cos((k+1)*season_angle_t[t]) basis
-  peer_adj_m     tuple of length M, each a tf.SparseTensor (N,N) adjacency
-  L              scalar int32   peer lookback window length
+  weekend_t            (T,)    int32  weekend indicator in {0,1} (1=weekend, 0=weekday)
+  season_sin_kt  (K,T)   f64    sin((k+1)*theta_t[t]) basis
+  season_cos_kt  (K,T)   f64    cos((k+1)*theta_t[t]) basis
+  peer_adj_m     tuple length M of tf.SparseTensor (N,N) adjacency (known networks)
+  L              scalar int32   peer lookback window length (known hyperparameter)
+  decay          scalar f64     habit decay in (0,1) (known input)
 
-Parameters (theta) are expected to be float64 tensors:
-  beta_market_mj (M,J)
-  beta_habit_j   (J,)
-  beta_peer_j    (J,)
-  decay_rate_j   (J,) in (0,1)
-  beta_dow_m     (M,7)
-  beta_dow_j     (J,7)
-  a_m, b_m       (M,K)
-  a_j, b_j       (J,K)
+Parameters (theta), all float64:
+  beta_market_j  (J,)    product intercept shift beyond delta_mj
+  beta_habit_j   (J,)    habit sensitivity
+  beta_peer_j    (J,)    peer sensitivity
+  beta_dow_j     (J,2)   product weekday/weekend shifts
+  a_m, b_m       (M,K)   market seasonal Fourier coefficients
 
-Utility (inside options j=1..J, with outside option utility 0):
+Utility (inside options j=1..J; outside has utility 0):
   v_{m,i,j,t} =
       delta_{m,j}
-    + beta_market_mj[m,j]
+    + beta_market_j[j]
     + beta_habit_j[j] * H_{m,i,j,t}
     + beta_peer_j[j]  * P_{m,i,j,t}
-    + beta_dow_m[m, dow_t] + beta_dow_j[j, dow_t]
-    + S_m[m,t] + S_j[j,t]
+    + beta_dow_j[j, weekend_t[t]]
+    + S_m[m,t]
 
-Choice model:
-  P(y=j | v) = exp(v_j) / (1 + sum_r exp(v_r)),  outside j=0 has v_0=0.
+Seasonality (market-only):
+  S_m[m,t] = sum_k a_m[m,k]*sin_k[t] + b_m[m,k]*cos_k[t]
+
+Habit stock (known scalar decay):
+  H_{t+1} = decay * H_t + x_t
+where x_t = 1{y_t == j}.
+
+Peer exposure (lookback L):
+  P_{i,j,t} = sum_{k in N(i)} sum_{ell=1..L} 1{ y_{k,t-ell} == j }.
 """
 
 from __future__ import annotations
@@ -57,99 +60,27 @@ PeerAdjacency = tuple[tf.SparseTensor, ...]
 
 
 def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
-    """Map unconstrained parameters z[*] to constrained theta[*].
+    """Map unconstrained parameters z[*] to theta[*].
 
-    Expected dtypes:
-      - All z tensors are float64.
+    This updated spec has no constrained parameters in theta (decay is known input),
+    so this is an identity mapping.
 
-    Required z keys and shapes:
-      z_beta_market_mj  (M,J) -> beta_market_mj  real
-      z_beta_habit_j    (J,)  -> beta_habit_j    real
-      z_beta_peer_j     (J,)  -> beta_peer_j     real
-      z_decay_rate_j    (J,)  -> decay_rate_j    in (0,1)
-      z_beta_dow_m      (M,7) -> beta_dow_m      real
-      z_beta_dow_j      (J,7) -> beta_dow_j      real
-      z_a_m             (M,K) -> a_m             real
-      z_b_m             (M,K) -> b_m             real
-      z_a_j             (J,K) -> a_j             real
-      z_b_j             (J,K) -> b_j             real
-
-    Returns:
-      dict[str, tf.Tensor] theta.
+    Required z keys and shapes (all float64):
+      z_beta_market_j  (J,)   -> beta_market_j
+      z_beta_habit_j   (J,)   -> beta_habit_j
+      z_beta_peer_j    (J,)   -> beta_peer_j
+      z_beta_dow_j     (J,2)  -> beta_dow_j
+      z_a_m            (M,K)  -> a_m
+      z_b_m            (M,K)  -> b_m
     """
     return {
-        "beta_market_mj": z["z_beta_market_mj"],
+        "beta_market_j": z["z_beta_market_j"],
         "beta_habit_j": z["z_beta_habit_j"],
         "beta_peer_j": z["z_beta_peer_j"],
-        "decay_rate_j": tf.math.sigmoid(z["z_decay_rate_j"]),
-        "beta_dow_m": z["z_beta_dow_m"],
         "beta_dow_j": z["z_beta_dow_j"],
         "a_m": z["z_a_m"],
         "b_m": z["z_b_m"],
-        "a_j": z["z_a_j"],
-        "b_j": z["z_b_j"],
     }
-
-
-def _ensure_theta(
-    theta: dict[str, tf.Tensor],
-    decay_rate_eps: tf.Tensor,
-) -> dict[str, tf.Tensor]:
-    """Apply identifiability constraints and optional decay clipping.
-
-    This enforces (in theta-space):
-      - beta_dow_m: mean across weekdays is 0 within each market
-      - beta_dow_j: mean across weekdays is 0 within each product, then mean across products is 0 per weekday
-      - a_j, b_j: centered across products per harmonic
-      - decay_rate_j: clipped to [eps, 1-eps] (eps may be 0)
-
-    Expected dtypes:
-      - theta[*] are float64
-      - decay_rate_eps is float64 (or castable to float64)
-    """
-    eps = tf.cast(decay_rate_eps, tf.float64)
-
-    th = dict(theta)
-    th["decay_rate_j"] = tf.clip_by_value(th["decay_rate_j"], eps, 1.0 - eps)
-
-    beta_dow_m, beta_dow_j, a_j, b_j = apply_identifiability_constraints_tf(
-        beta_dow_m=th["beta_dow_m"],
-        beta_dow_j=th["beta_dow_j"],
-        a_j=th["a_j"],
-        b_j=th["b_j"],
-    )
-    th["beta_dow_m"] = beta_dow_m
-    th["beta_dow_j"] = beta_dow_j
-    th["a_j"] = a_j
-    th["b_j"] = b_j
-
-    return th
-
-
-def apply_identifiability_constraints_tf(
-    beta_dow_m: tf.Tensor,
-    beta_dow_j: tf.Tensor,
-    a_j: tf.Tensor,
-    b_j: tf.Tensor,
-) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Center additive decomposition components.
-
-    - beta_dow_m: center within market over weekdays
-    - beta_dow_j: center within product over weekdays, then center across products per weekday
-    - a_j, b_j: center across products per harmonic
-
-    Expected dtypes: float64.
-    """
-    beta_dow_m = beta_dow_m - tf.reduce_mean(beta_dow_m, axis=1, keepdims=True)
-
-    beta_dow_j = beta_dow_j - tf.reduce_mean(beta_dow_j, axis=1, keepdims=True)
-    beta_dow_j = beta_dow_j - tf.reduce_mean(beta_dow_j, axis=0, keepdims=True)
-
-    # These ops are safe with shape (J,0) when K == 0.
-    a_j = a_j - tf.reduce_mean(a_j, axis=0, keepdims=True)
-    b_j = b_j - tf.reduce_mean(b_j, axis=0, keepdims=True)
-
-    return beta_dow_m, beta_dow_j, a_j, b_j
 
 
 # =============================================================================
@@ -196,8 +127,8 @@ def _inside_choice_onehot(y_mit: tf.Tensor, J: tf.Tensor) -> tf.Tensor:
     """Build inside-choice one-hot indicators.
 
     Args:
-      y_mit: (M,N,T) int32, 0=outside, j+1=inside j
-      J: scalar int32
+      y_mit: (M,N,T) int32, 0=outside, c=j+1=inside product j
+      J: scalar int32 (number of inside products)
 
     Returns:
       x_mntj: (M,N,T,J) float64, x[...,t,j]=1{y[...,t]==j+1}
@@ -213,20 +144,21 @@ def _inside_choice_onehot(y_mit: tf.Tensor, J: tf.Tensor) -> tf.Tensor:
 
 def compute_habit_stock_from_onehot(
     x_mntj: tf.Tensor,
-    decay_rate_j: tf.Tensor,
+    decay: tf.Tensor,
 ) -> tf.Tensor:
     """Compute habit stocks H_{m,i,j,t} used in utility at each time t.
 
     Recurrence:
-      H_{t+1} = decay_rate_j * H_t + x_t
+      H_{t+1} = decay * H_t + x_t
 
     Args:
       x_mntj: (M,N,T,J) float64 inside-choice indicators
-      decay_rate_j: (J,) float64
+      decay: scalar float64
 
     Returns:
       H_mntj: (M,N,T,J) float64, where H[...,t,:] is the pre-choice stock at time t.
     """
+    decay = tf.cast(decay, tf.float64)
     x_t = tf.transpose(x_mntj, perm=[2, 0, 1, 3])  # (T,M,N,J)
 
     M = tf.shape(x_mntj)[0]
@@ -236,7 +168,7 @@ def compute_habit_stock_from_onehot(
     H0 = tf.zeros((M, N, J_int), dtype=tf.float64)
 
     def _step(H_curr: tf.Tensor, x_curr: tf.Tensor) -> tf.Tensor:
-        return H_curr * decay_rate_j[None, None, :] + x_curr
+        return H_curr * decay + x_curr
 
     H_next_t = tf.scan(_step, x_t, initializer=H0)  # (T,M,N,J) gives H_{t+1}
 
@@ -252,7 +184,7 @@ def rolling_window_counts(x_mntj: tf.Tensor, L: tf.Tensor) -> tf.Tensor:
 
     Args:
       x_mntj: (M,N,T,J) float64
-      L: scalar int
+      L: scalar int32
 
     Returns:
       C_mntj: (M,N,T,J) float64
@@ -281,13 +213,10 @@ def compute_peer_exposure_from_onehot(
 ) -> tf.Tensor:
     """Compute peer exposures P_{m,i,j,t} using known per-market adjacency matrices.
 
-    Definition:
-      P_{i,j,t} = sum_{k in N(i)} sum_{ell=1..L} 1{y_{k,t-ell} == j}
-
     Args:
       x_mntj: (M,N,T,J) float64 inside-choice indicators
       peer_adj_m: tuple length M of tf.SparseTensor (N,N)
-      L: scalar int
+      L: scalar int32
 
     Returns:
       P_mntj: (M,N,T,J) float64
@@ -340,54 +269,60 @@ def utilities_mntj_from_theta(
     theta: dict[str, tf.Tensor],
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
-    dow_t: tf.Tensor,
+    weekend_t: tf.Tensor,
     season_sin_kt: tf.Tensor,
     season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    decay_rate_eps: tf.Tensor,
+    decay: tf.Tensor,
 ) -> tf.Tensor:
     """Compute inside-option utilities v_{m,i,j,t} (no outside option column).
 
     Returns:
       v_mntj: (M,N,T,J) float64
     """
-    theta = _ensure_theta(theta=theta, decay_rate_eps=decay_rate_eps)
-
     y_mit = tf.convert_to_tensor(y_mit, dtype=tf.int32)
     delta_mj = tf.convert_to_tensor(delta_mj, dtype=tf.float64)
-    dow_t = tf.convert_to_tensor(dow_t, dtype=tf.int32)
+    weekend_t = tf.convert_to_tensor(weekend_t, dtype=tf.int32)
+    decay = tf.cast(decay, tf.float64)
 
-    # Seasonality: S_m (M,T), S_j (J,T)
+    # Market-only seasonality: S_m is (M,T)
     S_m = fourier_seasonality_tf(
-        theta["a_m"], theta["b_m"], season_sin_kt, season_cos_kt
+        tf.convert_to_tensor(theta["a_m"], dtype=tf.float64),
+        tf.convert_to_tensor(theta["b_m"], dtype=tf.float64),
+        tf.convert_to_tensor(season_sin_kt, dtype=tf.float64),
+        tf.convert_to_tensor(season_cos_kt, dtype=tf.float64),
     )
-    S_j = fourier_seasonality_tf(
-        theta["a_j"], theta["b_j"], season_sin_kt, season_cos_kt
-    )
 
-    # DOW terms: gather along weekday axis.
-    dow_m_mt = tf.gather(theta["beta_dow_m"], dow_t, axis=1)  # (M,T)
-    dow_j_jt = tf.gather(theta["beta_dow_j"], dow_t, axis=1)  # (J,T)
+    # Product-only binary DOW: gather along w-axis (2)
+    beta_dow_j = tf.convert_to_tensor(theta["beta_dow_j"], dtype=tf.float64)  # (J,2)
+    dow_j_jt = tf.gather(beta_dow_j, weekend_t, axis=1)  # (J,T)
+    dow_term = tf.transpose(dow_j_jt)[None, :, :]  # (1,T,J) -> broadcast over M
 
-    dow_mtj = dow_m_mt[:, :, None] + tf.transpose(dow_j_jt)[None, :, :]  # (M,T,J)
-    season_mtj = S_m[:, :, None] + tf.transpose(S_j)[None, :, :]  # (M,T,J)
+    # Product-only intercept: broadcast to (M,J)
+    beta_market_j = tf.convert_to_tensor(
+        theta["beta_market_j"], dtype=tf.float64
+    )  # (J,)
+    base_mj = delta_mj + beta_market_j[None, :]  # (M,J)
 
-    base_mj = delta_mj + theta["beta_market_mj"]  # (M,J)
-    base_mtj = base_mj[:, None, :] + dow_mtj + season_mtj  # (M,T,J)
+    # Base utility without habit/peer: (M,T,J)
+    base_mtj = base_mj[:, None, :] + S_m[:, :, None] + dow_term
 
     # Deterministic states from observed y.
     J_int = tf.shape(delta_mj)[1]
     x_mntj = _inside_choice_onehot(y_mit=y_mit, J=J_int)  # (M,N,T,J)
-    H_mntj = compute_habit_stock_from_onehot(
-        x_mntj=x_mntj, decay_rate_j=theta["decay_rate_j"]
-    )
+
+    H_mntj = compute_habit_stock_from_onehot(x_mntj=x_mntj, decay=decay)
     P_mntj = compute_peer_exposure_from_onehot(
         x_mntj=x_mntj, peer_adj_m=peer_adj_m, L=L
     )
 
-    beta_habit = theta["beta_habit_j"][None, None, None, :]
-    beta_peer = theta["beta_peer_j"][None, None, None, :]
+    beta_habit = tf.convert_to_tensor(theta["beta_habit_j"], dtype=tf.float64)[
+        None, None, None, :
+    ]
+    beta_peer = tf.convert_to_tensor(theta["beta_peer_j"], dtype=tf.float64)[
+        None, None, None, :
+    ]
 
     return base_mtj[:, None, :, :] + beta_habit * H_mntj + beta_peer * P_mntj
 
@@ -401,12 +336,12 @@ def loglik_mnt_from_theta(
     theta: dict[str, tf.Tensor],
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
-    dow_t: tf.Tensor,
+    weekend_t: tf.Tensor,
     season_sin_kt: tf.Tensor,
     season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    decay_rate_eps: tf.Tensor,
+    decay: tf.Tensor,
 ) -> tf.Tensor:
     """Per-(market, consumer, time) log-likelihood contributions under MNL with outside option.
 
@@ -419,12 +354,12 @@ def loglik_mnt_from_theta(
         theta=theta,
         y_mit=y_mit,
         delta_mj=delta_mj,
-        dow_t=dow_t,
+        weekend_t=weekend_t,
         season_sin_kt=season_sin_kt,
         season_cos_kt=season_cos_kt,
         peer_adj_m=peer_adj_m,
         L=L,
-        decay_rate_eps=decay_rate_eps,
+        decay=decay,
     )
 
     zeros_outside = tf.zeros_like(v_mntj[..., :1])
@@ -438,12 +373,12 @@ def loglik_from_theta(
     theta: dict[str, tf.Tensor],
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
-    dow_t: tf.Tensor,
+    weekend_t: tf.Tensor,
     season_sin_kt: tf.Tensor,
     season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    decay_rate_eps: tf.Tensor,
+    decay: tf.Tensor,
 ) -> tf.Tensor:
     """Total log-likelihood scalar (sum over M,N,T)."""
     return tf.reduce_sum(
@@ -451,12 +386,12 @@ def loglik_from_theta(
             theta=theta,
             y_mit=y_mit,
             delta_mj=delta_mj,
-            dow_t=dow_t,
+            weekend_t=weekend_t,
             season_sin_kt=season_sin_kt,
             season_cos_kt=season_cos_kt,
             peer_adj_m=peer_adj_m,
             L=L,
-            decay_rate_eps=decay_rate_eps,
+            decay=decay,
         )
     )
 
@@ -465,12 +400,12 @@ def predict_choice_probs_from_theta(
     theta: dict[str, tf.Tensor],
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
-    dow_t: tf.Tensor,
+    weekend_t: tf.Tensor,
     season_sin_kt: tf.Tensor,
     season_cos_kt: tf.Tensor,
     peer_adj_m: PeerAdjacency,
     L: tf.Tensor,
-    decay_rate_eps: tf.Tensor,
+    decay: tf.Tensor,
 ) -> tf.Tensor:
     """Predict choice probabilities under MNL with outside option.
 
@@ -483,12 +418,12 @@ def predict_choice_probs_from_theta(
         theta=theta,
         y_mit=y_mit,
         delta_mj=delta_mj,
-        dow_t=dow_t,
+        weekend_t=weekend_t,
         season_sin_kt=season_sin_kt,
         season_cos_kt=season_cos_kt,
         peer_adj_m=peer_adj_m,
         L=L,
-        decay_rate_eps=decay_rate_eps,
+        decay=decay,
     )
 
     zeros_outside = tf.zeros_like(v_mntj[..., :1])
