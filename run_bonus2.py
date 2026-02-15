@@ -6,7 +6,7 @@ End-to-end orchestration for Bonus Q2:
 - Phase 1: Zhang feature-based baseline choice model -> delta_hat (J,)
 - Bonus2 DGP: simulate y_mit under habit + peer + DOW + seasonal MNL using delta_mj
 - Bonus2 estimation: RW-MH over z-blocks (Ching-style architecture) -> theta_hat
-- Bonus2 evaluation: clean, stockpiling-style summary via bonus2_evaluate.py
+- Bonus2 evaluation: clean summary via bonus2_evaluate.py
 
 Notes:
 - We do NOT run the Lu market-shock phase.
@@ -103,7 +103,7 @@ CFG_BONUS2 = {
     },
     # MCMC config
     "mcmc_seed": 0,
-    "mcmc_n_iter": 10,
+    "mcmc_n_iter": 30,
     # estimator init (scalar fills)
     "init_theta": {
         "beta_market": 0.0,
@@ -136,8 +136,8 @@ CFG_BONUS2 = {
         "beta_habit": 0.05,
         "beta_peer": 0.05,
         "decay_rate": 0.02,
-        "beta_dow_m": 0.05,
-        "beta_dow_j": 0.05,
+        "beta_dow_m": 0.001,
+        "beta_dow_j": 0.001,
         "a_m": 0.05,
         "b_m": 0.05,
         "a_j": 0.05,
@@ -156,6 +156,31 @@ def _tile_delta_mj(delta_hat: np.ndarray, M: int) -> np.ndarray:
     if delta_hat.ndim != 1:
         raise ValueError("delta_hat must be 1D (J,)")
     return np.tile(delta_hat[None, :], reps=(int(M), 1)).astype(np.float64)
+
+
+def _delta_only_baseline_probs(delta_mj: np.ndarray, N: int, T: int) -> np.ndarray:
+    """
+    Construct δ-only baseline probabilities:
+      p_m(c) = softmax([0, δ_m1, ..., δ_mJ]) over c=0..J,
+    then broadcast to (M,N,T,J+1).
+    """
+    delta_mj = np.asarray(delta_mj, dtype=np.float64)
+    if delta_mj.ndim != 2:
+        raise ValueError("delta_mj must be 2D (M,J)")
+    M, J = delta_mj.shape
+    if M < 1 or J < 1:
+        raise ValueError(f"delta_mj must have M>=1 and J>=1, got {delta_mj.shape}")
+    if N < 1 or T < 1:
+        raise ValueError(f"N and T must be >=1, got N={N}, T={T}")
+
+    logits = np.concatenate(
+        [np.zeros((M, 1), dtype=np.float64), delta_mj], axis=1
+    )  # (M,J+1)
+    logits = logits - logits.max(axis=1, keepdims=True)  # stable softmax
+    exp_logits = np.exp(logits)
+    p_mc = exp_logits / exp_logits.sum(axis=1, keepdims=True)  # (M,J+1)
+
+    return np.broadcast_to(p_mc[:, None, None, :], (M, N, T, J + 1)).copy()
 
 
 def _theta_true_from_panel(panel: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -375,7 +400,7 @@ def main() -> None:
     # Bonus2 estimation
     res = run_bonus2_estimation(CFG_BONUS2, panel=panel)
 
-    # Build probabilities for evaluation (fitted + oracle)
+    # Build probabilities for evaluation (fitted + oracle; baseline is δ-only in NumPy)
     y_tf = tf.convert_to_tensor(np.asarray(panel["y"], dtype=np.int32), dtype=tf.int32)
     delta_tf = tf.convert_to_tensor(
         np.asarray(panel["delta"], dtype=np.float64), dtype=tf.float64
@@ -391,6 +416,7 @@ def main() -> None:
     )
 
     N = int(panel["y"].shape[1])
+    T = int(panel["y"].shape[2])
     L_tf = tf.convert_to_tensor(int(panel["peer_lookback_L"]), dtype=tf.int32)
     decay_rate_eps_tf = tf.convert_to_tensor(
         float(panel["params_true"]["decay_rate_eps"]), dtype=tf.float64
@@ -425,7 +451,10 @@ def main() -> None:
         decay_rate_eps=decay_rate_eps_tf,
     ).numpy()
 
-    # Bonus2 evaluation (stockpiling-style)
+    # δ-only baseline probabilities for evaluation
+    p_delta_only = _delta_only_baseline_probs(panel["delta"], N=N, T=T)
+
+    # Bonus2 evaluation
     mcmc = {}
     if "n_saved" in res:
         mcmc["n_saved"] = int(res["n_saved"])
@@ -437,6 +466,7 @@ def main() -> None:
     ev = evaluate_bonus2(
         y_mit=panel["y"],
         p_choice_hat_mntc=p_hat,
+        p_choice_baseline_mntc=p_delta_only,
         theta_hat=theta_hat,
         theta_true=theta_true,
         p_choice_oracle_mntc=p_oracle,

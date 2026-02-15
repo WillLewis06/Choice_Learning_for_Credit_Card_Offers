@@ -3,10 +3,11 @@ bonus2/bonus2_evaluate.py
 
 Evaluation utilities for Bonus Q2 (habit + peer + DOW + seasonality) MNL choice model.
 
-Design goals (mirrors stockpiling_evaluate.py):
+Design goals:
 - Pure NumPy (no TensorFlow).
-- Clean, reviewer-friendly summary formatting.
+- Simple, reviewer-friendly summary formatting.
 - No trace averaging: theta_hat is treated as the final point estimate passed in.
+- Baseline probabilities must be provided explicitly (no empirical-share fallback).
 
 Conventions:
   - y_mit: integer choices, shape (M,N,T), values in {0..J}
@@ -107,8 +108,7 @@ def _validate_choice_panel_shapes(
 def _gather_p_true(y_int: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Gather p[m,i,t,y[m,i,t]]."""
     idx = y_int[..., None]
-    p_true = np.take_along_axis(p, idx, axis=3)[..., 0]
-    return p_true
+    return np.take_along_axis(p, idx, axis=3)[..., 0]
 
 
 def predictive_metrics_from_choice_probs(
@@ -145,9 +145,8 @@ def predictive_metrics_from_choice_probs(
     avg_p_true = float(np.mean(p_true))
 
     C = J + 1
-    share_emp = np.zeros((C,), dtype=np.float64)
-    for c in range(C):
-        share_emp[c] = np.mean(y == c)
+    y_flat = y.reshape(-1)
+    share_emp = np.bincount(y_flat, minlength=C).astype(np.float64) / float(y_flat.size)
     share_pred = np.mean(p, axis=(0, 1, 2))
 
     return {
@@ -161,46 +160,12 @@ def predictive_metrics_from_choice_probs(
     }
 
 
-def baseline_metrics_from_choices(
-    y_mit: Any, J: int | None = None, eps: float = 1e-12
-) -> dict[str, Any]:
-    """
-    Baseline model (fallback): constant probabilities equal to empirical shares.
-    """
-    y = np.asarray(y_mit)
-    _require_ndim(y, 3, "y_mit")
-    try:
-        y_int = y.astype(np.int64, copy=False)
-    except Exception as e:
-        raise ValueError(
-            f"y_mit: expected integer-like, conversion failed ({e})"
-        ) from e
-
-    if J is None:
-        J = int(y_int.max())
-    if J < 1:
-        raise ValueError(f"baseline: expected J>=1, got J={J}")
-
-    M, N, T = y_int.shape
-    C = J + 1
-
-    share_emp = np.zeros((C,), dtype=np.float64)
-    for c in range(C):
-        share_emp[c] = np.mean(y_int == c)
-
-    p = np.broadcast_to(share_emp, (M, N, T, C)).copy()
-    mets = predictive_metrics_from_choice_probs(y_int, p, eps=eps)
-
-    return {**mets, "baseline_shares": share_emp.copy()}
-
-
 # =============================================================================
 # Parameter recovery
 # =============================================================================
 
 
 _MEAN_RECOVERY_ORDER = [
-    # model formulation order (mean-comparable blocks)
     "beta_market_mj",
     "beta_habit_j",
     "beta_peer_j",
@@ -210,7 +175,6 @@ _MEAN_RECOVERY_ORDER = [
 ]
 
 _STD_RECOVERY_ORDER = [
-    # centered / mean-not-informative blocks, model formulation order
     "beta_dow_m",
     "beta_dow_j",
     "a_j",
@@ -221,7 +185,8 @@ _STD_RECOVERY_ORDER = [
 def _rmse(a: np.ndarray, b: np.ndarray) -> float:
     if a.size == 0:
         return 0.0
-    return float(np.sqrt(np.mean((a - b) ** 2)))
+    d = a - b
+    return float(np.sqrt(np.mean(d * d)))
 
 
 def parameter_recovery_metrics(
@@ -238,7 +203,6 @@ def parameter_recovery_metrics(
     mean_block: dict[str, Any] = {}
     std_block: dict[str, Any] = {}
 
-    # Mean-comparable
     for k in _MEAN_RECOVERY_ORDER:
         if k not in theta_true:
             raise ValueError(f"theta_true missing key '{k}'")
@@ -261,7 +225,6 @@ def parameter_recovery_metrics(
             "bias": float(mh - mt),
         }
 
-    # Std-comparable
     for k in _STD_RECOVERY_ORDER:
         if k not in theta_true:
             raise ValueError(f"theta_true missing key '{k}'")
@@ -295,15 +258,17 @@ def parameter_recovery_metrics(
 def evaluate_bonus2(
     y_mit: Any,
     p_choice_hat_mntc: Any,
+    p_choice_baseline_mntc: Any,
     theta_hat: dict[str, Any] | None = None,
     theta_true: dict[str, Any] | None = None,
     p_choice_oracle_mntc: Any | None = None,
     mcmc: dict[str, Any] | None = None,
     eps: float = 1e-12,
-    p_choice_baseline_mntc: Any | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate fitted probabilities against observed choices.
+
+    Baseline is required and must be passed as probabilities.
 
     Output schema:
       {
@@ -317,19 +282,14 @@ def evaluate_bonus2(
     y, p_hat, M, N, T, J = _validate_choice_panel_shapes(
         y_mit, p_choice_hat_mntc, "p_choice_hat_mntc"
     )
+    _, p_base, _, _, _, _ = _validate_choice_panel_shapes(
+        y, p_choice_baseline_mntc, "p_choice_baseline_mntc"
+    )
 
-    models: dict[str, Any] = {}
-
-    # Baseline: caller-provided probabilities (preferred) or fallback constant-share baseline.
-    if p_choice_baseline_mntc is not None:
-        _, p_base, _, _, _, _ = _validate_choice_panel_shapes(
-            y, p_choice_baseline_mntc, "p_choice_baseline_mntc"
-        )
-        models["baseline"] = predictive_metrics_from_choice_probs(y, p_base, eps=eps)
-    else:
-        models["baseline"] = baseline_metrics_from_choices(y, J=J, eps=eps)
-
-    models["fitted"] = predictive_metrics_from_choice_probs(y, p_hat, eps=eps)
+    models: dict[str, Any] = {
+        "baseline": predictive_metrics_from_choice_probs(y, p_base, eps=eps),
+        "fitted": predictive_metrics_from_choice_probs(y, p_hat, eps=eps),
+    }
 
     if p_choice_oracle_mntc is not None:
         _, p_oracle, _, _, _, _ = _validate_choice_panel_shapes(
@@ -337,21 +297,21 @@ def evaluate_bonus2(
         )
         models["oracle"] = predictive_metrics_from_choice_probs(y, p_oracle, eps=eps)
 
-    # Deltas (schema-driven)
     base = models["baseline"]
     fit = models["fitted"]
 
-    deltas: dict[str, dict[str, float]] = {}
-    deltas["fitted_vs_baseline"] = {
-        "delta_nll": float(base["nll_per_obs"] - fit["nll_per_obs"]),
-        "delta_acc": float(fit["acc"] - base["acc"]),
+    deltas: dict[str, dict[str, float]] = {
+        "fitted_vs_baseline": {
+            "delta_nll": float(fit["nll_per_obs"] - base["nll_per_obs"]),
+            "delta_acc": float(fit["acc"] - base["acc"]),
+        }
     }
 
     if "oracle" in models:
         ora = models["oracle"]
         deltas["fitted_vs_oracle"] = {
             "delta_nll": float(fit["nll_per_obs"] - ora["nll_per_obs"]),
-            "delta_acc": float(ora["acc"] - fit["acc"]),
+            "delta_acc": float(fit["acc"] - ora["acc"]),
         }
 
     out: dict[str, Any] = {
@@ -360,13 +320,11 @@ def evaluate_bonus2(
         "deltas": deltas,
     }
 
-    # Optional parameter recovery
     if theta_true is not None:
         if theta_hat is None:
             raise ValueError("theta_true provided but theta_hat is None")
         out["param"] = {"hat": parameter_recovery_metrics(theta_true, theta_hat)}
 
-    # Optional MCMC acceptance (schema-driven)
     if mcmc is not None and isinstance(mcmc, dict):
         accept_rates = mcmc.get("accept_rates", mcmc.get("accept", {}))
         n_saved = mcmc.get("n_saved", None)
@@ -450,16 +408,15 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
     if dvb is not None:
         lines.append("")
         lines.append(
-            f"gain vs baseline: Δnll={dvb['delta_nll']:.6f} | Δacc={dvb['delta_acc']:.6f}"
+            f"fitted - baseline: Δnll={dvb['delta_nll']:.6f} | Δacc={dvb['delta_acc']:.6f}"
         )
 
     dvo = deltas.get("fitted_vs_oracle", None)
     if dvo is not None:
         lines.append(
-            f"fitted - oracle: Δnll={dvo['delta_nll']:.6f} | Δacc={dvo['delta_acc']:.6f}"
+            f"fitted - oracle:   Δnll={dvo['delta_nll']:.6f} | Δacc={dvo['delta_acc']:.6f}"
         )
 
-    # Parameter recovery (hat): split into mean vs std sections, fixed order
     if params is not None and isinstance(params, dict) and "hat" in params:
         hat = params["hat"]
         if isinstance(hat, dict):
@@ -514,7 +471,6 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
                         f"{f6(float(pk['bias_std']))}"
                     )
 
-    # MCMC acceptance (ordered by model formulation)
     if isinstance(mcmc, dict):
         rates = mcmc.get("accept_rates", {})
         n_saved = mcmc.get("n_saved", None)
@@ -528,7 +484,6 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
             lines.append(a_header)
             lines.append("-" * len(a_header))
 
-            # Model-formulation order for blocks (then any extras)
             ordered = [
                 "beta_market",
                 "beta_habit",
@@ -541,18 +496,17 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
                 "a_j",
                 "b_j",
             ]
-            printed = []
+            printed: set[str] = set()
             vals: list[float] = []
 
             for k in ordered:
                 if k in rates:
                     r = float(rates[k])
-                    printed.append(k)
+                    printed.add(k)
                     vals.append(r)
                     lines.append(f"{k:<14}{r:>10.4f}")
 
-            extras = sorted([k for k in rates.keys() if k not in set(printed)])
-            for k in extras:
+            for k in sorted([k for k in rates.keys() if k not in printed]):
                 r = float(rates[k])
                 vals.append(r)
                 lines.append(f"{k:<14}{r:>10.4f}")

@@ -40,7 +40,13 @@ Likelihood contributions:
 
 Supported log-posterior views:
   - "all": scalar (sum over M,N,T)
-  - "m":   (M,)   (sum over N,T)   [valid only when updating a block with leading dim M]
+  - "m":   (M,)   (sum over N,T)
+
+When is view="m" valid?
+  - view="m" is valid for blocks whose leading dimension is M (market-leading blocks),
+    because the model factorizes by market (no cross-market edges/terms).
+  - There is no analogous "productwise" factorization because the MNL denominator
+    couples products within a market-time.
 """
 
 from __future__ import annotations
@@ -103,7 +109,6 @@ def logprior_decay_beta_kappa1_on_z(
     kappa = tf.cast(kappa_decay, tf.float64)
 
     eps = tf.cast(decay_rate_eps, tf.float64)
-    # Never allow exact 0/1 inside logs.
     eps_safe = tf.maximum(eps, tf.constant(1e-12, tf.float64))
 
     decay = tf.math.sigmoid(z)
@@ -178,8 +183,6 @@ def _reduce_lp(lp_block: tf.Tensor, view: str) -> tf.Tensor:
         return tf.reduce_sum(lp_block)
 
     if view == "m":
-        # Sum over all axes except the leading axis.
-        # If lp_block is rank-1 (M,), this is a no-op.
         rank = tf.rank(lp_block)
         axes = tf.range(1, rank)
         return tf.reduce_sum(lp_block, axis=axes)
@@ -240,8 +243,19 @@ def _logpost_decay_rate_j_all(
     return ll + lp
 
 
+def _gather_market(x_m: tf.Tensor, m: tf.Tensor) -> tf.Tensor:
+    """Select a single market contribution from a (M,) tensor."""
+    m = tf.cast(m, tf.int32)
+    return tf.gather(x_m, m)
+
+
 # =============================================================================
-# Per-block logpost wrappers (use view="all" for correctness under MNL coupling)
+# Per-block logpost wrappers
+# =============================================================================
+#
+# - Use *_all for a scalar target.
+# - Use *_m for marketwise (M,) targets; valid for market-leading blocks only.
+# - Use *_at_m for a scalar target for a specific market m (convenience for row-wise updates).
 # =============================================================================
 
 
@@ -351,8 +365,19 @@ def logpost_z_b_j_all(
 
 
 # =============================================================================
-# Optional: marketwise views (safe only when the updated block factorizes by market)
+# Marketwise views (valid for market-leading blocks only)
 # =============================================================================
+
+
+def logpost_z_beta_market_mj_m(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+) -> tf.Tensor:
+    """(M,) log posterior view for updating z_beta_market_mj (marketwise reduction)."""
+    return _logpost_view(
+        z=z, z_key="z_beta_market_mj", view="m", inputs=inputs, sigma_z=sigma_z
+    )
 
 
 def logpost_z_beta_dow_m_m(
@@ -382,3 +407,52 @@ def logpost_z_b_m_m(
 ) -> tf.Tensor:
     """(M,) log posterior view for updating z_b_m (marketwise reduction)."""
     return _logpost_view(z=z, z_key="z_b_m", view="m", inputs=inputs, sigma_z=sigma_z)
+
+
+# =============================================================================
+# Single-market scalar conveniences (for row-wise market updates)
+# =============================================================================
+
+
+def logpost_z_beta_market_mj_at_m(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+    m: tf.Tensor,
+) -> tf.Tensor:
+    """Scalar log posterior contribution for market m for z_beta_market_mj."""
+    return _gather_market(
+        logpost_z_beta_market_mj_m(z=z, inputs=inputs, sigma_z=sigma_z), m
+    )
+
+
+def logpost_z_beta_dow_m_at_m(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+    m: tf.Tensor,
+) -> tf.Tensor:
+    """Scalar log posterior contribution for market m for z_beta_dow_m."""
+    return _gather_market(
+        logpost_z_beta_dow_m_m(z=z, inputs=inputs, sigma_z=sigma_z), m
+    )
+
+
+def logpost_z_a_m_at_m(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+    m: tf.Tensor,
+) -> tf.Tensor:
+    """Scalar log posterior contribution for market m for z_a_m."""
+    return _gather_market(logpost_z_a_m_m(z=z, inputs=inputs, sigma_z=sigma_z), m)
+
+
+def logpost_z_b_m_at_m(
+    z: dict[str, tf.Tensor],
+    inputs: dict[str, tf.Tensor],
+    sigma_z: dict[str, tf.Tensor],
+    m: tf.Tensor,
+) -> tf.Tensor:
+    """Scalar log posterior contribution for market m for z_b_m."""
+    return _gather_market(logpost_z_b_m_m(z=z, inputs=inputs, sigma_z=sigma_z), m)

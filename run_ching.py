@@ -466,24 +466,25 @@ def run_phase3_evaluation(
     I_max = int(cfg["I_max"])
     pi0 = uniform_pi_I0(I_max)
 
-    inputs = StockpilingInputs(
-        a_mnjt=tf.convert_to_tensor(np.asarray(panel["a_mnjt"]), dtype=tf.float64),
-        s_mjt=tf.convert_to_tensor(np.asarray(panel["p_state_mjt"]), dtype=tf.int32),
-        u_mj=tf.convert_to_tensor(np.asarray(panel["u_mj"]), dtype=tf.float64),
-        P_price_mj=tf.convert_to_tensor(np.asarray(P_price_mj), dtype=tf.float64),
-        price_vals_mj=tf.convert_to_tensor(np.asarray(price_vals_mj), dtype=tf.float64),
-        lambda_mn=tf.convert_to_tensor(
+    inputs: StockpilingInputs = {
+        "a_mnjt": tf.convert_to_tensor(np.asarray(panel["a_mnjt"]), dtype=tf.float64),
+        "s_mjt": tf.convert_to_tensor(np.asarray(panel["p_state_mjt"]), dtype=tf.int32),
+        "u_mj": tf.convert_to_tensor(np.asarray(panel["u_mj"]), dtype=tf.float64),
+        "P_price_mj": tf.convert_to_tensor(np.asarray(P_price_mj), dtype=tf.float64),
+        "price_vals_mj": tf.convert_to_tensor(
+            np.asarray(price_vals_mj), dtype=tf.float64
+        ),
+        "lambda_mn": tf.convert_to_tensor(
             np.asarray(panel["lambda_mn"]), dtype=tf.float64
         ),
-        I_max=I_max,
-        waste_cost=float(cfg["waste_cost"]),
-        tol=float(cfg["dp_tol"]),
-        max_iter=int(cfg["dp_max_iter"]),
-        z=None,
-        init_I_dist=tf.convert_to_tensor(pi0, dtype=tf.float64),
-        inventory_maps=None,
-        use_ccp_cache=True,
-    )
+        "I_max": I_max,
+        "waste_cost": float(cfg["waste_cost"]),
+        "tol": float(cfg["dp_tol"]),
+        "max_iter": int(cfg["dp_max_iter"]),
+        "init_I_dist": tf.convert_to_tensor(pi0, dtype=tf.float64),
+        "inventory_maps": None,
+        "use_ccp_cache": True,
+    }
 
     theta_hat_tf = {
         "beta": tf.convert_to_tensor(theta_hat["beta"], dtype=tf.float64),

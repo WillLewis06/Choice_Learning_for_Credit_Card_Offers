@@ -31,6 +31,7 @@ Unconstrained parameters z (RW-MH on z-space):
 Notes:
   - lambda_mn is treated as known input data and is not estimated.
   - u_scale can be "frozen" for testing by setting k["u_scale"] = 0.0 (skips the update).
+  - `self.inputs` is a plain dict-like mapping (no dataclass); it contains only fixed data.
 """
 
 from __future__ import annotations
@@ -111,22 +112,23 @@ class StockpilingEstimator:
         self.rng = tf.random.Generator.from_seed(int(rng_seed))
         inventory_maps = model.build_inventory_maps(self.I_max)
 
-        self.inputs = StockpilingInputs(
-            a_mnjt=tf.convert_to_tensor(a_mnjt, dtype=tf.float64),
-            s_mjt=tf.convert_to_tensor(p_state_mjt, dtype=tf.int32),
-            u_mj=tf.convert_to_tensor(u_mj, dtype=tf.float64),
-            P_price_mj=tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
-            price_vals_mj=tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
-            lambda_mn=tf.convert_to_tensor(lambda_mn, dtype=tf.float64),
-            I_max=self.I_max,
-            waste_cost=float(waste_cost),
-            tol=float(tol),
-            max_iter=int(max_iter),
-            z=None,
-            init_I_dist=tf.convert_to_tensor(pi_I0, dtype=tf.float64),
-            inventory_maps=inventory_maps,
-            use_ccp_cache=bool(use_ccp_cache),
-        )
+        # Fixed inputs passed into the posterior/likelihood (dict-like mapping).
+        # Do NOT attach any current parameter state (no "z" field).
+        self.inputs: StockpilingInputs = {
+            "a_mnjt": tf.convert_to_tensor(a_mnjt, dtype=tf.float64),
+            "s_mjt": tf.convert_to_tensor(p_state_mjt, dtype=tf.int32),
+            "u_mj": tf.convert_to_tensor(u_mj, dtype=tf.float64),
+            "P_price_mj": tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
+            "price_vals_mj": tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
+            "lambda_mn": tf.convert_to_tensor(lambda_mn, dtype=tf.float64),
+            "I_max": self.I_max,
+            "waste_cost": float(waste_cost),
+            "tol": float(tol),
+            "max_iter": int(max_iter),
+            "init_I_dist": tf.convert_to_tensor(pi_I0, dtype=tf.float64),
+            "inventory_maps": inventory_maps,
+            "use_ccp_cache": bool(use_ccp_cache),
+        }
 
         self.sigma_z: dict[str, tf.Tensor] = {
             "z_beta": tf.constant(float(sigmas["z_beta"]), dtype=tf.float64),

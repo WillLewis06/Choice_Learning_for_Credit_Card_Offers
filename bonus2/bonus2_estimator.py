@@ -36,6 +36,8 @@ Public API:
 Notes:
   - No traces are stored; only the last draw is returned.
   - Returned theta_* are in the identified (centered) form consistent with the DGP.
+  - MCMC updates for large matrix blocks are row-wise (one market row / one product row
+    per call) while _mcmc_iteration_step remains a compiled tf.function graph.
 """
 
 from __future__ import annotations
@@ -48,16 +50,16 @@ import tensorflow as tf
 from bonus2 import bonus2_model as model
 
 from bonus2.bonus2_updates import (
-    update_z_a_j,
-    update_z_a_m,
-    update_z_b_j,
-    update_z_b_m,
-    update_z_beta_dow_j,
-    update_z_beta_dow_m,
+    update_z_beta_market_mj_row,
     update_z_beta_habit_j,
-    update_z_beta_market_mj,
     update_z_beta_peer_j,
     update_z_decay_rate_j,
+    update_z_beta_dow_m_row,
+    update_z_beta_dow_j_row,
+    update_z_a_m_row,
+    update_z_b_m_row,
+    update_z_a_j_row,
+    update_z_b_j_row,
 )
 
 try:
@@ -65,7 +67,6 @@ try:
 except Exception:  # pragma: no cover
 
     def report_iteration_progress(z: dict[str, tf.Tensor], it: tf.Tensor) -> None:
-        # Minimal fallback (kept TF-safe for @tf.function call sites).
         means = []
         for k in sorted(z.keys()):
             x = tf.cast(z[k], tf.float64)
@@ -144,15 +145,17 @@ def _neighbors_to_peer_adj_m(
 
 class Bonus2Estimator:
     """
-    Estimate Bonus Q2 parameters with elementwise RW-MH on unconstrained z-blocks.
+    Estimate Bonus Q2 parameters with RW-MH on unconstrained z-blocks.
 
-    Block shapes:
-      - Market-product (M,J): z_beta_market_mj
-      - Product (J,):        z_beta_habit_j, z_beta_peer_j, z_decay_rate_j
-      - Market×DOW (M,7):    z_beta_dow_m
-      - Product×DOW (J,7):   z_beta_dow_j
-      - Market×K (M,K):      z_a_m, z_b_m
-      - Product×K (J,K):     z_a_j, z_b_j
+    Large matrix blocks are updated row-wise (within a compiled tf.function sweep):
+      - Market×Product (M,J): z_beta_market_mj updated one market row at a time
+      - Market×DOW (M,7):     z_beta_dow_m updated one market row at a time
+      - Market×K (M,K):       z_a_m, z_b_m updated one market row at a time
+      - Product×DOW (J,7):    z_beta_dow_j updated one product row at a time
+      - Product×K (J,K):      z_a_j, z_b_j updated one product row at a time
+
+    Small vector blocks are updated as single calls per sweep:
+      - Product (J,): z_beta_habit_j, z_beta_peer_j, z_decay_rate_j
     """
 
     def __init__(
@@ -194,12 +197,10 @@ class Bonus2Estimator:
             )
 
         if int(sin_np.shape[1]) == self.T:
-            # (K,T)
             self.K = int(sin_np.shape[0])
             sin_np_kt = sin_np
             cos_np_kt = cos_np
         elif int(sin_np.shape[0]) == self.T:
-            # (T,K) -> (K,T)
             self.K = int(sin_np.shape[1])
             sin_np_kt = sin_np.T
             cos_np_kt = cos_np.T
@@ -225,6 +226,7 @@ class Bonus2Estimator:
         self.peer_adj_m = _neighbors_to_peer_adj_m(neighbors, M=self.M, N=self.N)
 
         self.L = tf.convert_to_tensor(int(L), dtype=tf.int32)
+
         self.kappa_decay = tf.convert_to_tensor(float(kappa_decay), dtype=tf.float64)
         if float(kappa_decay) <= 0.0:
             raise ValueError("kappa_decay must be > 0")
@@ -234,9 +236,6 @@ class Bonus2Estimator:
         )
 
         # ---- prior scales over z (scalar float64 tensors) ----
-        # Expected sigma_z keys (z-space):
-        #   z_beta_market_mj, z_beta_habit_j, z_beta_peer_j, z_decay_rate_j,
-        #   z_beta_dow_m, z_beta_dow_j, z_a_m, z_b_m, z_a_j, z_b_j
         self.sigma_z: dict[str, tf.Tensor] = {
             k: tf.convert_to_tensor(float(v), dtype=tf.float64)
             for k, v in sigmas.items()
@@ -352,7 +351,7 @@ class Bonus2Estimator:
         # ---- sweep counter (used for acceptance-rate denominators) ----
         self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
 
-        # ---- block sizes for acceptance-rate denominators ----
+        # ---- element counts for acceptance-rate denominators (elementwise rates) ----
         self._block_sizes: dict[str, int] = {
             "beta_market": self.M * self.J,
             "beta_habit": self.J,
@@ -406,7 +405,7 @@ class Bonus2Estimator:
           - theta_init: initial parameters (identified)
           - theta_hat: last-draw parameters (identified)
           - n_saved: number of sweeps completed
-          - accept: acceptance rates per block (accepted / (n_saved * block_size))
+          - accept: acceptance rates per block (accepted_elements / (n_saved * block_size))
         """
         theta_last = self._theta_identified_from_z(
             self._current_z_dict(), as_numpy=False
@@ -456,14 +455,11 @@ class Bonus2Estimator:
         """
         theta = model.unconstrained_to_theta(z_dict)
 
-        # Optional numeric clip for decay_rate_j.
         eps = self.inputs.get("decay_rate_eps", tf.constant(0.0, tf.float64))
         eps_f = float(eps.numpy()) if isinstance(eps, tf.Tensor) else float(eps)
         if eps_f > 0.0:
             theta["decay_rate_j"] = tf.clip_by_value(
-                tf.cast(theta["decay_rate_j"], tf.float64),
-                eps_f,
-                1.0 - eps_f,
+                tf.cast(theta["decay_rate_j"], tf.float64), eps_f, 1.0 - eps_f
             )
 
         beta_dow_m, beta_dow_j, a_j, b_j = model.apply_identifiability_constraints_tf(
@@ -495,56 +491,30 @@ class Bonus2Estimator:
         inputs = self.inputs
         sigma_z = self.sigma_z
 
-        # Current z blocks (as Variables).
-        z_beta_market_mj = self.z["z_beta_market_mj"]
-        z_beta_habit_j = self.z["z_beta_habit_j"]
-        z_beta_peer_j = self.z["z_beta_peer_j"]
-        z_decay_rate_j = self.z["z_decay_rate_j"]
-        z_beta_dow_m = self.z["z_beta_dow_m"]
-        z_beta_dow_j = self.z["z_beta_dow_j"]
-        z_a_m = self.z["z_a_m"]
-        z_b_m = self.z["z_b_m"]
-        z_a_j = self.z["z_a_j"]
-        z_b_j = self.z["z_b_j"]
+        z_dict = self._current_z_dict()
 
-        # ---- per-block updates ----
+        # ---- Market×Product intercept: update one market row at a time ----
+        for m in tf.range(self.M):
+            z_new, accepted = update_z_beta_market_mj_row(
+                rng=self.rng,
+                k=self.k["beta_market"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                m=m,
+            )
+            self.z["z_beta_market_mj"].assign(z_new)
+            self.accept["beta_market"].assign_add(
+                tf.reduce_sum(tf.cast(accepted, tf.int32))
+            )
 
-        z_new, accepted = update_z_beta_market_mj(
-            rng=self.rng,
-            k=self.k["beta_market"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=z_beta_market_mj,
-            z_beta_habit_j=z_beta_habit_j,
-            z_beta_peer_j=z_beta_peer_j,
-            z_decay_rate_j=z_decay_rate_j,
-            z_beta_dow_m=z_beta_dow_m,
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_beta_market_mj"].assign(z_new)
-        self.accept["beta_market"].assign_add(
-            tf.reduce_sum(tf.cast(accepted, tf.int32))
-        )
-
+        # ---- Product vectors (single update each) ----
         z_new, accepted = update_z_beta_habit_j(
             rng=self.rng,
             k=self.k["beta_habit"],
             inputs=inputs,
             sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=z_beta_habit_j,
-            z_beta_peer_j=z_beta_peer_j,
-            z_decay_rate_j=z_decay_rate_j,
-            z_beta_dow_m=z_beta_dow_m,
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
+            z=z_dict,
         )
         self.z["z_beta_habit_j"].assign(z_new)
         self.accept["beta_habit"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
@@ -554,16 +524,7 @@ class Bonus2Estimator:
             k=self.k["beta_peer"],
             inputs=inputs,
             sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=z_beta_peer_j,
-            z_decay_rate_j=z_decay_rate_j,
-            z_beta_dow_m=z_beta_dow_m,
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
+            z=z_dict,
         )
         self.z["z_beta_peer_j"].assign(z_new)
         self.accept["beta_peer"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
@@ -573,133 +534,84 @@ class Bonus2Estimator:
             k=self.k["decay_rate"],
             inputs=inputs,
             sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=z_decay_rate_j,
-            z_beta_dow_m=z_beta_dow_m,
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
+            z=z_dict,
         )
         self.z["z_decay_rate_j"].assign(z_new)
         self.accept["decay_rate"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_beta_dow_m(
-            rng=self.rng,
-            k=self.k["beta_dow_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=z_beta_dow_m,
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_beta_dow_m"].assign(z_new)
-        self.accept["beta_dow_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        # ---- Market-leading time blocks: one market row at a time ----
+        for m in tf.range(self.M):
+            z_new, accepted = update_z_beta_dow_m_row(
+                rng=self.rng,
+                k=self.k["beta_dow_m"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                m=m,
+            )
+            self.z["z_beta_dow_m"].assign(z_new)
+            self.accept["beta_dow_m"].assign_add(
+                tf.reduce_sum(tf.cast(accepted, tf.int32))
+            )
 
-        z_new, accepted = update_z_beta_dow_j(
-            rng=self.rng,
-            k=self.k["beta_dow_j"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=self.z["z_beta_dow_m"],
-            z_beta_dow_j=z_beta_dow_j,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_beta_dow_j"].assign(z_new)
-        self.accept["beta_dow_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+            z_new, accepted = update_z_a_m_row(
+                rng=self.rng,
+                k=self.k["a_m"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                m=m,
+            )
+            self.z["z_a_m"].assign(z_new)
+            self.accept["a_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_a_m(
-            rng=self.rng,
-            k=self.k["a_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=self.z["z_beta_dow_m"],
-            z_beta_dow_j=self.z["z_beta_dow_j"],
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_a_m"].assign(z_new)
-        self.accept["a_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+            z_new, accepted = update_z_b_m_row(
+                rng=self.rng,
+                k=self.k["b_m"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                m=m,
+            )
+            self.z["z_b_m"].assign(z_new)
+            self.accept["b_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_b_m(
-            rng=self.rng,
-            k=self.k["b_m"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=self.z["z_beta_dow_m"],
-            z_beta_dow_j=self.z["z_beta_dow_j"],
-            z_a_m=self.z["z_a_m"],
-            z_b_m=z_b_m,
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_b_m"].assign(z_new)
-        self.accept["b_m"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+        # ---- Product-leading time blocks: one product row at a time ----
+        for j in tf.range(self.J):
+            z_new, accepted = update_z_beta_dow_j_row(
+                rng=self.rng,
+                k=self.k["beta_dow_j"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                j=j,
+            )
+            self.z["z_beta_dow_j"].assign(z_new)
+            self.accept["beta_dow_j"].assign_add(
+                tf.reduce_sum(tf.cast(accepted, tf.int32))
+            )
 
-        z_new, accepted = update_z_a_j(
-            rng=self.rng,
-            k=self.k["a_j"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=self.z["z_beta_dow_m"],
-            z_beta_dow_j=self.z["z_beta_dow_j"],
-            z_a_m=self.z["z_a_m"],
-            z_b_m=self.z["z_b_m"],
-            z_a_j=z_a_j,
-            z_b_j=z_b_j,
-        )
-        self.z["z_a_j"].assign(z_new)
-        self.accept["a_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+            z_new, accepted = update_z_a_j_row(
+                rng=self.rng,
+                k=self.k["a_j"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                j=j,
+            )
+            self.z["z_a_j"].assign(z_new)
+            self.accept["a_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
-        z_new, accepted = update_z_b_j(
-            rng=self.rng,
-            k=self.k["b_j"],
-            inputs=inputs,
-            sigma_z=sigma_z,
-            z_beta_market_mj=self.z["z_beta_market_mj"],
-            z_beta_habit_j=self.z["z_beta_habit_j"],
-            z_beta_peer_j=self.z["z_beta_peer_j"],
-            z_decay_rate_j=self.z["z_decay_rate_j"],
-            z_beta_dow_m=self.z["z_beta_dow_m"],
-            z_beta_dow_j=self.z["z_beta_dow_j"],
-            z_a_m=self.z["z_a_m"],
-            z_b_m=self.z["z_b_m"],
-            z_a_j=self.z["z_a_j"],
-            z_b_j=z_b_j,
-        )
-        self.z["z_b_j"].assign(z_new)
-        self.accept["b_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
+            z_new, accepted = update_z_b_j_row(
+                rng=self.rng,
+                k=self.k["b_j"],
+                inputs=inputs,
+                sigma_z=sigma_z,
+                z=z_dict,
+                j=j,
+            )
+            self.z["z_b_j"].assign(z_new)
+            self.accept["b_j"].assign_add(tf.reduce_sum(tf.cast(accepted, tf.int32)))
 
         # ---- sweep counter + diagnostics ----
         self.saved.assign_add(1)
