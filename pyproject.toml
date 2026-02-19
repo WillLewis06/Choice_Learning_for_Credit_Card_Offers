@@ -23,7 +23,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-pythonpath = [".", "tests/lu", "tests/ching"]
+pythonpath = [".", "tests/lu", "tests/ching", "tests/zhang", "tests/bonus2"]
 
 [tool.setuptools.packages.find]
 where = ["."]
