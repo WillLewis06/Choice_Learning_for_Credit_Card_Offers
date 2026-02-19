@@ -63,6 +63,7 @@ Notes
 - Market-level seasonality only (no product seasonality).
 - Product-level DOW only (binary weekday/weekend; no market DOW).
 - Product intercept shift only (no market×product intercept beyond delta).
+- All input validation is centralized in bonus2/bonus2_input_validation.py.
 """
 
 from __future__ import annotations
@@ -70,6 +71,11 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+
+from bonus2.bonus2_input_validation import (
+    validate_bonus2_dgp_inputs,
+    validate_bonus2_panel,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -398,6 +404,20 @@ def simulate_bonus2_dgp(
     peer_lookback_L: int,
 ):
     """Simulate multi-market data for Bonus Q2 under the updated spec."""
+    validate_bonus2_dgp_inputs(
+        delta=delta,
+        N=N,
+        T=T,
+        avg_friends=avg_friends,
+        params_true=params_true,
+        decay=decay,
+        seed=seed,
+        season_period=season_period,
+        friends_sd=friends_sd,
+        K=K,
+        peer_lookback_L=peer_lookback_L,
+    )
+
     delta = np.asarray(delta, dtype=np.float64)
     M, J = delta.shape
 
@@ -444,7 +464,7 @@ def simulate_bonus2_dgp(
             peer_lookback_L=peer_lookback_L,
         )
 
-    return {
+    panel = {
         # observed / known inputs
         "y": y,
         "delta": delta,
@@ -468,3 +488,6 @@ def simulate_bonus2_dgp(
         "peer_lookback_L": int(peer_lookback_L),
         "params_true": params_true,
     }
+
+    validate_bonus2_panel(panel)
+    return panel

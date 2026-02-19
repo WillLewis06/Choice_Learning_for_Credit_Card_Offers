@@ -43,6 +43,11 @@ import tensorflow as tf
 
 from ching import stockpiling_model as model
 from ching.stockpiling_diagnostics import report_iteration_progress
+from ching.stockpiling_input_validation import (
+    normalize_stockpiling_estimator_fit_inputs,
+    normalize_stockpiling_estimator_init_inputs,
+    normalize_stockpiling_estimator_init_theta,
+)
 from ching.stockpiling_posterior import StockpilingInputs
 from ching.stockpiling_updates import (
     update_z_alpha_j,
@@ -89,45 +94,57 @@ class StockpilingEstimator:
           max_iter: Maximum iterations for the CCP solver.
           rng_seed: RNG seed for MCMC proposals.
         """
-        a_mnjt = np.asarray(a_mnjt, dtype=np.int32)
-        p_state_mjt = np.asarray(p_state_mjt, dtype=np.int32)
-        u_mj = np.asarray(u_mj, dtype=np.float64)
-        lambda_mn = np.asarray(lambda_mn, dtype=np.float64)
-        P_price_mj = np.asarray(P_price_mj, dtype=np.float64)
-        price_vals_mj = np.asarray(price_vals_mj, dtype=np.float64)
-        pi_I0 = np.asarray(pi_I0, dtype=np.float64)
+        norm = normalize_stockpiling_estimator_init_inputs(
+            a_mnjt=a_mnjt,
+            p_state_mjt=p_state_mjt,
+            u_mj=u_mj,
+            price_vals_mj=price_vals_mj,
+            P_price_mj=P_price_mj,
+            lambda_mn=lambda_mn,
+            I_max=I_max,
+            pi_I0=pi_I0,
+            waste_cost=waste_cost,
+            tol=tol,
+            max_iter=max_iter,
+            sigmas=dict(sigmas),
+            rng_seed=rng_seed,
+        )
 
-        M, N, J, T = a_mnjt.shape
-        S = int(price_vals_mj.shape[2])
+        self.M = int(norm["M"])
+        self.N = int(norm["N"])
+        self.J = int(norm["J"])
+        self.T = int(norm["T"])
+        self.S = int(norm["S"])
+        self.I_max = int(norm["I_max"])
 
-        self.M, self.N, self.J, self.T, self.S = int(M), int(N), int(J), int(T), int(S)
-        self.I_max = int(I_max)
-
-        self.rng = tf.random.Generator.from_seed(int(rng_seed))
+        self.rng = tf.random.Generator.from_seed(int(norm["rng_seed"]))
         inventory_maps = model.build_inventory_maps(self.I_max)
 
         # Fixed inputs passed into the posterior/likelihood (dict-like mapping).
         # Do NOT attach any current parameter state (no "z" field).
         self.inputs: StockpilingInputs = {
-            "a_mnjt": tf.convert_to_tensor(a_mnjt, dtype=tf.int32),
-            "s_mjt": tf.convert_to_tensor(p_state_mjt, dtype=tf.int32),
-            "u_mj": tf.convert_to_tensor(u_mj, dtype=tf.float64),
-            "P_price_mj": tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
-            "price_vals_mj": tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
-            "lambda_mn": tf.convert_to_tensor(lambda_mn, dtype=tf.float64),
-            "waste_cost": tf.constant(float(waste_cost), dtype=tf.float64),
-            "tol": float(tol),
-            "max_iter": int(max_iter),
-            "init_I_dist": tf.convert_to_tensor(pi_I0, dtype=tf.float64),
+            "a_mnjt": tf.convert_to_tensor(norm["a_mnjt"], dtype=tf.int32),
+            "s_mjt": tf.convert_to_tensor(norm["p_state_mjt"], dtype=tf.int32),
+            "u_mj": tf.convert_to_tensor(norm["u_mj"], dtype=tf.float64),
+            "P_price_mj": tf.convert_to_tensor(norm["P_price_mj"], dtype=tf.float64),
+            "price_vals_mj": tf.convert_to_tensor(
+                norm["price_vals_mj"], dtype=tf.float64
+            ),
+            "lambda_mn": tf.convert_to_tensor(norm["lambda_mn"], dtype=tf.float64),
+            "waste_cost": tf.constant(float(norm["waste_cost"]), dtype=tf.float64),
+            "tol": float(norm["tol"]),
+            "max_iter": int(norm["max_iter"]),
+            "init_I_dist": tf.convert_to_tensor(norm["pi_I0"], dtype=tf.float64),
             "inventory_maps": inventory_maps,
         }
 
+        sig = norm["sigmas"]
         self.sigma_z: dict[str, tf.Tensor] = {
-            "z_beta": tf.constant(float(sigmas["z_beta"]), dtype=tf.float64),
-            "z_alpha": tf.constant(float(sigmas["z_alpha"]), dtype=tf.float64),
-            "z_v": tf.constant(float(sigmas["z_v"]), dtype=tf.float64),
-            "z_fc": tf.constant(float(sigmas["z_fc"]), dtype=tf.float64),
-            "z_u_scale": tf.constant(float(sigmas["z_u_scale"]), dtype=tf.float64),
+            "z_beta": tf.constant(float(sig["z_beta"]), dtype=tf.float64),
+            "z_alpha": tf.constant(float(sig["z_alpha"]), dtype=tf.float64),
+            "z_v": tf.constant(float(sig["z_v"]), dtype=tf.float64),
+            "z_fc": tf.constant(float(sig["z_fc"]), dtype=tf.float64),
+            "z_u_scale": tf.constant(float(sig["z_u_scale"]), dtype=tf.float64),
         }
 
         self.z: dict[str, tf.Variable] = {}
@@ -136,36 +153,10 @@ class StockpilingEstimator:
         self.sum_theta: dict[str, tf.Variable] = {}
         self.saved = tf.Variable(0, dtype=tf.int32)
 
-    def _as_vec(self, x: Any, length: int, name: str, min_value: float) -> tf.Tensor:
-        """
-        Convert x to a float64 tensor of shape (length,).
-
-        If x is scalar, broadcasts to (length,).
-        If x is shape (length,), uses it directly.
-        """
-        a = np.asarray(x, dtype=np.float64)
-        if a.ndim == 0:
-            a = np.full((length,), float(a), dtype=np.float64)
-        if a.shape != (length,):
-            raise ValueError(
-                f"{name}: expected scalar or shape ({length},), got {a.shape}"
-            )
-        if not np.isfinite(a).all():
-            raise ValueError(f"{name}: expected finite values, got non-finite")
-        if (a <= min_value).any():
-            mn = float(a.min()) if a.size else float("nan")
-            raise ValueError(f"{name}: expected all > {min_value}, got min={mn}")
-        return tf.convert_to_tensor(a, dtype=tf.float64)
-
     def _reset_chain_state(
         self, init_theta: Mapping[str, Any], k: Mapping[str, float]
     ) -> None:
         """Initialize z, proposal scales, acceptance counters, and running sums."""
-        required_k = {"beta", "alpha", "v", "fc", "u_scale"}
-        missing_k = required_k - set(k.keys())
-        if missing_k:
-            raise ValueError(f"k: missing keys {sorted(missing_k)}")
-
         self.k = {
             "beta": tf.constant(float(k["beta"]), dtype=tf.float64),
             "alpha": tf.constant(float(k["alpha"]), dtype=tf.float64),
@@ -175,15 +166,10 @@ class StockpilingEstimator:
         }
 
         beta0 = float(init_theta["beta"])
-        if not np.isfinite(beta0) or beta0 <= 0.0 or beta0 >= 1.0:
-            raise ValueError(f"init_theta['beta']: expected in (0,1), got {beta0}")
-
-        alpha0 = self._as_vec(init_theta["alpha"], self.J, "init_theta['alpha']", 0.0)
-        v0 = self._as_vec(init_theta["v"], self.J, "init_theta['v']", 0.0)
-        fc0 = self._as_vec(init_theta["fc"], self.J, "init_theta['fc']", 0.0)
-        u_scale0 = self._as_vec(
-            init_theta["u_scale"], self.M, "init_theta['u_scale']", 0.0
-        )
+        alpha0 = tf.convert_to_tensor(init_theta["alpha"], dtype=tf.float64)
+        v0 = tf.convert_to_tensor(init_theta["v"], dtype=tf.float64)
+        fc0 = tf.convert_to_tensor(init_theta["fc"], dtype=tf.float64)
+        u_scale0 = tf.convert_to_tensor(init_theta["u_scale"], dtype=tf.float64)
 
         beta0_tf = tf.constant(beta0, dtype=tf.float64)
         z_beta0 = tf.reshape(tf.math.log(beta0_tf / (1.0 - beta0_tf)), (1,))
@@ -334,12 +320,19 @@ class StockpilingEstimator:
             - "n_saved": number of saved draws
             - "z_last": final z-space state
         """
-        if int(n_iter) < 1:
-            raise ValueError(f"n_iter: expected >= 1, got {n_iter}")
+        fit_norm = normalize_stockpiling_estimator_fit_inputs(n_iter=n_iter, k=dict(k))
+        n_iter_n = int(fit_norm["n_iter"])
+        k_norm = fit_norm["k"]
 
-        self._reset_chain_state(init_theta=init_theta, k=k)
+        init_theta_norm = normalize_stockpiling_estimator_init_theta(
+            init_theta=dict(init_theta),
+            M=self.M,
+            J=self.J,
+        )
 
-        for it in range(int(n_iter)):
+        self._reset_chain_state(init_theta=init_theta_norm, k=k_norm)
+
+        for it in range(n_iter_n):
             self._mcmc_iteration_step(tf.constant(it, dtype=tf.int32))
 
         saved_f = tf.cast(tf.maximum(self.saved, 1), tf.float64)

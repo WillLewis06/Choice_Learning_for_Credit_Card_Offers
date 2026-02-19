@@ -50,6 +50,11 @@ from bonus2.bonus2_updates import (
     update_z_beta_peer_j,
 )
 
+from bonus2.bonus2_input_validation import (
+    validate_bonus2_estimator_fit_inputs,
+    validate_bonus2_estimator_init_inputs,
+)
+
 try:
     from bonus2.bonus2_diagnostics import report_iteration_progress
 except Exception:  # pragma: no cover
@@ -62,49 +67,43 @@ except Exception:  # pragma: no cover
         tf.print("[Bonus2] it=", it, "| mean(z)=", means)
 
 
-def _coerce_neighbors_to_list(neighbors: Any, M: int, N: int) -> list[list[list[int]]]:
-    """Coerce neighbor structure to nested Python lists: neighbors[m][i] -> list[int]."""
+def _coerce_neighbors_to_list(neighbors: Any) -> list[list[list[int]]]:
+    """Coerce neighbor structure to nested Python lists: neighbors[m][i] -> list[int].
+
+    This function performs parsing/coercion only. It does not validate:
+      - market/consumer dimensions (M,N),
+      - index bounds,
+      - duplicates or self-edges.
+
+    Those checks belong in bonus2_input_validation.py.
+    """
     nb = neighbors
     if isinstance(nb, tf.RaggedTensor):
         nb = nb.to_list()
     elif isinstance(nb, np.ndarray):
         nb = nb.tolist()
 
-    if not isinstance(nb, (list, tuple)) or len(nb) != M:
-        raise ValueError("neighbors must be a nested list/tuple with outer length M")
+    if not isinstance(nb, (list, tuple)):
+        raise ValueError("neighbors must be list/tuple (or convertible to one)")
 
     out: list[list[list[int]]] = []
-    for m in range(M):
-        rows = nb[m]
-        if not isinstance(rows, (list, tuple)) or len(rows) != N:
-            raise ValueError("neighbors[m] must have length N for each market m")
+    for rows in nb:
+        if not isinstance(rows, (list, tuple)):
+            raise ValueError("neighbors[m] must be list/tuple for each market m")
 
         rows_out: list[list[int]] = []
-        for i in range(N):
-            neigh_i = rows[i]
+        for neigh_i in rows:
             if neigh_i is None:
                 rows_out.append([])
                 continue
 
             if isinstance(neigh_i, np.ndarray):
                 neigh_i = neigh_i.tolist()
-            if isinstance(neigh_i, (list, tuple)):
-                neigh_list = [int(k) for k in neigh_i]
-            else:
-                neigh_list = [int(neigh_i)]
 
-            clean: list[int] = []
-            seen = set()
-            for k in neigh_list:
-                if k == i:
-                    continue
-                if k < 0 or k >= N:
-                    continue
-                if k in seen:
-                    continue
-                seen.add(k)
-                clean.append(k)
-            rows_out.append(clean)
+            if isinstance(neigh_i, (list, tuple)):
+                rows_out.append([int(k) for k in neigh_i])
+            else:
+                rows_out.append([int(neigh_i)])
 
         out.append(rows_out)
 
@@ -128,28 +127,33 @@ class Bonus2Estimator:
         sigmas: dict[str, float],
         seed: int,
     ) -> None:
-        # ---- infer dimensions ----
+        # ---- coerce neighbors then validate all inputs centrally ----
+        nbrs_m = _coerce_neighbors_to_list(neighbors)
+
+        validate_bonus2_estimator_init_inputs(
+            y_mit=y_mit,
+            delta_mj=delta_mj,
+            weekend_t=weekend_t,
+            season_sin_kt=season_sin_kt,
+            season_cos_kt=season_cos_kt,
+            neighbors=nbrs_m,
+            L=L,
+            decay=decay,
+            init_theta=init_theta,
+            sigmas=sigmas,
+            seed=seed,
+        )
+
+        # ---- infer dimensions (validated) ----
         y_np = np.asarray(y_mit)
-        if y_np.ndim != 3:
-            raise ValueError("y_mit must be 3D (M,N,T)")
         self.M, self.N, self.T = (int(x) for x in y_np.shape)
 
         delta_np = np.asarray(delta_mj, dtype=np.float64)
-        if delta_np.ndim != 2:
-            raise ValueError("delta_mj must be 2D (M,J)")
-        if int(delta_np.shape[0]) != self.M:
-            raise ValueError("delta_mj first axis must match y_mit markets (M)")
         self.J = int(delta_np.shape[1])
 
         # ---- seasonal basis: accept (K,T) or transpose from (T,K) ----
         sin_np = np.asarray(season_sin_kt, dtype=np.float64)
         cos_np = np.asarray(season_cos_kt, dtype=np.float64)
-        if sin_np.ndim != 2 or cos_np.ndim != 2:
-            raise ValueError("season_sin_kt and season_cos_kt must be 2D")
-        if sin_np.shape != cos_np.shape:
-            raise ValueError(
-                "season_sin_kt and season_cos_kt must have identical shape"
-            )
 
         if int(sin_np.shape[1]) == self.T:
             self.K = int(sin_np.shape[0])
@@ -159,19 +163,14 @@ class Bonus2Estimator:
             self.K = int(sin_np.shape[1])
             sin_np_kt = sin_np.T
             cos_np_kt = cos_np.T
-        else:
+        else:  # pragma: no cover
             raise ValueError(
                 "season_sin_kt/season_cos_kt must have T on one axis "
                 "(shape (K,T) or (T,K))"
             )
 
-        # ---- weekend indicator ----
-        w_np = np.asarray(weekend_t)
-        if w_np.ndim != 1 or int(w_np.shape[0]) != self.T:
-            raise ValueError("weekend_t must be 1D with length T")
-        # minimal validation: values must be 0/1
-        if not np.all((w_np == 0) | (w_np == 1)):
-            raise ValueError("weekend_t must contain only 0/1 values")
+        # ---- weekend indicator (validated to be {0,1}) ----
+        w_np = np.asarray(weekend_t, dtype=np.int32)
 
         # ---- convert to TF tensors ----
         self.y_mit = tf.convert_to_tensor(y_np, dtype=tf.int32)  # (M,N,T)
@@ -180,18 +179,13 @@ class Bonus2Estimator:
         self.season_sin_kt = tf.convert_to_tensor(sin_np_kt, dtype=tf.float64)  # (K,T)
         self.season_cos_kt = tf.convert_to_tensor(cos_np_kt, dtype=tf.float64)  # (K,T)
 
-        decay_f = float(decay)
-        if not (0.0 < decay_f < 1.0):
-            raise ValueError("decay must be in (0,1)")
-        self.decay = tf.convert_to_tensor(decay_f, dtype=tf.float64)
-
-        # ---- network: build peer_adj_m ----
-        nbrs_m = _coerce_neighbors_to_list(neighbors, M=self.M, N=self.N)
-        self.peer_adj_m = model.build_peer_adjacency(nbrs_m=nbrs_m, N=self.N)
-
+        self.decay = tf.convert_to_tensor(float(decay), dtype=tf.float64)
         self.L = tf.convert_to_tensor(int(L), dtype=tf.int32)
 
-        # ---- prior scales over z (scalar float64 tensors) ----
+        # ---- network: build peer_adj_m (validated) ----
+        self.peer_adj_m = model.build_peer_adjacency(nbrs_m=nbrs_m, N=self.N)
+
+        # ---- prior scales over z (scalar float64 tensors; validated keys/positivity) ----
         self.sigma_z: dict[str, tf.Tensor] = {
             k: tf.convert_to_tensor(float(v), dtype=tf.float64)
             for k, v in sigmas.items()
@@ -212,7 +206,7 @@ class Bonus2Estimator:
         # ---- RNG ----
         self.rng = tf.random.Generator.from_seed(int(seed))
 
-        # ---- initialize z explicitly from init_theta (scalar fills) ----
+        # ---- initialize z explicitly from init_theta (scalar fills; validated keys) ----
         beta_market0 = tf.convert_to_tensor(
             float(init_theta["beta_market"]), tf.float64
         )
@@ -284,9 +278,9 @@ class Bonus2Estimator:
           k: RW step sizes keyed by:
              {"beta_market","beta_habit","beta_peer","beta_dow_j","a_m","b_m"}
         """
+        validate_bonus2_estimator_fit_inputs(n_iter=n_iter, k=k)
+
         n_iter = int(n_iter)
-        if n_iter <= 0:
-            raise ValueError("n_iter must be > 0")
 
         self.k["beta_market"].assign(float(k["beta_market"]))
         self.k["beta_habit"].assign(float(k["beta_habit"]))

@@ -16,6 +16,7 @@ Notes:
     w_t                 (T,) in {0,1} where 1=weekend
     season_sin_kt       (K,T)
     season_cos_kt       (K,T)
+- All input validation is centralized in bonus2/bonus2_input_validation.py.
 """
 
 from __future__ import annotations
@@ -41,10 +42,15 @@ from bonus2.bonus2_evaluate import (  # noqa: E402
     evaluate_bonus2,
     format_evaluation_summary,
 )
-from bonus2.bonus2_diagnostics import (
+from bonus2.bonus2_diagnostics import (  # noqa: E402
     report_theta_summary,
     report_known_summary,
-)  # noqa: E402
+)
+
+from bonus2.bonus2_input_validation import (  # noqa: E402
+    validate_phase1_delta_hat,
+    validate_bonus2_panel,
+)
 
 # =============================================================================
 # Configuration
@@ -139,9 +145,8 @@ CFG_BONUS2 = {
 
 
 def _tile_delta_mj(delta_hat: np.ndarray, M: int) -> np.ndarray:
+    """Tile phase-1 delta_hat (J,) into delta_mj (M,J)."""
     delta_hat = np.asarray(delta_hat, dtype=np.float64)
-    if delta_hat.ndim != 1:
-        raise ValueError("delta_hat must be 1D (J,)")
     return np.tile(delta_hat[None, :], reps=(int(M), 1)).astype(np.float64)
 
 
@@ -309,6 +314,8 @@ def run_bonus2_dgp(
 def run_bonus2_estimation(cfg: dict[str, Any], panel: dict[str, Any]) -> dict[str, Any]:
     print("=== Bonus2 estimation ===")
 
+    validate_bonus2_panel(panel)
+
     est = Bonus2Estimator(
         y_mit=panel["y"],
         delta_mj=panel["delta"],
@@ -342,12 +349,9 @@ def main() -> None:
     out1 = run_phase1(CFG_PHASE1)
 
     delta_hat = out1["delta_hat"]
+    validate_phase1_delta_hat(delta_hat, num_products=CFG_PHASE1["num_products"])
+
     M = int(CFG_PHASE1["num_markets"])
-    J = int(CFG_PHASE1["num_products"])
-    if int(delta_hat.shape[0]) != J:
-        raise ValueError(
-            "Phase 1 delta_hat length does not match CFG_PHASE1['num_products']"
-        )
 
     # Build delta_mj for Bonus2 (fixed baseline utilities)
     delta_mj = _tile_delta_mj(delta_hat=delta_hat, M=M)

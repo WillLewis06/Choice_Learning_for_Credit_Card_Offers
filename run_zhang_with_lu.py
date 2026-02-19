@@ -339,7 +339,7 @@ def main() -> None:
     sd_u = 0.5
 
     depth = 5
-    width = 32
+    width = 64
     heads = 8
 
     epochs = 50

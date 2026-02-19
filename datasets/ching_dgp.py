@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ching.stockpiling_input_validation import validate_stockpiling_dgp_inputs
+from ching.stockpiling_input_validation import normalize_stockpiling_dgp_inputs
 
 
 def _logit(p: float) -> float:
@@ -55,18 +55,6 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
-# Draw on an unconstrained z-scale then transform:
-#   beta, lambda: sigmoid(z)
-#   alpha, v, fc: exp(z)
-theta_z_hypers: dict[str, dict[str, float]] = {
-    "beta": {"mu": _logit(0.71), "sd": 0.35},
-    "alpha": {"mu": float(np.log(0.27)), "sd": 0.50},
-    "v": {"mu": float(np.log(0.48)), "sd": 0.50},
-    "fc": {"mu": float(np.log(1.83)), "sd": 0.50},
-    "lambda": {"mu": _logit(0.30), "sd": 0.35},
-}
-
-
 def sample_theta_true(
     rng: np.random.Generator,
     M: int,
@@ -74,38 +62,26 @@ def sample_theta_true(
     J: int,
 ) -> dict[str, np.ndarray]:
     """
-    Sample true parameters under the target heterogeneity structure.
+    Sample "true" parameters used by the DGP.
 
-    Returns:
-      dict with:
-        - beta:               scalar float64 stored as a 0-d ndarray
-        - alpha, v, fc:       (J,) float64
-        - lambda:             (M,N) float64
+    Returns dict of ndarrays:
+      - beta: scalar float64 stored as 0-d ndarray
+      - alpha: (J,) float64
+      - v: (J,) float64
+      - fc: (J,) float64
+      - lambda: (M,N) float64, in (0,1)
     """
-    # Global scalar beta (0-d)
-    z_beta = rng.normal(theta_z_hypers["beta"]["mu"], theta_z_hypers["beta"]["sd"])
-    beta = _sigmoid(np.asarray(z_beta, dtype=np.float64)).astype(np.float64, copy=False)
+    beta = np.asarray(rng.uniform(0.85, 0.98), dtype=np.float64)
 
-    # Product-level block (J,)
-    z_alpha = rng.normal(
-        theta_z_hypers["alpha"]["mu"], theta_z_hypers["alpha"]["sd"], size=(J,)
-    )
-    z_v = rng.normal(theta_z_hypers["v"]["mu"], theta_z_hypers["v"]["sd"], size=(J,))
-    z_fc = rng.normal(theta_z_hypers["fc"]["mu"], theta_z_hypers["fc"]["sd"], size=(J,))
+    alpha = rng.lognormal(mean=np.log(1.0), sigma=0.25, size=(J,)).astype(np.float64)
+    v = rng.lognormal(mean=np.log(2.0), sigma=0.25, size=(J,)).astype(np.float64)
+    fc = rng.lognormal(mean=np.log(0.2), sigma=0.25, size=(J,)).astype(np.float64)
 
-    # Market-consumer block (M,N)
-    z_lambda = rng.normal(
-        theta_z_hypers["lambda"]["mu"], theta_z_hypers["lambda"]["sd"], size=(M, N)
-    )
+    # Market-consumer consumption probability.
+    lam_logit = rng.normal(loc=_logit(0.25), scale=0.8, size=(M, N)).astype(np.float64)
+    lam = _sigmoid(lam_logit)
 
-    out: dict[str, np.ndarray] = {
-        "beta": beta,
-        "alpha": np.exp(z_alpha).astype(np.float64, copy=False),
-        "v": np.exp(z_v).astype(np.float64, copy=False),
-        "fc": np.exp(z_fc).astype(np.float64, copy=False),
-        "lambda": _sigmoid(z_lambda).astype(np.float64, copy=False),
-    }
-    return out
+    return {"beta": beta, "alpha": alpha, "v": v, "fc": fc, "lambda": lam}
 
 
 def compute_u_mj(
@@ -114,10 +90,8 @@ def compute_u_mj(
     njt_true: np.ndarray,
 ) -> np.ndarray:
     """
-    Compute u_mj = delta_j + E_bar_m + n_mj.
-
-    Returns:
-      ndarray (M,J) float64 via numpy promotion.
+    Compute market-product intercept u_mj from Phase 1–2 truth:
+      u_mj = delta_j + E_bar_m + n_mj
     """
     return delta_true[None, :] + E_bar_true[:, None] + njt_true
 
@@ -129,25 +103,19 @@ def simulate_price_states(
     start_state: int,
 ) -> np.ndarray:
     """
-    Simulate a length-T Markov chain over discrete price states.
-
-    Args:
-      P_price: (S,S) row-stochastic transition matrix.
-      start_state: initial state in {0,...,S-1}.
+    Simulate a discrete Markov chain of length T given transition matrix P_price (S,S).
 
     Returns:
-      ndarray of shape (T,), dtype int64.
+      ndarray (T,), dtype int64.
     """
-    cdf = np.cumsum(P_price, axis=1)
-    p_state_t = np.empty((T,), dtype=np.int64)
-    p_state_t[0] = start_state
+    S = int(P_price.shape[0])
+    s = np.zeros((T,), dtype=np.int64)
+    s[0] = int(start_state)
 
-    u = rng.random(T - 1)
     for t in range(1, T):
-        prev = p_state_t[t - 1]
-        p_state_t[t] = np.searchsorted(cdf[prev], u[t - 1], side="right")
+        s[t] = int(rng.choice(S, p=P_price[int(s[t - 1])]))
 
-    return p_state_t
+    return s
 
 
 def simulate_market_product_price_path(
@@ -191,20 +159,26 @@ def next_inventory(
     """
     Inventory transition with truncation to [0, I_max].
 
-    Transition:
-      I_next = clip(I + a - c, 0, I_max)
+    Args:
+      I: (N,) current inventory
+      a: (N,) purchase indicator {0,1}
+      c: (N,) consumption indicator {0,1}
+
+    Returns:
+      I_next: (N,) updated inventory in [0, I_max]
     """
-    I_next = I + a - c
-    return np.clip(I_next, 0, I_max)
+    I_next = I + a.astype(np.int64) - c.astype(np.int64)
+    I_next = np.clip(I_next, 0, I_max)
+    return I_next.astype(np.int64)
 
 
 def solve_ccp_buy(
     u_eff: float,
     beta: float,
-    alpha: float,
-    v: float,
-    fc: float,
-    lambda_: float,
+    alpha_j: float,
+    v_j: float,
+    fc_j: float,
+    lambda_n: float,
     I_max: int,
     P_price: np.ndarray,
     price_vals: np.ndarray,
@@ -213,63 +187,88 @@ def solve_ccp_buy(
     max_iter: int,
 ) -> np.ndarray:
     """
-    Solve the single-consumer DP for one product and return buy CCPs.
+    Solve for consumer CCPs for a single (market, product, consumer) given lambda_n.
 
-    State: (s, I) where
-      - s is a discrete price state in {0,...,S-1}
-      - I is inventory in {0,...,I_max}
+    We solve for CCP_buy(s,i) on a grid of price state s and inventory i.
 
     Returns:
-      ndarray: ccp_buy[s, I] = P(a=1 | s, I), shape (S, I_max+1).
+      ccp_buy_s_i: (S, I_max+1) float64 in [0,1].
     """
-    # --- State transitions (indices) ---
     S = int(P_price.shape[0])
-    I_size = I_max + 1
-    I_grid = np.arange(I_size, dtype=np.int64)
+    I_size = int(I_max + 1)
 
-    # Inventory index transitions for (a in {0,1}, c in {0,1}).
-    I_a0_c0 = I_grid
-    I_a0_c1 = np.maximum(I_grid - 1, 0)
-    I_a1_c0 = np.minimum(I_grid + 1, I_max)
-    I_a1_c1 = I_grid
+    # Value function V(s,i) (inclusive value).
+    V = np.zeros((S, I_size), dtype=np.float64)
 
-    # --- Flow utilities ---
-    # No buy: stockout penalty if inventory is zero.
-    u0 = (-v * (I_grid == 0))[None, :]
+    # Iterate on Bellman fixed point for V(s,i).
+    for _ in range(int(max_iter)):
+        V_old = V.copy()
 
-    # Buy: intercept minus price disutility and fixed cost.
-    base_buy_s = u_eff - alpha * price_vals - fc
-    u1 = base_buy_s[:, None]
+        # Expected future value under price transitions:
+        EV_next = P_price @ V_old  # (S, I_size)
 
-    # Waste-at-cap penalty: buying when at cap, then not consuming.
-    u1 = u1 - (waste_cost * (1.0 - lambda_)) * (I_grid == I_max)[None, :]
+        for s in range(S):
+            p = float(price_vals[s])
 
-    # --- Bellman fixed point / value iteration ---
-    v_fn = np.zeros((S, I_size), dtype=np.float64)
+            for i in range(I_size):
+                # If buy:
+                I_buy = min(i + 1, I_max)
+                # If no-buy:
+                I_nb = i
 
-    def _compute_q(v_value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Compute choice-specific value functions q0(s,I), q1(s,I) given v(s,I)."""
-        ev_next = P_price @ v_value
+                # Expected continuation value accounting for consumption:
+                cont_buy = (1.0 - lambda_n) * EV_next[s, I_buy] + lambda_n * EV_next[
+                    s, max(I_buy - 1, 0)
+                ]
+                cont_nb = (1.0 - lambda_n) * EV_next[s, I_nb] + lambda_n * EV_next[
+                    s, max(I_nb - 1, 0)
+                ]
 
-        cont0 = (1.0 - lambda_) * ev_next[:, I_a0_c0] + lambda_ * ev_next[:, I_a0_c1]
-        cont1 = (1.0 - lambda_) * ev_next[:, I_a1_c0] + lambda_ * ev_next[:, I_a1_c1]
+                # Flow utilities:
+                u_buy = u_eff - alpha_j * p - fc_j - waste_cost * float(I_buy)
+                # Stockout penalty if inventory is 0 and consumption occurs:
+                u_nb = u_eff - v_j * float(i == 0)
 
-        q0 = u0 + beta * cont0
-        q1 = u1 + beta * cont1
-        return q0, q1
+                # Choice-specific values:
+                Q_buy = u_buy + beta * cont_buy
+                Q_nb = u_nb + beta * cont_nb
 
-    for _ in range(max_iter):
-        q0, q1 = _compute_q(v_fn)
-        v_new = np.logaddexp(q0, q1)
+                # Inclusive value (log-sum-exp):
+                m = max(Q_buy, Q_nb)
+                V[s, i] = m + np.log(np.exp(Q_buy - m) + np.exp(Q_nb - m))
 
-        if np.max(np.abs(v_new - v_fn)) < tol:
-            v_fn = v_new
+        diff = np.max(np.abs(V - V_old))
+        if diff < float(tol):
             break
-        v_fn = v_new
 
-    q0, q1 = _compute_q(v_fn)
-    denom = np.logaddexp(q0, q1)
-    return np.exp(q1 - denom)
+    # Compute CCP_buy from converged V:
+    ccp_buy = np.zeros((S, I_size), dtype=np.float64)
+    EV = P_price @ V  # (S, I_size)
+
+    for s in range(S):
+        p = float(price_vals[s])
+
+        for i in range(I_size):
+            I_buy = min(i + 1, I_max)
+            I_nb = i
+
+            cont_buy = (1.0 - lambda_n) * EV[s, I_buy] + lambda_n * EV[
+                s, max(I_buy - 1, 0)
+            ]
+            cont_nb = (1.0 - lambda_n) * EV[s, I_nb] + lambda_n * EV[
+                s, max(I_nb - 1, 0)
+            ]
+
+            u_buy = u_eff - alpha_j * p - fc_j - waste_cost * float(I_buy)
+            u_nb = u_eff - v_j * float(i == 0)
+
+            Q_buy = u_buy + beta * cont_buy
+            Q_nb = u_nb + beta * cont_nb
+
+            denom = np.exp(Q_buy) + np.exp(Q_nb)
+            ccp_buy[s, i] = np.exp(Q_buy) / denom
+
+    return ccp_buy
 
 
 def solve_market_product_ccps(
@@ -287,43 +286,37 @@ def solve_market_product_ccps(
     max_iter: int,
 ) -> np.ndarray:
     """
-    Solve CCPs for all consumers for a single (market, product).
+    Solve CCP_buy for all consumers in a given market-product pair.
 
-    Product parameters are shared across markets and consumers; only u_eff and the price
-    process vary by (m,j). Only lambda varies by consumer.
+    Args:
+      lambda_mn: (N,) consumer-specific consumption probabilities.
 
     Returns:
-      ndarray: ccp_buy_n_s_i with shape (N, S, I_max+1), float64.
+      ccp_buy_n_s_i: (N, S, I_max+1) float64.
     """
     N = int(lambda_mn.shape[0])
     S = int(P_price.shape[0])
-    ccp_buy_n_s_i = np.zeros((N, S, I_max + 1), dtype=np.float64)
+    I_size = int(I_max + 1)
 
-    # Cast scalars once; only lambda changes across consumers.
-    u_eff_f = float(u_eff)
-    beta_f = float(beta)
-    alpha_f = float(alpha_j)
-    v_f = float(v_j)
-    fc_f = float(fc_j)
-    waste_cost_f = float(waste_cost)
+    ccp_buy = np.zeros((N, S, I_size), dtype=np.float64)
 
     for n in range(N):
-        ccp_buy_n_s_i[n] = solve_ccp_buy(
-            u_eff=u_eff_f,
-            beta=beta_f,
-            alpha=alpha_f,
-            v=v_f,
-            fc=fc_f,
-            lambda_=float(lambda_mn[n]),
-            I_max=I_max,
+        ccp_buy[n] = solve_ccp_buy(
+            u_eff=float(u_eff),
+            beta=float(beta),
+            alpha_j=float(alpha_j),
+            v_j=float(v_j),
+            fc_j=float(fc_j),
+            lambda_n=float(lambda_mn[n]),
+            I_max=int(I_max),
             P_price=P_price,
             price_vals=price_vals,
-            waste_cost=waste_cost_f,
-            tol=tol,
-            max_iter=max_iter,
+            waste_cost=float(waste_cost),
+            tol=float(tol),
+            max_iter=int(max_iter),
         )
 
-    return ccp_buy_n_s_i
+    return ccp_buy
 
 
 def simulate_market_product_panel(
@@ -335,38 +328,36 @@ def simulate_market_product_panel(
     I_max: int,
 ) -> np.ndarray:
     """
-    Simulate seller-observed purchases for one (market, product).
+    Simulate purchases a_{n,t} for one market-product pair.
 
     Args:
-      p_state_t: (T,) price states for this product.
-      ccp_buy_n_s_i: (N,S,I_max+1) buy probabilities by consumer/state/inventory.
+      p_state_t: (T,) int price-state path.
+      ccp_buy_n_s_i: (N,S,I_max+1) buy probabilities.
       lambda_mn: (N,) consumption probabilities.
-      I_init: (N,) initial inventory (latent).
-      I_max: inventory cap.
+      I_init: (N,) initial inventory levels in [0, I_max].
 
     Returns:
-      ndarray: a_nt of shape (N, T), dtype int64.
+      a_nt: (N,T) int64 purchases.
     """
-    N = int(I_init.shape[0])
+    N = int(lambda_mn.shape[0])
     T = int(p_state_t.shape[0])
     a_nt = np.zeros((N, T), dtype=np.int64)
 
-    I_curr = I_init.copy()
-
-    # Latent consumption shocks c_{n,t} (boolean); converted to 0/1 ints at use sites.
+    # Latent consumption draws:
     c_nt = simulate_consumption(rng=rng, N=N, T=T, lambda_n=lambda_mn)
 
-    n_idx = np.arange(N)
+    I_n = I_init.astype(np.int64)
+
     for t in range(T):
         s = int(p_state_t[t])
-        prob_buy = ccp_buy_n_s_i[n_idx, s, I_curr]
-        a_bool = rng.random(N) < prob_buy
 
-        a_int = a_bool.astype(np.int64, copy=False)
-        c_int = c_nt[:, t].astype(np.int64, copy=False)
+        # Buy decisions conditional on (s, I_n).
+        buy_prob = ccp_buy_n_s_i[np.arange(N), s, I_n]
+        a_t = rng.random((N,)) < buy_prob
+        a_nt[:, t] = a_t.astype(np.int64)
 
-        a_nt[:, t] = a_int
-        I_curr = next_inventory(I_curr, a_int, c_int, I_max)
+        # Inventory transition.
+        I_n = next_inventory(I=I_n, a=a_nt[:, t], c=c_nt[:, t], I_max=I_max)
 
     return a_nt
 
@@ -388,6 +379,10 @@ def generate_dgp(
     """
     Generate seller-observed stockpiling panel data for M markets and J products.
 
+    This function performs a single boundary normalization/validation via
+    normalize_stockpiling_dgp_inputs(...). After that point, all inputs are treated
+    as canonical (dtypes/shapes/ranges) and the remainder of the code is simulation.
+
     Args:
       P_price_mj: (M,J,S,S) transition matrices (row-stochastic), one per (market, product).
       price_vals_mj: (M,J,S) price levels indexed by the market-product price state.
@@ -401,14 +396,7 @@ def generate_dgp(
         - alpha, v, fc:       (J,) float64
         - lambda:             (M,N) float64
     """
-    rng = np.random.default_rng(seed)
-
-    M = int(E_bar_true.shape[0])
-    J = int(delta_true.shape[0])
-
-    theta_true = sample_theta_true(rng=rng, M=M, N=N, J=J)
-
-    validate_stockpiling_dgp_inputs(
+    norm = normalize_stockpiling_dgp_inputs(
         seed=seed,
         delta_true=delta_true,
         E_bar_true=E_bar_true,
@@ -423,6 +411,26 @@ def generate_dgp(
         max_iter=max_iter,
     )
 
+    rng = np.random.default_rng(int(norm["seed"]))
+
+    # Canonical dimensions and inputs.
+    M = int(norm["M"])
+    N = int(norm["N"])
+    J = int(norm["J"])
+    T = int(norm["T"])
+    I_max = int(norm["I_max"])
+
+    delta_true = norm["delta_true"]
+    E_bar_true = norm["E_bar_true"]
+    njt_true = norm["njt_true"]
+    P_price_mj = norm["P_price_mj"]
+    price_vals_mj = norm["price_vals_mj"]
+    waste_cost = float(norm["waste_cost"])
+    tol = float(norm["tol"])
+    max_iter = int(norm["max_iter"])
+
+    theta_true = sample_theta_true(rng=rng, M=M, N=N, J=J)
+
     u_mj_true = compute_u_mj(
         delta_true=delta_true, E_bar_true=E_bar_true, njt_true=njt_true
     )
@@ -430,18 +438,19 @@ def generate_dgp(
     p_state_mjt = np.zeros((M, J, T), dtype=np.int64)
     a_mnjt = np.zeros((M, N, J, T), dtype=np.int64)
 
-    theta = theta_true
-    beta = float(theta["beta"])
+    beta = float(theta_true["beta"])
+    alpha = theta_true["alpha"]
+    v = theta_true["v"]
+    fc = theta_true["fc"]
+    lambda_true = theta_true["lambda"]
 
     for m in range(M):
-        # Per-market objects.
-        lambda_mn = theta["lambda"][m]  # (N,)
+        lambda_mn = lambda_true[m]  # (N,)
 
         # Latent initial inventories for each consumer-product.
         I_init_nj = rng.integers(0, I_max + 1, size=(N, J), dtype=np.int64)
 
         for j in range(J):
-            # Per-market-product objects.
             P_price = P_price_mj[m, j]
             price_vals = price_vals_mj[m, j]
 
@@ -452,20 +461,15 @@ def generate_dgp(
             p_state_mjt[m, j] = p_state_t
 
             # Effective intercept for this (market, product).
-            u_eff = u_mj_true[m, j]
-
-            # Product parameters (shared across markets).
-            alpha_j = float(theta["alpha"][j])
-            v_j = float(theta["v"][j])
-            fc_j = float(theta["fc"][j])
+            u_eff = float(u_mj_true[m, j])
 
             # Solve per-consumer CCPs (only lambda varies across consumers).
             ccp_buy_n_s_i = solve_market_product_ccps(
                 u_eff=u_eff,
                 beta=beta,
-                alpha_j=alpha_j,
-                v_j=v_j,
-                fc_j=fc_j,
+                alpha_j=float(alpha[j]),
+                v_j=float(v[j]),
+                fc_j=float(fc[j]),
                 lambda_mn=lambda_mn,
                 I_max=I_max,
                 P_price=P_price,

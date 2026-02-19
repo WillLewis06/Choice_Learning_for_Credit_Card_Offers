@@ -1,5 +1,5 @@
 """
-bonus2_evaluate.py
+bonus2/bonus2_evaluate.py
 
 Evaluation utilities for Bonus Q2 (updated spec).
 
@@ -8,6 +8,11 @@ Design goals:
 - Baseline is the δ-only model (NOT empirical-share baseline).
 - Supports (a) passing predicted choice probabilities directly, or
   (b) computing fitted/oracle probabilities from theta via bonus2_model.
+
+Assumption:
+- This module is called only with inputs that already satisfy the Bonus2
+  contracts (validated upstream in bonus2_input_validation.py). Therefore,
+  this file does not perform input-contract validation (shapes/ranges/sums).
 
 Choice encoding:
   y_mit (M,N,T) with values:
@@ -29,64 +34,6 @@ import numpy as np
 
 
 # =============================================================================
-# Validation
-# =============================================================================
-
-
-def _validate_choice_panel(y_mit: np.ndarray) -> tuple[int, int, int]:
-    y = np.asarray(y_mit)
-    if y.ndim != 3:
-        raise ValueError(f"y_mit must have shape (M,N,T); got {y.shape}")
-    return (int(y.shape[0]), int(y.shape[1]), int(y.shape[2]))
-
-
-def _validate_probs(
-    y_mit: np.ndarray,
-    p_choice_mntc: np.ndarray,
-    *,
-    tol: float,
-) -> tuple[int, int, int, int]:
-    y = np.asarray(y_mit)
-    p = np.asarray(p_choice_mntc, dtype=np.float64)
-
-    if p.ndim != 4:
-        raise ValueError(f"p_choice_mntc must have shape (M,N,T,C); got {p.shape}")
-
-    M, N, T = _validate_choice_panel(y)
-    if p.shape[0] != M or p.shape[1] != N or p.shape[2] != T:
-        raise ValueError(
-            f"p_choice_mntc first 3 dims must match y_mit (M,N,T)=({M},{N},{T}); got {p.shape}"
-        )
-
-    C = int(p.shape[3])
-    y_min = int(np.min(y))
-    y_max = int(np.max(y))
-    if y_min < 0 or y_max >= C:
-        raise ValueError(
-            f"y_mit values must be in [0,{C-1}]; got min={y_min}, max={y_max}"
-        )
-
-    if not np.isfinite(p).all():
-        raise ValueError("p_choice_mntc contains NaN/Inf")
-
-    p_min = float(np.min(p))
-    p_max = float(np.max(p))
-    if p_min < -tol or p_max > 1.0 + tol:
-        raise ValueError(
-            f"p_choice_mntc must be in [0,1] (tol={tol}); got min={p_min:.6g}, max={p_max:.6g}"
-        )
-
-    rs = np.sum(p, axis=3)
-    max_dev = float(np.max(np.abs(rs - 1.0)))
-    if max_dev > tol:
-        raise ValueError(
-            f"p_choice_mntc rows must sum to 1 (tol={tol}); max |sum-1|={max_dev:.6g}"
-        )
-
-    return M, N, T, C
-
-
-# =============================================================================
 # Metrics
 # =============================================================================
 
@@ -96,11 +43,9 @@ def choice_metrics_from_probs(
     p_choice_mntc: np.ndarray,
     *,
     eps: float = 1e-12,
-    validate: bool = True,
-    tol: float = 1e-6,
 ) -> dict[str, float]:
     """
-    Multinomial predictive metrics.
+    Multinomial predictive metrics from per-observation probabilities.
 
     Returns:
       {
@@ -114,10 +59,6 @@ def choice_metrics_from_probs(
     y = np.asarray(y_mit, dtype=np.int64)
     p = np.asarray(p_choice_mntc, dtype=np.float64)
 
-    if validate:
-        _validate_probs(y, p, tol=tol)
-
-    # p_true per observation
     p_true = np.take_along_axis(p, y[..., None], axis=3)[..., 0]
     p_true_clip = np.clip(p_true, eps, 1.0)
 
@@ -147,11 +88,8 @@ def delta_only_baseline_probs(delta_mj: np.ndarray) -> np.ndarray:
       p_mjc: (M, J+1) with c=0 outside and c=j+1 for inside product j.
     """
     delta = np.asarray(delta_mj, dtype=np.float64)
-    if delta.ndim != 2:
-        raise ValueError(f"delta_mj must have shape (M,J); got {delta.shape}")
-
     J = int(delta.shape[1])
-    # Stable softmax with outside utility 0
+
     max_u = np.maximum(0.0, np.max(delta, axis=1))  # (M,)
     exp_in = np.exp(delta - max_u[:, None])  # (M,J)
     exp_out = np.exp(-max_u)  # (M,)
@@ -159,9 +97,7 @@ def delta_only_baseline_probs(delta_mj: np.ndarray) -> np.ndarray:
 
     p_out = (exp_out / den)[:, None]  # (M,1)
     p_in = exp_in / den[:, None]  # (M,J)
-    p_mjc = np.concatenate([p_out, p_in], axis=1)  # (M,J+1)
-
-    return p_mjc
+    return np.concatenate([p_out, p_in], axis=1)  # (M,J+1)
 
 
 def choice_metrics_from_market_probs(
@@ -169,75 +105,28 @@ def choice_metrics_from_market_probs(
     p_mjc: np.ndarray,
     *,
     eps: float = 1e-12,
-    tol: float = 1e-6,
 ) -> dict[str, float]:
     """
     Multinomial metrics when probabilities are market-only (M,C), constant in (i,t).
     """
     y = np.asarray(y_mit, dtype=np.int64)
-    M, N, T = _validate_choice_panel(y)
     p = np.asarray(p_mjc, dtype=np.float64)
 
-    if p.ndim != 2:
-        raise ValueError(f"p_mjc must have shape (M,C); got {p.shape}")
-    if int(p.shape[0]) != M:
-        raise ValueError(f"p_mjc first axis must be M={M}; got {p.shape}")
-    C = int(p.shape[1])
+    # Broadcast to (M,N,T,C) then pick realized class
+    p4 = p[:, None, None, :]
+    p_true = np.take_along_axis(p4, y[..., None], axis=3)[..., 0]
+    p_true_clip = np.clip(p_true, eps, 1.0)
 
-    y_min = int(np.min(y))
-    y_max = int(np.max(y))
-    if y_min < 0 or y_max >= C:
-        raise ValueError(
-            f"y_mit values must be in [0,{C-1}]; got min={y_min}, max={y_max}"
-        )
-
-    if not np.isfinite(p).all():
-        raise ValueError("p_mjc contains NaN/Inf")
-    p_min = float(np.min(p))
-    p_max = float(np.max(p))
-    if p_min < -tol or p_max > 1.0 + tol:
-        raise ValueError(
-            f"p_mjc must be in [0,1] (tol={tol}); got min={p_min:.6g}, max={p_max:.6g}"
-        )
-    rs = np.sum(p, axis=1)
-    max_dev = float(np.max(np.abs(rs - 1.0)))
-    if max_dev > tol:
-        raise ValueError(
-            f"p_mjc rows must sum to 1 (tol={tol}); max |sum-1|={max_dev:.6g}"
-        )
-
-    n_obs = float(M * N * T)
+    nll = float(-np.mean(np.log(p_true_clip)))
+    c_hat = np.argmax(p, axis=1)  # (M,)
+    acc = float(np.mean(y == c_hat[:, None, None]))
     out_emp = float(np.mean(y == 0))
-
-    sum_logp = 0.0
-    sum_ptrue = 0.0
-    sum_acc = 0.0
-    sum_outpred = 0.0
-
-    for m in range(M):
-        y_flat = y[m].ravel()
-        p_row = p[m]
-
-        p_true = p_row[y_flat]
-        p_true_clip = np.clip(p_true, eps, 1.0)
-
-        sum_ptrue += float(np.sum(p_true))
-        sum_logp += float(np.sum(np.log(p_true_clip)))
-
-        c_hat = int(np.argmax(p_row))
-        sum_acc += float(np.sum(y_flat == c_hat))
-
-        # same for every (i,t) within market m
-        sum_outpred += float(p_row[0]) * float(N * T)
-
-    nll = float(-sum_logp / n_obs)
-    acc = float(sum_acc / n_obs)
-    out_pred = float(sum_outpred / n_obs)
+    out_pred = float(np.mean(p[:, 0]))
 
     return {
         "nll": nll,
         "acc": acc,
-        "p_true": float(sum_ptrue / n_obs),
+        "p_true": float(np.mean(p_true)),
         "out_emp": out_emp,
         "out_pred": out_pred,
     }
@@ -376,57 +265,32 @@ def evaluate_bonus2(
     decay: float | None = None,
     mcmc: dict[str, Any] | None = None,
     eps: float = 1e-12,
-    validate_probs: bool = True,
-    tol: float = 1e-6,
 ) -> dict[str, Any]:
     """
     Evaluate Bonus2 predictions and (optionally) parameter recovery and MCMC diagnostics.
 
     You can provide predicted probabilities directly (p_choice_*), or provide theta_* plus
     the required inputs to compute probabilities via the TF model.
-
-    Output schema:
-      {
-        "shape": {...},
-        "models": {"baseline":..., "fitted":..., "oracle":... (optional)},
-        "deltas": {"fitted_minus_baseline":..., "fitted_minus_oracle":... (optional)},
-        "param": {"mean_stats":..., "std_stats":...} (optional),
-        "mcmc": {"n_saved": int|None, "accept_rates": dict[str,float]} (optional)
-      }
     """
     y = np.asarray(y_mit, dtype=np.int64)
-    M, N, T = _validate_choice_panel(y)
     delta = np.asarray(delta_mj, dtype=np.float64)
-    if delta.shape[0] != M:
-        raise ValueError(f"delta_mj first axis must be M={M}; got {delta.shape}")
+
+    M, N, T = (int(x) for x in y.shape)
     J = int(delta.shape[1])
     n_obs = int(M * N * T)
 
     # Baseline
     if p_choice_baseline_mntc is None:
         p_base_mjc = delta_only_baseline_probs(delta)
-        base_metrics = choice_metrics_from_market_probs(y, p_base_mjc, eps=eps, tol=tol)
+        base_metrics = choice_metrics_from_market_probs(y, p_base_mjc, eps=eps)
     else:
         p_base = np.asarray(p_choice_baseline_mntc, dtype=np.float64)
-        base_metrics = choice_metrics_from_probs(
-            y, p_base, eps=eps, validate=validate_probs, tol=tol
-        )
+        base_metrics = choice_metrics_from_probs(y, p_base, eps=eps)
 
     # Fitted
     if p_choice_hat_mntc is None:
-        if theta_hat is None:
-            raise ValueError(
-                "Provide either p_choice_hat_mntc or theta_hat (+ model inputs)"
-            )
-
-        need = (w_t, season_sin_kt, season_cos_kt, peer_adj_m, L, decay)
-        if any(x is None for x in need):
-            raise ValueError(
-                "theta_hat provided but missing model inputs to compute probabilities"
-            )
-
         p_fit = _predict_probs_via_model(
-            theta=theta_hat,
+            theta=theta_hat,  # assumed provided
             y_mit=y,
             delta_mj=delta,
             w_t=np.asarray(w_t, dtype=np.int64),
@@ -444,11 +308,6 @@ def evaluate_bonus2(
     if p_choice_oracle_mntc is not None:
         p_or = np.asarray(p_choice_oracle_mntc, dtype=np.float64)
     elif theta_true is not None:
-        need = (w_t, season_sin_kt, season_cos_kt, peer_adj_m, L, decay)
-        if any(x is None for x in need):
-            raise ValueError(
-                "theta_true provided but missing model inputs to compute oracle probabilities"
-            )
         p_or = _predict_probs_via_model(
             theta=theta_true,
             y_mit=y,
@@ -464,14 +323,10 @@ def evaluate_bonus2(
     # Metrics
     models: dict[str, dict[str, float]] = {
         "baseline": base_metrics,
-        "fitted": choice_metrics_from_probs(
-            y, p_fit, eps=eps, validate=validate_probs, tol=tol
-        ),
+        "fitted": choice_metrics_from_probs(y, p_fit, eps=eps),
     }
     if p_or is not None:
-        models["oracle"] = choice_metrics_from_probs(
-            y, p_or, eps=eps, validate=validate_probs, tol=tol
-        )
+        models["oracle"] = choice_metrics_from_probs(y, p_or, eps=eps)
 
     deltas: dict[str, dict[str, float]] = {}
     base = models["baseline"]

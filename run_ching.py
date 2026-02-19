@@ -46,6 +46,8 @@ from ching.stockpiling_estimator import StockpilingEstimator
 from ching.stockpiling_evaluate import evaluate_stockpiling, format_evaluation_summary
 from ching.stockpiling_posterior import StockpilingInputs, predict_p_buy_mnjt_from_theta
 
+from ching.stockpiling_input_validation import validate_stockpiling_phase3_config
+
 # Phase 1–2 orchestration
 from run_zhang_with_lu import (
     print_choice_model_diagnostics,
@@ -247,7 +249,7 @@ def build_price_processes(
 
 
 def summarize_stockpiling_panel(
-    panel: dict[str, object], init_theta: dict[str, float]
+    panel: dict[str, object], init_theta: dict[str, Any]
 ) -> None:
     """Print basic panel diagnostics and true/init means (excluding lambda)."""
     a_mnjt = np.asarray(panel["a_mnjt"])
@@ -271,13 +273,19 @@ def summarize_stockpiling_panel(
             f'mean(fc)= "{float(np.mean(theta_true["fc"])):.4f}"'
         )
 
+    beta0 = float(np.mean(np.asarray(init_theta["beta"], dtype=np.float64)))
+    alpha0 = float(np.mean(np.asarray(init_theta["alpha"], dtype=np.float64)))
+    v0 = float(np.mean(np.asarray(init_theta["v"], dtype=np.float64)))
+    fc0 = float(np.mean(np.asarray(init_theta["fc"], dtype=np.float64)))
+    u_scale0 = float(np.mean(np.asarray(init_theta["u_scale"], dtype=np.float64)))
+
     print(
         "[Stockpiling] Init | "
-        f'mean(beta)= "{float(init_theta["beta"]):.4f}" , '
-        f'mean(alpha)= "{float(init_theta["alpha"]):.4f}" , '
-        f'mean(v)= "{float(init_theta["v"]):.4f}" , '
-        f'mean(fc)= "{float(init_theta["fc"]):.4f}" , '
-        f'mean(u_scale)= "{float(init_theta["u_scale"]):.4f}"'
+        f'mean(beta)= "{beta0:.4f}" , '
+        f'mean(alpha)= "{alpha0:.4f}" , '
+        f'mean(v)= "{v0:.4f}" , '
+        f'mean(fc)= "{fc0:.4f}" , '
+        f'mean(u_scale)= "{u_scale0:.4f}"'
     )
 
 
@@ -380,14 +388,14 @@ def run_phase3_dgp(
     """Generate the Phase-3 seller-observed panel via datasets.ching_dgp.generate_dgp."""
     a_mnjt, p_state_mjt, u_mj, theta_true = generate_dgp(
         seed=int(seed_dgp),
-        delta_true=np.asarray(delta_used, dtype=np.float64),
-        E_bar_true=np.asarray(E_bar_used, dtype=np.float64),
-        njt_true=np.asarray(njt_used, dtype=np.float64),
+        delta_true=delta_used,
+        E_bar_true=E_bar_used,
+        njt_true=njt_used,
         N=int(cfg["N"]),
         T=int(cfg["T"]),
         I_max=int(cfg["I_max"]),
-        P_price_mj=np.asarray(P_price_mj, dtype=np.float64),
-        price_vals_mj=np.asarray(price_vals_mj, dtype=np.float64),
+        P_price_mj=P_price_mj,
+        price_vals_mj=price_vals_mj,
         waste_cost=float(cfg["waste_cost"]),
         tol=float(cfg["dp_tol"]),
         max_iter=int(cfg["dp_max_iter"]),
@@ -412,12 +420,12 @@ def run_phase3_estimation(
 ) -> dict[str, Any]:
     """Fit stockpiling parameters from observed data, treating lambda_mn as known."""
     est = StockpilingEstimator(
-        a_mnjt=np.asarray(panel["a_mnjt"]),
-        p_state_mjt=np.asarray(panel["p_state_mjt"]),
-        u_mj=np.asarray(panel["u_mj"]),
-        lambda_mn=np.asarray(panel["lambda_mn"]),
-        P_price_mj=np.asarray(P_price_mj),
-        price_vals_mj=np.asarray(price_vals_mj),
+        a_mnjt=panel["a_mnjt"],
+        p_state_mjt=panel["p_state_mjt"],
+        u_mj=panel["u_mj"],
+        lambda_mn=panel["lambda_mn"],
+        P_price_mj=P_price_mj,
+        price_vals_mj=price_vals_mj,
         pi_I0=uniform_pi_I0(int(cfg["I_max"])),
         I_max=int(cfg["I_max"]),
         waste_cost=float(cfg["waste_cost"]),
@@ -529,6 +537,8 @@ def main() -> None:
 
     M = int(E_bar_used.shape[0])
     J = int(delta_used.shape[0])
+
+    validate_stockpiling_phase3_config(cfg=CFG_PHASE3, M=M, J=J)
 
     P_price_mj, price_vals_mj = build_price_processes(
         M=M,
