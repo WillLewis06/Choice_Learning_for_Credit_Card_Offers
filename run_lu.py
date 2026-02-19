@@ -37,7 +37,7 @@ def main() -> None:
     seed = 123
 
     # Number of simulation draws used inside estimators for RC integration.
-    n_draws = 20
+    n_draws = 50
 
     # -------------------------------------------------------------------------
     # BLP fitting configuration (shared across strong-IV and weak-IV runs)
@@ -50,7 +50,7 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Lu shrinkage configuration: MCMC length plus proposal-scale tuning controls
     # -------------------------------------------------------------------------
-    shrink_n_iter = 10
+    shrink_n_iter = 500
 
     # Tuning targets and multiplicative adjustments for RW-MH vs TMH blocks.
     shrink_target_low = 0.3

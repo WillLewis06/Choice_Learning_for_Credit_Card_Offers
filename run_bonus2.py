@@ -53,9 +53,9 @@ from bonus2.bonus2_diagnostics import (
 # Phase 1: baseline choice model (Zhang feature-based)
 CFG_PHASE1 = {
     "seed": 123,
-    "num_products": 10,
-    "num_groups": 2,
-    "num_markets": 5,
+    "num_products": 15,
+    "num_groups": 15,
+    "num_markets": 3,
     "N_base": 2_000,
     "N_shock": 1_000,
     "num_features": 4,
@@ -67,9 +67,9 @@ CFG_PHASE1 = {
     "p_active": 0.25,
     "sd_u": 0.5,
     "depth": 5,
-    "width": 32,
+    "width": 64,
     "heads": 8,
-    "epochs": 5,
+    "epochs": 50,
     "batch_size": 64,
     "learning_rate": 1e-3,
     "shuffle_buffer": 10_000,
@@ -80,22 +80,22 @@ CFG_PHASE1 = {
 # Bonus2: DGP + estimation (updated spec)
 CFG_BONUS2 = {
     # panel size
-    "N": 200,
-    "T": (365 * 5),
+    "N": 100,
+    "T": (365 * 10),
     # time features
     "season_period": 365,
     "K": 1,
-    "peer_lookback_L": 2,
+    "peer_lookback_L": 1,
     # known scalar habit decay
-    "decay": 0.875,
+    "decay": 0.8,
     # network hyperparams (DGP)
-    "avg_friends": 5.0,
-    "friends_sd": 2.0,
+    "avg_friends": 3.0,
+    "friends_sd": 1.0,
     # DGP parameter dispersion (required keys; no defaults in DGP)
     "params_true": {
-        "habit_mean": 0.6,
-        "habit_sd": 0.25,
-        "peer_mean": 0.2,
+        "habit_mean": 0.60,
+        "habit_sd": 0.05,
+        "peer_mean": 0.5,
         "peer_sd": 0.15,
         "mktprod_sd": 0.5,  # product intercept sd
         "dow_prod_sd": 0.2,  # product weekend effect sd
@@ -103,7 +103,7 @@ CFG_BONUS2 = {
     },
     # MCMC config
     "mcmc_seed": 0,
-    "mcmc_n_iter": 100,
+    "mcmc_n_iter": 200,
     # estimator init (scalar fills)
     "init_theta": {
         "beta_market": 0.0,
@@ -124,12 +124,12 @@ CFG_BONUS2 = {
     },
     # RW step sizes (keys must match Bonus2Estimator.fit expectation)
     "k": {
-        "beta_market": 0.05,
-        "beta_habit": 0.05,
-        "beta_peer": 0.05,
+        "beta_market": 0.02,
+        "beta_habit": 0.02,
+        "beta_peer": 0.02,
         "beta_dow_j": 0.01,
-        "a_m": 0.01,
-        "b_m": 0.01,
+        "a_m": 0.05,
+        "b_m": 0.05,
     },
 }
 

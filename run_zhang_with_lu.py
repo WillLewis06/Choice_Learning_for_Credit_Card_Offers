@@ -342,13 +342,13 @@ def main() -> None:
     width = 32
     heads = 8
 
-    epochs = 5
+    epochs = 50
     batch_size = 64
     learning_rate = 1e-3
     shuffle_buffer = 1_000
 
     shrink_seed = 0
-    shrink_n_iter = 10
+    shrink_n_iter = 500
     shrink_pilot_length = 20
     shrink_max_rounds = 50
     shrink_target_low = 0.3
