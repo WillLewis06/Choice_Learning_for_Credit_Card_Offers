@@ -5,8 +5,8 @@ from choice_learn.datasets.base import load_swissmetro
 
 # from choice_learn.datasets.expedia import load_expedia
 
-from models.featureless import FeaturelessDeepHalo
-from models.featurebased import FeatureBasedDeepHalo
+from zhang.featureless import FeaturelessDeepHalo
+from zhang.featurebased import FeatureBasedDeepHalo
 from choice_learn.models.tastenet import TasteNet
 from choice_learn.models.rumnet import GPURUMnet
 from choice_learn.models.reslogit import ResLogit

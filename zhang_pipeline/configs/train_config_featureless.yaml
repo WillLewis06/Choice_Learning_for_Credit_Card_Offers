@@ -1,0 +1,33 @@
+# Paths to data .csv files
+data_root: ./data
+checkpoint_dir: ./checkpoints # where to store and load saved models
+
+# .csv data file names - frequency based data is optional
+files:
+  train_raw: Synthetic_20-15-80_Train.csv
+  test_raw: Synthetic_20-15-20_Test.csv
+  train_freq: Synthetic_20-15-80_Train_Freq.csv
+  test_freq: Synthetic_20-15-20_Test_Freq.csv
+
+# model specification
+model:
+  type: featureless  # featureless, featurebased or stacked
+  depth: 5           # as per the zhang25 paper meaning
+  width: 348         # dim of the hidden representation - not used in stacked
+  # name to save the model as in the checkpoints directory
+  save_name: synthetic_featureless_d5_w300 # will default if null
+
+# Training params - will load defaults if null or invalid
+train:
+  loss: mse          # loss function - mse or nll
+  optimizer: adam    # adam or sgd
+  lr: 0.0001          # learning rate
+  batch_size: 1024
+  epochs: 100          # num of training cycles
+  patience: 5        # early stopping as a num of epochs without improvement - set 0 or null to disable
+  l2: 0.001          # regularisation rate
+
+# Evaluation params - will load defaults if null or invalid
+eval:
+  batch_size: 4096
+  loss: mse          # loss function - mse or nll

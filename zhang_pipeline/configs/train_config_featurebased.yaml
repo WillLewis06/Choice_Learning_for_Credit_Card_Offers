@@ -1,0 +1,36 @@
+# Paths to data .csv files
+data_root: ./data
+checkpoint_dir: ./checkpoints # where to store and load saved models
+
+# .csv data file names - frequency based data is optional
+files:
+  train_raw: expedia_train.csv
+  test_raw: expedia_test.csv
+  # as a feature based data set will be 3d 
+  # we need an identifying column to group items
+  group_col: srch_id
+  choice_col: booking_bool # col values we wish to learn
+
+# model specification
+model:
+  type: featurebased # featureless, featurebased or stacked
+  depth: 5           # as per the zhang25 paper meaning
+  width: 100         # dim of the hidden representation - not used in stacked
+  heads: 8
+  # name to save the model as in the checkpoints directory
+  save_name: expedia_featurebased_d5_w300 # will default if null
+
+# Training params - will load defaults if null or invalid
+train:
+  loss: nll          # loss function - mse or nll
+  optimizer: adam    # adam or sgd
+  lr: 0.0005          # learning rate
+  batch_size: 256
+  epochs: 5          # num of training cycles
+  patience: 5        # early stopping as a num of epochs without improvement - set 0 or null to disable
+  l2: 0.001          # regularisation rate
+
+# Evaluation params - will load defaults if null or invalid
+eval:
+  batch_size: 256
+  loss: nll          # loss function - mse or nll

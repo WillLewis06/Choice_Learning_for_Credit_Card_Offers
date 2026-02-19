@@ -4,9 +4,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kif"
+name = "JPM-Q3"
 version = "0.1.0"
-description = "kif implementation code (extends choice-learn)"
+description = "implementation code (extends choice-learn)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,8 +23,8 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-pythonpath = ["tests/lu", "tests/ching"]
+pythonpath = [".", "tests/lu", "tests/ching"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["datasets*", "lu*", "ching*", "models*", "toolbox*"]
+include = ["datasets*", "lu*", "ching*", "zhang*", "toolbox*"]

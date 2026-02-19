@@ -1,0 +1,33 @@
+# Paths to data .csv files
+data_root: ./data
+checkpoint_dir: ./checkpoints # where to store and load saved models
+
+# .csv data file names - frequency based data is optional
+files:
+  train_raw: Synthetic_20-15-80_Train.csv
+  test_raw: Synthetic_20-15-20_Test.csv
+  train_freq: Synthetic_20-15-80_Train_Freq.csv
+  test_freq: Synthetic_20-15-20_Test_Freq.csv
+
+# load model specification
+model:
+  type: stacked      # featureless, featurebased or stacked
+  # Existing model to load
+  load_path: ./checkpoints/synthetic_stacked_d5_w300.keras
+  # Optional: new name for the continued model (if you want to save separately)
+  save_name: synthetic_stacked_d5_w300.keras
+
+# Training params - will load defaults if null or invalid
+train:
+  loss: nll          # loss function - mse or nll
+  optimizer: adam    # adam or sgd
+  lr: 0.0005          # learning rate
+  batch_size: 1024
+  epochs: 5          # num of training cycles
+  patience: 5        # early stopping as a num of epochs without improvement - set 0 or null to disable
+  l2: 0.001          # regularisation rate
+
+# Evaluation params - will load defaults if null or invalid
+eval:
+  batch_size: 4096
+  loss: nll          # loss function - mse or nll

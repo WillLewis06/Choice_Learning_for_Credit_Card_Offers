@@ -1,0 +1,23 @@
+# Paths to data .csv files
+data_root: ./data
+checkpoint_dir: ./checkpoints # where to store and load saved models
+
+# .csv data file names - frequency based data is optional
+files:
+  train_raw: expedia_train.csv
+  test_raw: expedia_test.csv
+  # as a feature based data set will be 3d 
+  # we need an identifying column to group items
+  group_col: srch_id
+  choice_col: booking_bool # col values we wish to learn
+
+# load model specification
+model:
+  type: featurebased  # featureless, featurebased or stacked
+  # Existing model to load
+  load_path: ./checkpoints/expedia_featurebased_d5_w300.keras
+
+# Evaluation params - will load defaults if null or invalid
+eval:
+  batch_size: 4096
+  loss: nll          # loss function - mse or nll

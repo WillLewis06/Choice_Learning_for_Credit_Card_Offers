@@ -18,7 +18,7 @@ import tensorflow as tf
 from pathlib import Path
 
 # If this file lives in choice_learn/models/, keep the import relative.
-from models.featureless import BaseFeaturelessDeepHalo, FeaturelessDeepHalo
+from zhang.featureless import BaseFeaturelessDeepHalo, FeaturelessDeepHalo
 
 
 def _make_base(

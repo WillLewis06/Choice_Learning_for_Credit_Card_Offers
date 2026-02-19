@@ -15,9 +15,6 @@ This file focuses on orchestration and a minimal public API:
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 import tensorflow as tf
 
@@ -132,34 +129,6 @@ class LuShrinkageEstimator:
     # Optional local cache for tuned proposal scales
     # ------------------------------------------------------------------
 
-    def _debug_save_k(self, k_r, k_E_bar, k_beta, k_njt) -> None:
-        """Persist tuned proposal scales to a local json file."""
-        path = Path("./_debug_cache/lu_shrinkage_k.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        path.write_text(
-            json.dumps(
-                {
-                    "k_r": float(k_r.numpy()),
-                    "k_E_bar": float(k_E_bar.numpy()),
-                    "k_beta": float(k_beta.numpy()),
-                    "k_njt": float(k_njt.numpy()),
-                }
-            )
-        )
-
-    def _debug_load_k(self):
-        """Load tuned proposal scales from a local json file."""
-        path = Path("./_debug_cache/lu_shrinkage_k.json")
-        d = json.loads(path.read_text())
-
-        return (
-            tf.constant(d["k_r"], dtype=tf.float64),
-            tf.constant(d["k_E_bar"], dtype=tf.float64),
-            tf.constant(d["k_beta"], dtype=tf.float64),
-            tf.constant(d["k_njt"], dtype=tf.float64),
-        )
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -199,10 +168,6 @@ class LuShrinkageEstimator:
 
         # Tune each proposal scale (k_*) using a short pilot run.
         k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = tune_shrinkage(self)
-
-        # Optional: persist tuned k values to skip tuning on repeated runs.
-        self._debug_save_k(k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned)
-        # k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned = self._debug_load_k()
 
         # Diagnostics accumulates running sums used to compute posterior means.
         diag = LuShrinkageDiagnostics(T=self.T, J=self.J)

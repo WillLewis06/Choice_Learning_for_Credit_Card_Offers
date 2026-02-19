@@ -1,0 +1,33 @@
+# Paths to data .csv files
+data_root: ./data
+checkpoint_dir: ./checkpoints # where to store and load saved models
+
+# .csv data file names - frequency based data is optional
+files:
+  train_raw: hotel1_train.csv
+  test_raw: hotel1_test.csv
+  train_freq:
+  test_freq:
+
+# model specification
+model:
+  type: featureless  # featureless, featurebased or stacked
+  depth: 5           # as per the zhang25 paper meaning
+  width: 300         # dim of the hidden representation - not used in stacked
+  # name to save the model as in the checkpoints directory
+  save_name: hotel1_featureless_d5_w300 # will default if null
+
+# Training params - will load defaults if null or invalid
+train:
+  loss: nll          # loss function - mse or nll
+  optimizer: adam    # adam or sgd
+  lr: 0.0005          # learning rate
+  batch_size: 1024
+  epochs: 5          # num of training cycles
+  patience: 5        # early stopping as a num of epochs without improvement - set 0 or null to disable
+  l2: 0.001          # regularisation rate
+
+# Evaluation params - will load defaults if null or invalid
+eval:
+  batch_size: 4096
+  loss: nll          # loss function - mse or nll
