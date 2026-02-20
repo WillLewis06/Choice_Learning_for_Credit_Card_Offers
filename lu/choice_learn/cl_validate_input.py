@@ -1,225 +1,250 @@
 """
-Input validation for the choice-learn + Lu sparse-shock shrinkage estimator.
+Input validation for the choice-learn + Lu shrinkage estimator.
 
-This module centralizes all shape, dtype, and basic value checks used by:
-  - ChoiceLearnShrinkageEstimator.__init__ and .fit (Python-side validation),
-  - tuning utilities (Python-side validation),
-  - TMH kernel calls (TF-graph-safe validation usable inside tf.function).
+Scope:
+  - Validate external data tensors passed into the estimator (delta_cl, qjt, q0t).
+  - Validate external configuration mappings (init_config, fit_config).
 
-Model interface (fixed data + counts):
-  - delta_cl: tf.float64 tensor, shape (T, J)  (fixed baseline logits from choice-learn)
-  - qjt:     tf.float64 tensor, shape (T, J)  (inside counts)
-  - q0t:     tf.float64 tensor, shape (T,)    (outside counts)
-
-Design:
-  - Python-side validation is strict and raises early with clear messages.
-  - TF-side validation uses tf.debugging asserts so it can run inside compiled
-    graphs without breaking tracing.
+Policy:
+  - Reject missing or invalid inputs outright (no defaults, no fallbacks).
+  - Do not coerce or cast inputs.
 """
 
 from __future__ import annotations
 
-import tensorflow as tf
+from collections.abc import Mapping, Sequence
 
-# -----------------------------------------------------------------------------
-# Helpers (Python-side)
-# -----------------------------------------------------------------------------
+import tensorflow as tf
 
 
 def _require(cond: bool, msg: str) -> None:
-    """Raise ValueError if cond is False."""
     if not cond:
         raise ValueError(msg)
 
 
-def _require_type(x, types, msg: str) -> None:
-    """Raise TypeError if x is not an instance of types."""
+def _require_type(x, types, name: str) -> None:
     if not isinstance(x, types):
-        raise TypeError(msg)
+        raise TypeError(f"{name} must be {types}, got {type(x)}")
 
 
-def _is_float_like(x) -> bool:
-    """Return True for Python float/int values (excluding bool)."""
-    return isinstance(x, (float, int)) and not isinstance(x, bool)
+def _require_mapping(x, name: str) -> None:
+    _require_type(x, Mapping, name)
 
 
-def _require_tensor_rank(x: tf.Tensor, rank: int, name: str) -> None:
-    """Require a static tensor rank (Python-side)."""
+def _require_has_keys(section: Mapping, keys: Sequence[str], name: str) -> None:
+    missing = [k for k in keys if k not in section]
+    _require(not missing, f"{name} missing keys: {missing}")
+
+
+def _require_int(x, name: str) -> None:
+    _require_type(x, int, name)
+
+
+def _require_positive_int(x, name: str) -> None:
+    _require_int(x, name)
+    _require(x > 0, f"{name} must be > 0")
+
+
+def _require_floatlike(x, name: str) -> None:
+    _require_type(x, (int, float), name)
+
+
+def _require_nonnegative_floatlike(x, name: str) -> None:
+    _require_floatlike(x, name)
+    _require(float(x) >= 0.0, f"{name} must be >= 0")
+
+
+def _require_positive_floatlike(x, name: str) -> None:
+    _require_floatlike(x, name)
+    _require(float(x) > 0.0, f"{name} must be > 0")
+
+
+def _require_prob_band(low, high, name_low: str, name_high: str) -> None:
+    _require_floatlike(low, name_low)
+    _require_floatlike(high, name_high)
+    lo = float(low)
+    hi = float(high)
+    _require(0.0 <= lo <= 1.0, f"{name_low} must be in [0, 1]")
+    _require(0.0 <= hi <= 1.0, f"{name_high} must be in [0, 1]")
+    _require(lo <= hi, f"{name_low} must be <= {name_high}")
+
+
+def _require_tf_tensor(x, name: str) -> None:
+    if not isinstance(x, (tf.Tensor, tf.Variable)):
+        raise TypeError(f"{name} must be a tf.Tensor or tf.Variable, got {type(x)}")
+
+
+def _require_float64_tensor(x, name: str) -> None:
+    _require_tf_tensor(x, name)
+    _require(x.dtype == tf.float64, f"{name} must have dtype tf.float64, got {x.dtype}")
+
+
+def _require_static_shape(x: tf.Tensor, expected: tuple[int, ...], name: str) -> None:
+    shape = x.shape
     _require(
-        x.shape.rank == rank,
-        f"{name} must have rank {rank}; got rank {x.shape.rank}.",
+        shape.rank == len(expected),
+        f"{name} must have rank {len(expected)}, got {shape.rank}",
+    )
+    dims = shape.as_list()
+    _require(
+        all(d is not None for d in dims),
+        f"{name} must have a fully known static shape, got {shape}",
+    )
+    _require(
+        tuple(dims) == expected, f"{name} must have shape {expected}, got {tuple(dims)}"
     )
 
 
-def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
-    """Require x to be a tf.Tensor with dtype tf.float64."""
-    _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
-    _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
+def _require_all_finite(x: tf.Tensor, name: str) -> None:
+    tf.debugging.assert_all_finite(x, f"{name} must be finite")
 
 
-def _require_float64_variable(x, name: str) -> None:
-    """Require x to be a tf.Variable with dtype tf.float64."""
-    _require_type(x, tf.Variable, f"{name} must be a tf.Variable (no backward compat).")
-    _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
-
-
-def _require_positive_int(x: int, name: str) -> None:
-    """Require x to be a positive Python int."""
-    _require_type(x, int, f"{name} must be an int.")
-    _require(x > 0, f"{name} must be > 0; got {x}.")
-
-
-def _require_float(x: float, name: str) -> None:
-    """Require x to be a Python float/int (excluding bool)."""
-    _require(_is_float_like(x), f"{name} must be a float or int; got {type(x)}.")
-
-
-def _require_prob_band(low: float, high: float, low_name: str, high_name: str) -> None:
-    """Require 0 <= low <= high <= 1 for acceptance-rate targets."""
-    _require_float(low, low_name)
-    _require_float(high, high_name)
-    _require(0.0 <= float(low) <= 1.0, f"{low_name} must be in [0,1]; got {low}.")
-    _require(0.0 <= float(high) <= 1.0, f"{high_name} must be in [0,1]; got {high}.")
-    _require(
-        float(low) <= float(high),
-        f"Must have {low_name} <= {high_name}; got {low} > {high}.",
+def _require_nonnegative(x: tf.Tensor, name: str) -> None:
+    tf.debugging.assert_greater_equal(
+        x, tf.zeros([], tf.float64), f"{name} must be >= 0"
     )
 
 
-# -----------------------------------------------------------------------------
-# Estimator entrypoints (Python-side)
-# -----------------------------------------------------------------------------
+def _require_binary_01(x: tf.Tensor, name: str) -> None:
+    ok = tf.reduce_all(tf.logical_or(tf.equal(x, 0.0), tf.equal(x, 1.0)))
+    _require(bool(ok.numpy()), f"{name} must be binary in {{0,1}}")
 
 
-def init_validate_input(
-    delta_cl: tf.Tensor,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-) -> None:
-    """Validate ChoiceLearnShrinkageEstimator.__init__ inputs.
+def _require_open_unit_interval(x: tf.Tensor, name: str) -> None:
+    gt0 = tf.reduce_all(x > 0.0)
+    lt1 = tf.reduce_all(x < 1.0)
+    _require(
+        bool(gt0.numpy()) and bool(lt1.numpy()),
+        f"{name} must satisfy 0 < {name} < 1 elementwise",
+    )
 
-    Strict contract:
-      - delta_cl, qjt: tf.float64, rank-2, identical static shape (T, J).
-      - q0t: tf.float64, rank-1, static shape (T,) matching delta_cl.shape[0].
 
-    Notes:
-      - We require static (T, J) so downstream code can allocate variables once.
-      - Counts are validated for shape/dtype here; non-negativity checks are
-        intentionally not enforced at init-time to keep this minimal (you may
-        add them later if desired).
-    """
+def validate_data_inputs(
+    delta_cl: tf.Tensor, qjt: tf.Tensor, q0t: tf.Tensor
+) -> tuple[int, int]:
+    """Validate external data tensors and return (T, J)."""
     _require_float64_tensor(delta_cl, "delta_cl")
     _require_float64_tensor(qjt, "qjt")
     _require_float64_tensor(q0t, "q0t")
 
-    _require_tensor_rank(delta_cl, 2, "delta_cl")
-    _require_tensor_rank(qjt, 2, "qjt")
-    _require_tensor_rank(q0t, 1, "q0t")
-
     _require(
-        qjt.shape == delta_cl.shape,
-        f"qjt must have same shape as delta_cl; got {qjt.shape} vs {delta_cl.shape}.",
+        delta_cl.shape.rank == 2,
+        f"delta_cl must have rank 2, got {delta_cl.shape.rank}",
+    )
+    _require(qjt.shape.rank == 2, f"qjt must have rank 2, got {qjt.shape.rank}")
+    _require(q0t.shape.rank == 1, f"q0t must have rank 1, got {q0t.shape.rank}")
+
+    dc = delta_cl.shape.as_list()
+    qj = qjt.shape.as_list()
+    q0 = q0t.shape.as_list()
+    _require(
+        all(d is not None for d in dc),
+        f"delta_cl must have static shape (T,J), got {delta_cl.shape}",
+    )
+    _require(
+        all(d is not None for d in qj),
+        f"qjt must have static shape (T,J), got {qjt.shape}",
+    )
+    _require(
+        all(d is not None for d in q0),
+        f"q0t must have static shape (T,), got {q0t.shape}",
     )
 
+    T, J = int(dc[0]), int(dc[1])
     _require(
-        delta_cl.shape[0] is not None and delta_cl.shape[1] is not None,
-        f"delta_cl must have static shape (T,J); got {delta_cl.shape}.",
+        qj[0] == T and qj[1] == J,
+        f"qjt shape must match delta_cl shape {(T, J)}, got {tuple(qj)}",
     )
-    T = int(delta_cl.shape[0])
+    _require(q0[0] == T, f"q0t length must match T={T}, got {q0[0]}")
 
+    _require_all_finite(delta_cl, "delta_cl")
+    _require_all_finite(qjt, "qjt")
+    _require_all_finite(q0t, "q0t")
+
+    _require_nonnegative(qjt, "qjt")
+    _require_nonnegative(q0t, "q0t")
+
+    return T, J
+
+
+def validate_init_config(config: Mapping[str, object], T: int, J: int) -> None:
+    """Validate estimator construction config (priors + initial state)."""
+    _require_mapping(config, "init_config")
+    _require_positive_int(T, "T")
+    _require_positive_int(J, "J")
+
+    _require_has_keys(config, ["seed", "posterior", "init_state"], "init_config")
+
+    seed = config["seed"]
+    posterior = config["posterior"]
+    init_state = config["init_state"]
+
+    _require_int(seed, "seed")
+    _require_mapping(posterior, "posterior")
+    _require_mapping(init_state, "init_state")
+
+    posterior_keys = [
+        "alpha_mean",
+        "alpha_var",
+        "E_bar_mean",
+        "E_bar_var",
+        "T0_sq",
+        "T1_sq",
+        "a_phi",
+        "b_phi",
+    ]
+    _require_has_keys(posterior, posterior_keys, "posterior")
+
+    _require_floatlike(posterior["alpha_mean"], "posterior.alpha_mean")
+    _require_positive_floatlike(posterior["alpha_var"], "posterior.alpha_var")
+    _require_floatlike(posterior["E_bar_mean"], "posterior.E_bar_mean")
+    _require_positive_floatlike(posterior["E_bar_var"], "posterior.E_bar_var")
+    _require_positive_floatlike(posterior["T0_sq"], "posterior.T0_sq")
+    _require_positive_floatlike(posterior["T1_sq"], "posterior.T1_sq")
+    _require_positive_floatlike(posterior["a_phi"], "posterior.a_phi")
+    _require_positive_floatlike(posterior["b_phi"], "posterior.b_phi")
     _require(
-        q0t.shape[0] is not None,
-        f"q0t must have static shape (T,); got {q0t.shape}.",
-    )
-    _require(int(q0t.shape[0]) == T, f"q0t must be shape (T,) with T={T}.")
-
-
-def fit_validate_input(
-    n_iter: int,
-    pilot_length: int,
-    ridge: float,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor_rw: float,
-    factor_tmh: float,
-) -> None:
-    """Validate ChoiceLearnShrinkageEstimator.fit controls.
-
-    Strict contract:
-      - n_iter, pilot_length, max_rounds: int > 0
-      - ridge: float >= 0
-      - target band: 0 <= target_low <= target_high <= 1
-      - factor_rw, factor_tmh: float > 1
-    """
-    _require_positive_int(n_iter, "n_iter")
-    _require_positive_int(pilot_length, "pilot_length")
-    _require_positive_int(max_rounds, "max_rounds")
-
-    _require_float(ridge, "ridge")
-    _require(float(ridge) >= 0.0, f"ridge must be >= 0; got {ridge}.")
-
-    _require_prob_band(target_low, target_high, "target_low", "target_high")
-
-    _require_float(factor_rw, "factor_rw")
-    _require_float(factor_tmh, "factor_tmh")
-    _require(float(factor_rw) > 1.0, f"factor_rw must be > 1; got {factor_rw}.")
-    _require(float(factor_tmh) > 1.0, f"factor_tmh must be > 1; got {factor_tmh}.")
-
-
-def tune_k_validate_input(
-    k0: tf.Tensor,
-    pilot_length: int,
-    target_low: float,
-    target_high: float,
-    max_rounds: int,
-    factor: float,
-    name: str,
-) -> None:
-    """Validate tune_k controls (Python-side).
-
-    Strict contract:
-      - k0: scalar tf.float64 > 0
-      - pilot_length, max_rounds: int > 0
-      - factor: float > 1
-      - target band: 0 <= target_low <= target_high <= 1
-      - name: str (used for logging only)
-    """
-    _require_float64_tensor(k0, "k0")
-    _require_tensor_rank(k0, 0, "k0")
-
-    # Keep the strict check aligned with the docstring: require k0 > 0.
-    _require(
-        float(k0.numpy()) > 0.0,
-        f"k0 must be > 0; got {float(k0.numpy())}.",
+        float(posterior["T1_sq"]) > float(posterior["T0_sq"]),
+        "posterior.T1_sq must be > posterior.T0_sq",
     )
 
-    _require_positive_int(pilot_length, "pilot_length")
-    _require_positive_int(max_rounds, "max_rounds")
+    init_keys = ["alpha", "E_bar", "njt", "gamma", "phi"]
+    _require_has_keys(init_state, init_keys, "init_state")
 
-    _require_prob_band(target_low, target_high, "target_low", "target_high")
+    alpha0 = init_state["alpha"]
+    E_bar0 = init_state["E_bar"]
+    njt0 = init_state["njt"]
+    gamma0 = init_state["gamma"]
+    phi0 = init_state["phi"]
 
-    _require_float(factor, "factor")
-    _require(float(factor) > 1.0, f"factor must be > 1; got {factor}.")
+    _require_float64_tensor(alpha0, "init_state.alpha")
+    _require_float64_tensor(E_bar0, "init_state.E_bar")
+    _require_float64_tensor(njt0, "init_state.njt")
+    _require_float64_tensor(gamma0, "init_state.gamma")
+    _require_float64_tensor(phi0, "init_state.phi")
 
-    _require_type(name, str, "name must be a str.")
+    _require_static_shape(alpha0, (), "init_state.alpha")
+    _require_static_shape(E_bar0, (T,), "init_state.E_bar")
+    _require_static_shape(njt0, (T, J), "init_state.njt")
+    _require_static_shape(gamma0, (T, J), "init_state.gamma")
+    _require_static_shape(phi0, (T,), "init_state.phi")
+
+    _require_all_finite(alpha0, "init_state.alpha")
+    _require_all_finite(E_bar0, "init_state.E_bar")
+    _require_all_finite(njt0, "init_state.njt")
+    _require_all_finite(gamma0, "init_state.gamma")
+    _require_all_finite(phi0, "init_state.phi")
+
+    _require_binary_01(gamma0, "init_state.gamma")
+    _require_open_unit_interval(phi0, "init_state.phi")
 
 
-def tune_shrinkage_validate_input(shrink) -> None:
-    """Validate that `shrink` exposes the attributes required by tuning.
+def validate_fit_config(config: Mapping[str, object]) -> None:
+    """Validate fit() configuration (run length + tuning settings)."""
+    _require_mapping(config, "fit_config")
 
-    This is a structural check: `tune_shrinkage` relies on a specific estimator
-    interface (data tensors, state variables, posterior, RNG, and tuning knobs).
-
-    It enforces:
-      - required attributes exist,
-      - tuning knobs have valid types/values,
-      - tensors have expected dtypes and ranks,
-      - state objects are tf.Variable where .read_value() is used.
-
-    This function is Python-side only; do not call it inside tf.function.
-    """
     required = [
+        "n_iter",
         "pilot_length",
         "ridge",
         "target_low",
@@ -227,106 +252,40 @@ def tune_shrinkage_validate_input(shrink) -> None:
         "max_rounds",
         "factor_rw",
         "factor_tmh",
-        "T",
-        "qjt",
-        "q0t",
-        "delta_cl",
-        "alpha",
-        "E_bar",
-        "njt",
-        "gamma",
-        "phi",
-        "posterior",
-        "rng",
+        "k_alpha0",
+        "k_E_bar0",
+        "k_njt0",
+        "tune_seed",
     ]
-    missing = [name for name in required if not hasattr(shrink, name)]
-    _require(not missing, "tune_shrinkage missing attributes: " + ", ".join(missing))
+    _require_has_keys(config, required, "fit_config")
 
-    # Validate scalar tuning controls.
-    pilot_length = shrink.pilot_length
-    max_rounds = shrink.max_rounds
-    ridge = shrink.ridge
-    target_low = shrink.target_low
-    target_high = shrink.target_high
-    factor_rw = shrink.factor_rw
-    factor_tmh = shrink.factor_tmh
+    n_iter = config["n_iter"]
+    pilot_length = config["pilot_length"]
 
-    _require_type(pilot_length, int, "pilot_length must be an int.")
-    _require(pilot_length > 0, f"pilot_length must be > 0; got {pilot_length}.")
+    _require_positive_int(n_iter, "n_iter")
+    _require_positive_int(pilot_length, "pilot_length")
+    _require(pilot_length <= n_iter, "pilot_length must be <= n_iter")
 
-    _require_type(max_rounds, int, "max_rounds must be an int.")
-    _require(max_rounds > 0, f"max_rounds must be > 0; got {max_rounds}.")
-
-    _require_float(ridge, "ridge")
-    _require(float(ridge) >= 0.0, f"ridge must be >= 0; got {ridge}.")
-
-    _require_prob_band(target_low, target_high, "target_low", "target_high")
-
-    _require_float(factor_rw, "factor_rw")
-    _require_float(factor_tmh, "factor_tmh")
-    _require(float(factor_rw) > 1.0, f"factor_rw must be > 1; got {factor_rw}.")
-    _require(float(factor_tmh) > 1.0, f"factor_tmh must be > 1; got {factor_tmh}.")
-
-    # Data tensors (must be tf.Tensor, float64).
-    for name, rank in [("qjt", 2), ("delta_cl", 2), ("q0t", 1)]:
-        x = getattr(shrink, name)
-        _require_float64_tensor(x, name)
-        _require_tensor_rank(x, rank, name)
-
-    # Require qjt and delta_cl shapes to match statically (if available).
-    qjt = shrink.qjt
-    delta_cl = shrink.delta_cl
-    _require(
-        qjt.shape == delta_cl.shape,
-        f"qjt must have same shape as delta_cl; got {qjt.shape} vs {delta_cl.shape}.",
+    _require_nonnegative_floatlike(config["ridge"], "ridge")
+    _require_prob_band(
+        config["target_low"], config["target_high"], "target_low", "target_high"
     )
+    _require_positive_int(config["max_rounds"], "max_rounds")
 
-    # State must be tf.Variable (since tune_shrinkage uses .read_value()).
-    for name, rank in [
-        ("alpha", 0),
-        ("E_bar", 1),
-        ("njt", 2),
-        ("gamma", 2),
-        ("phi", 1),
-    ]:
-        x = getattr(shrink, name)
-        _require_float64_variable(x, name)
-        _require_tensor_rank(x.read_value(), rank, f"{name}.read_value()")
+    _require_positive_floatlike(config["factor_rw"], "factor_rw")
+    _require_positive_floatlike(config["factor_tmh"], "factor_tmh")
+    _require(float(config["factor_rw"]) > 1.0, "factor_rw must be > 1")
+    _require(float(config["factor_tmh"]) > 1.0, "factor_tmh must be > 1")
 
+    _require_positive_floatlike(config["k_alpha0"], "k_alpha0")
+    _require_positive_floatlike(config["k_E_bar0"], "k_E_bar0")
+    _require_positive_floatlike(config["k_njt0"], "k_njt0")
 
-# -----------------------------------------------------------------------------
-# TMH validation (TF-side) — callable inside @tf.function
-# -----------------------------------------------------------------------------
+    _require_int(config["tune_seed"], "tune_seed")
 
 
-@tf.function(reduce_retracing=True)
-def tmh_step_validate_input_tf(
-    theta0: tf.Tensor,
-    k: tf.Tensor,
-    ridge: tf.Tensor,
-) -> None:
-    """Validate TMH inputs inside a compiled TF graph.
-
-    Enforced:
-      - theta0: rank-1 tf.float64 tensor with finite entries
-      - k: scalar tf.float64, finite, and k > 0
-      - ridge: scalar tf.float64, finite, and ridge >= 0
-
-    The TMH step relies on gradients/Hessians and linear algebra; these checks
-    catch invalid inputs early and provide clear error messages.
-    """
-    tf.debugging.assert_type(theta0, tf.float64)
-    tf.debugging.assert_rank(theta0, 1)
-    tf.debugging.assert_all_finite(theta0, "theta0 contains non-finite values.")
-
-    tf.debugging.assert_type(k, tf.float64)
-    tf.debugging.assert_rank(k, 0)
-    tf.debugging.assert_all_finite(k, "k is non-finite.")
-    tf.debugging.assert_greater(k, tf.constant(0.0, tf.float64), "k must be > 0.")
-
-    tf.debugging.assert_type(ridge, tf.float64)
-    tf.debugging.assert_rank(ridge, 0)
-    tf.debugging.assert_all_finite(ridge, "ridge is non-finite.")
-    tf.debugging.assert_greater_equal(
-        ridge, tf.constant(0.0, tf.float64), "ridge must be >= 0."
+def fit_validate_input(*args, **kwargs):
+    """Deprecated. Use validate_fit_config(fit_config) instead."""
+    raise RuntimeError(
+        "fit_validate_input is deprecated. Use validate_fit_config(fit_config)."
     )

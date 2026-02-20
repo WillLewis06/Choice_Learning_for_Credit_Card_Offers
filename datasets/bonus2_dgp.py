@@ -1,6 +1,7 @@
-"""datasets/bonus2_dgp.py
+"""
+datasets/bonus2_dgp.py
 
-Bonus Q2 DGP (updated spec)
+Bonus Q2 DGP
 
 Conventions
 -----------
@@ -18,10 +19,10 @@ For inside options j=1..J:
 
   v_{m,i,j,t} =
       delta_{m,j}
-    + beta_market_j[j]
+    + beta_intercept_j[j]
     + beta_habit_j[j] * H_{m,i,j,t}
     + beta_peer_j[j]  * P_{m,i,j,t}
-    + beta_dow_j[j, w(t)]
+    + beta_weekend_jw[j, w(t)]
     + S_m(t)
 
 Outside option:
@@ -42,11 +43,11 @@ Seasonality (market-only)
 
 Day-of-week (product-only; binary)
 ----------------------------------
-  w(t) ∈ {0,1} and DOW shift is beta_dow_j[j, w(t)].
+  w(t) ∈ {0,1} and the shift is beta_weekend_jw[j, w(t)].
 
 Product intercept (product-only)
 --------------------------------
-  beta_market_j[j] is an intercept shift beyond delta_{m,j}.
+  beta_intercept_j[j] is an intercept shift beyond delta_{m,j}.
 
 Parameter draws
 ---------------
@@ -54,16 +55,16 @@ All hyperparameters are read from the dict `dgp_hyperparams` with no defaults.
 This file expects (minimum):
   habit_mean, habit_sd
   peer_mean, peer_sd
-  mktprod_sd        (used for beta_market_j; name kept to reduce downstream edits)
-  dow_prod_sd       (used for beta_dow_j over w∈{0,1})
+  mktprod_sd        (used for beta_intercept_j; name kept to reduce downstream edits)
+  weekend_prod_sd   (used for beta_weekend_jw over w∈{0,1})
   season_mkt_sd     (used for market seasonality a_m,b_m)
 
 Notes
 -----
 - Market-level seasonality only (no product seasonality).
-- Product-level DOW only (binary weekday/weekend; no market DOW).
+- Product-level weekend only (binary weekday/weekend; no market DOW).
 - Product intercept shift only (no market×product intercept beyond delta).
-- All input validation is centralized in bonus2/bonus2_input_validation.py.
+- External input validation is centralized in bonus2/bonus2_input_validation.py.
 """
 
 from __future__ import annotations
@@ -83,9 +84,9 @@ from bonus2.bonus2_input_validation import (
 # -----------------------------------------------------------------------------
 
 
-def make_rng(seed: Any) -> np.random.Generator:
-    """Create a NumPy random generator (seed may be None)."""
-    return np.random.default_rng(seed)
+def make_rng(seed: int) -> np.random.Generator:
+    """Create a NumPy random generator."""
+    return np.random.default_rng(int(seed))
 
 
 # -----------------------------------------------------------------------------
@@ -189,7 +190,7 @@ def sample_core_product_params(J: int, rng, dgp_hyperparams: dict):
 
 
 def sample_product_intercepts(J: int, rng, dgp_hyperparams: dict):
-    """Sample product-only intercept shifts beta_market_j (J,)."""
+    """Sample product-only intercept shifts beta_intercept_j (J,)."""
     J = int(J)
     mkt_sd = float(dgp_hyperparams["mktprod_sd"])  # name kept to reduce edits elsewhere
     return rng.normal(loc=0.0, scale=mkt_sd, size=J).astype(np.float64)
@@ -218,10 +219,10 @@ def sample_time_market_params(M: int, K: int, rng, dgp_hyperparams: dict):
 
 
 def sample_time_product_params(J: int, rng, dgp_hyperparams: dict):
-    """Sample product-level weekday/weekend effects beta_dow_j (J,2)."""
+    """Sample product-level weekday/weekend effects beta_weekend_jw (J,2)."""
     J = int(J)
-    dow_prod_sd = float(dgp_hyperparams["dow_prod_sd"])
-    return rng.normal(loc=0.0, scale=dow_prod_sd, size=(J, 2)).astype(np.float64)
+    weekend_prod_sd = float(dgp_hyperparams["weekend_prod_sd"])
+    return rng.normal(loc=0.0, scale=weekend_prod_sd, size=(J, 2)).astype(np.float64)
 
 
 # -----------------------------------------------------------------------------
@@ -233,13 +234,13 @@ def generate_sparse_network(N: int, avg_friends: float, friends_sd: float, rng):
     """Generate adjacency list (within a market).
 
     Out-degree K_i ~ Normal(avg_friends, friends_sd^2), rounded, clipped to [0, N-1].
-    nbrs[i] is an int64 array of out-neighbors consumer i observes.
+    neighbors[i] is an int64 array of out-neighbors consumer i observes.
     """
     N = int(N)
     mu = float(avg_friends)
     sd = float(friends_sd)
 
-    nbrs = []
+    neighbors = []
     all_idx = np.arange(N, dtype=np.int64)
 
     for i in range(N):
@@ -247,14 +248,14 @@ def generate_sparse_network(N: int, avg_friends: float, friends_sd: float, rng):
         k = max(0, min(k, N - 1))
 
         if k == 0:
-            nbrs.append(np.zeros(0, dtype=np.int64))
+            neighbors.append(np.zeros(0, dtype=np.int64))
             continue
 
         candidates = np.concatenate([all_idx[:i], all_idx[i + 1 :]])
         chosen = rng.choice(candidates, size=k, replace=False).astype(np.int64)
-        nbrs.append(chosen)
+        neighbors.append(chosen)
 
-    return nbrs
+    return neighbors
 
 
 def _update_recent_choice_counts_inplace(C_counts, y_vec, sign: int):
@@ -280,13 +281,13 @@ def advance_peer_window(peer_buf, buf_pos: int, counts, y_new):
     return (buf_pos + 1) % peer_buf.shape[0]
 
 
-def peer_exposure_from_recent_counts(C_counts, nbrs):
+def peer_exposure_from_recent_counts(C_counts, neighbors):
     """Compute peer exposure P from recent inside-choice counts."""
-    N = len(nbrs)
+    N = len(neighbors)
     P = np.zeros((N, C_counts.shape[1]), dtype=np.float64)
 
     for i in range(N):
-        ni = nbrs[i]
+        ni = neighbors[i]
         if ni.size:
             P[i, :] = C_counts[ni, :].sum(axis=0)
 
@@ -334,23 +335,23 @@ def sample_mnl(v, rng):
 
 def simulate_one_market(
     delta_mj,
-    beta_market_j,
-    beta_dow_j,
+    beta_intercept_j,
+    beta_weekend_jw,
     weekend_t,
     S_m,
     beta_habit_j,
     beta_peer_j,
     decay: float,
-    nbrs,
+    neighbors,
     rng,
-    peer_lookback_L: int,
+    lookback: int,
 ):
     """Simulate one market panel y_{i,t}."""
-    L = int(peer_lookback_L)
+    L = int(lookback)
 
     delta_mj = np.asarray(delta_mj, dtype=np.float64)
-    beta_market_j = np.asarray(beta_market_j, dtype=np.float64)
-    beta_dow_j = np.asarray(beta_dow_j, dtype=np.float64)
+    beta_intercept_j = np.asarray(beta_intercept_j, dtype=np.float64)
+    beta_weekend_jw = np.asarray(beta_weekend_jw, dtype=np.float64)
     weekend_t = np.asarray(weekend_t, dtype=np.int64)
     S_m = np.asarray(S_m, dtype=np.float64)
     beta_habit_j = np.asarray(beta_habit_j, dtype=np.float64)
@@ -359,7 +360,7 @@ def simulate_one_market(
 
     J = int(delta_mj.shape[0])
     T = int(weekend_t.shape[0])
-    N = len(nbrs)
+    N = len(neighbors)
 
     y_it = np.zeros((N, T), dtype=np.int64)
     H = np.zeros((N, J), dtype=np.float64)
@@ -369,10 +370,10 @@ def simulate_one_market(
     recent_counts = np.zeros((N, J), dtype=np.int32)
 
     for t in range(T):
-        P = peer_exposure_from_recent_counts(recent_counts, nbrs)  # (N,J)
+        P = peer_exposure_from_recent_counts(recent_counts, neighbors)  # (N,J)
         w = int(weekend_t[t])
 
-        base_j = delta_mj + beta_market_j + beta_dow_j[:, w] + S_m[t]
+        base_j = delta_mj + beta_intercept_j + beta_weekend_jw[:, w] + S_m[t]
         v = base_j[None, :] + beta_habit_j[None, :] * H + beta_peer_j[None, :] * P
 
         y = sample_mnl(v, rng)
@@ -391,21 +392,21 @@ def simulate_one_market(
 
 
 def simulate_bonus2_dgp(
-    delta,
+    delta_mj,
     N: int,
     T: int,
     avg_friends: float,
     params_true: dict,
     decay: float,
-    seed: Any,
+    seed: int,
     season_period: int,
     friends_sd: float,
     K: int,
-    peer_lookback_L: int,
+    lookback: int,
 ):
-    """Simulate multi-market data for Bonus Q2 under the updated spec."""
+    """Simulate multi-market data for Bonus Q2."""
     validate_bonus2_dgp_inputs(
-        delta=delta,
+        delta_mj=delta_mj,
         N=N,
         T=T,
         avg_friends=avg_friends,
@@ -415,79 +416,76 @@ def simulate_bonus2_dgp(
         season_period=season_period,
         friends_sd=friends_sd,
         K=K,
-        peer_lookback_L=peer_lookback_L,
+        lookback=lookback,
     )
 
-    delta = np.asarray(delta, dtype=np.float64)
-    M, J = delta.shape
+    delta_mj = np.asarray(delta_mj, dtype=np.float64)
+    M, J = delta_mj.shape
 
     N = int(N)
     T = int(T)
     K = int(K)
-    peer_lookback_L = int(peer_lookback_L)
+    lookback = int(lookback)
 
     rng = make_rng(seed)
 
-    weekend_t, theta, season_sin_kt, season_cos_kt, dow = generate_time_features(
+    weekend_t, _, season_sin_kt, season_cos_kt, _ = generate_time_features(
         T, season_period, K
     )
 
-    # Draw parameters
     beta_habit_j, beta_peer_j = sample_core_product_params(
         J=J, rng=rng, dgp_hyperparams=params_true
     )
-    beta_market_j = sample_product_intercepts(J=J, rng=rng, dgp_hyperparams=params_true)
-    beta_dow_j = sample_time_product_params(J=J, rng=rng, dgp_hyperparams=params_true)
+    beta_intercept_j = sample_product_intercepts(
+        J=J, rng=rng, dgp_hyperparams=params_true
+    )
+    beta_weekend_jw = sample_time_product_params(
+        J=J, rng=rng, dgp_hyperparams=params_true
+    )
     a_m, b_m = sample_time_market_params(M=M, K=K, rng=rng, dgp_hyperparams=params_true)
 
-    # Precompute market seasonal series
     S_m_all = fourier_seasonality(a_m, b_m, season_sin_kt, season_cos_kt)  # (M,T)
 
-    y = np.zeros((M, N, T), dtype=np.int64)
-    nbrs_list = []
+    y_mit = np.zeros((M, N, T), dtype=np.int64)
+    neighbors_m = []
 
     for m in range(M):
-        nbrs = generate_sparse_network(N, avg_friends, friends_sd, rng)
-        nbrs_list.append(nbrs)
+        neighbors = generate_sparse_network(N, avg_friends, friends_sd, rng)
+        neighbors_m.append(neighbors)
 
-        y[m] = simulate_one_market(
-            delta_mj=delta[m],
-            beta_market_j=beta_market_j,
-            beta_dow_j=beta_dow_j,
+        y_mit[m] = simulate_one_market(
+            delta_mj=delta_mj[m],
+            beta_intercept_j=beta_intercept_j,
+            beta_weekend_jw=beta_weekend_jw,
             weekend_t=weekend_t,
             S_m=S_m_all[m],
             beta_habit_j=beta_habit_j,
             beta_peer_j=beta_peer_j,
             decay=decay,
-            nbrs=nbrs,
+            neighbors=neighbors,
             rng=rng,
-            peer_lookback_L=peer_lookback_L,
+            lookback=lookback,
         )
 
     panel = {
-        # observed / known inputs
-        "y": y,
-        "delta": delta,
-        "w": weekend_t,
-        "dow": dow,
-        "theta": theta,
+        "y_mit": y_mit,
+        "delta_mj": delta_mj,
+        "is_weekend_t": weekend_t,
+        "neighbors_m": neighbors_m,
+        "lookback": lookback,
         "season_sin_kt": season_sin_kt,
         "season_cos_kt": season_cos_kt,
-        "nbrs": nbrs_list,
-        "decay": float(decay),
-        # true parameters (for evaluation)
-        "beta_market_j": beta_market_j,
+        "decay": decay,
+    }
+    validate_bonus2_panel(panel)
+
+    theta_true = {
+        "beta_intercept_j": beta_intercept_j,
         "beta_habit_j": beta_habit_j,
         "beta_peer_j": beta_peer_j,
-        "beta_dow_j": beta_dow_j,
+        "beta_weekend_jw": beta_weekend_jw,
         "a_m": a_m,
         "b_m": b_m,
-        # metadata
-        "season_period": int(season_period),
-        "K": int(K),
-        "peer_lookback_L": int(peer_lookback_L),
-        "params_true": params_true,
     }
 
-    validate_bonus2_panel(panel)
-    return panel
+    return {"panel": panel, "theta_true": theta_true}

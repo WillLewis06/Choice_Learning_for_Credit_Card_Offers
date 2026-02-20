@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 
-from lu.shrinkage.lu_posterior import LuPosteriorTF
+from lu.shrinkage.lu_posterior import LuPosteriorConfig, LuPosteriorTF
 from lu_conftest import (
     assert_all_finite_tf,
     assert_prob_simplex_tf,
@@ -84,7 +84,32 @@ def _make_tiny_inputs() -> dict:
     }
 
 
-posterior = LuPosteriorTF(n_draws=25, seed=123, dtype=DTYPE)
+POSTERIOR_CONFIG = LuPosteriorConfig(
+    # Monte Carlo integration settings
+    n_draws=25,
+    seed=123,
+    # Numeric settings
+    dtype=DTYPE,
+    eps=1e-12,
+    # Global priors: Normal(mean, var)
+    beta_p_mean=-1.0,
+    beta_p_var=1.0,
+    beta_w_mean=0.3,
+    beta_w_var=1.0,
+    r_mean=0.0,
+    r_var=1.0,
+    # Market common shock prior: Normal(mean, var)
+    E_bar_mean=0.0,
+    E_bar_var=1.0,
+    # Spike-and-slab variances for njt (must satisfy T1_sq > T0_sq)
+    T0_sq=1e-2,
+    T1_sq=1.0,
+    # Beta prior for phi
+    a_phi=1.0,
+    b_phi=1.0,
+)
+
+posterior = LuPosteriorTF(config=POSTERIOR_CONFIG)
 tiny_inputs = _make_tiny_inputs()
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 
-from lu.shrinkage.lu_posterior import LuPosteriorTF
+from lu.shrinkage.lu_posterior import LuPosteriorConfig, LuPosteriorTF
 from lu.shrinkage.lu_updates import (
     update_E_bar,
     update_beta,
@@ -32,8 +32,29 @@ K = tf.constant(0.1, dtype=DTYPE)
 RIDGE = tf.constant(1e-6, dtype=DTYPE)
 
 
+def _posterior_config(n_draws: int, seed: int) -> LuPosteriorConfig:
+    return LuPosteriorConfig(
+        n_draws=int(n_draws),
+        seed=int(seed),
+        dtype=DTYPE,
+        eps=1e-12,
+        beta_p_mean=-1.0,
+        beta_p_var=1.0,
+        beta_w_mean=0.3,
+        beta_w_var=1.0,
+        r_mean=0.0,
+        r_var=1.0,
+        E_bar_mean=0.0,
+        E_bar_var=1.0,
+        T0_sq=1e-2,
+        T1_sq=1.0,
+        a_phi=1.0,
+        b_phi=1.0,
+    )
+
+
 def _posterior() -> LuPosteriorTF:
-    return LuPosteriorTF(n_draws=25, seed=123, dtype=DTYPE)
+    return LuPosteriorTF(config=_posterior_config(n_draws=25, seed=123))
 
 
 def _rng(seed: int) -> tf.random.Generator:
@@ -100,7 +121,6 @@ def _assert_bool_like_tf(x: tf.Tensor) -> None:
     if xv.size == 0:
         raise AssertionError("Expected non-empty bool-like tensor.")
 
-    # Allow exact {0,1} or values extremely close to {0,1}.
     xv_r = np.round(xv)
     if not np.all(np.isfinite(xv)):
         raise AssertionError("Bool-like tensor contains non-finite values.")

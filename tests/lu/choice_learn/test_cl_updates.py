@@ -30,9 +30,20 @@ DTYPE = tf.float64
 K = tf.constant(0.1, dtype=DTYPE)
 RIDGE = tf.constant(1e-6, dtype=DTYPE)
 
+_POSTERIOR_CONFIG = {
+    "alpha_mean": 1.0,
+    "alpha_var": 1.0,
+    "E_bar_mean": 0.0,
+    "E_bar_var": 1.0,
+    "T0_sq": 0.01,
+    "T1_sq": 1.0,
+    "a_phi": 2.0,
+    "b_phi": 2.0,
+}
+
 
 def _posterior() -> LuPosteriorTF:
-    return LuPosteriorTF(dtype=DTYPE)
+    return LuPosteriorTF(_POSTERIOR_CONFIG)
 
 
 def _rng(seed: int) -> tf.random.Generator:

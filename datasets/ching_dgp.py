@@ -1,14 +1,14 @@
 """
 Ching-style stockpiling DGP (multi-product, seller-observed).
 
-This DGP implements the Phase-3 model where:
+This DGP implements a Phase-3 model where:
   - all products j=1..J are modelled in the stockpiling layer
   - each (market, product) pair has its own exogenous Markov price-state process
   - price-state processes are simulated independently across (market, product) pairs (by construction)
 
 Upstream truth inputs (from Phase 1–2):
-  - delta_true (J,) product baseline utilities
-  - E_bar_true (M,) market shocks
+  - delta_true (J,)  product baseline utilities
+  - E_bar_true (M,)  market shocks
   - njt_true   (M,J) market-product shocks
 
 Phase-3 market-product intercept passed into the stockpiling layer:
@@ -17,12 +17,14 @@ Phase-3 market-product intercept passed into the stockpiling layer:
 Seller-observed outputs:
   - a_mnjt      (M, N, J, T) purchases (0/1, stored as int64)
   - p_state_mjt (M, J, T)    price states (int64)
-  - u_mj_true   (M, J)       fixed market-product intercepts (float64)
+  - u_mj_true   (M, J)       fixed market-product intercepts (unscaled, float64)
 
 True parameters (DGP draws):
   - global: beta (scalar)
   - per product (J,): alpha, v, fc
-  - per (market, consumer) (M,N): lambda   (note: renamed from lambda_c)
+  - per (market, consumer) (M,N): lambda
+  - per market (M,): u_scale  (strictly positive), applied to u_mj_true inside buy utility:
+        u_eff[m,j] = u_scale[m] * u_mj_true[m,j]
 
 Model conventions:
   - markets are independent
@@ -65,11 +67,12 @@ def sample_theta_true(
     Sample "true" parameters used by the DGP.
 
     Returns dict of ndarrays:
-      - beta: scalar float64 stored as 0-d ndarray
-      - alpha: (J,) float64
-      - v: (J,) float64
-      - fc: (J,) float64
+      - beta:   scalar float64 stored as 0-d ndarray
+      - alpha:  (J,) float64
+      - v:      (J,) float64
+      - fc:     (J,) float64
       - lambda: (M,N) float64, in (0,1)
+      - u_scale:(M,) float64, strictly positive
     """
     beta = np.asarray(rng.uniform(0.85, 0.98), dtype=np.float64)
 
@@ -81,7 +84,17 @@ def sample_theta_true(
     lam_logit = rng.normal(loc=_logit(0.25), scale=0.8, size=(M, N)).astype(np.float64)
     lam = _sigmoid(lam_logit)
 
-    return {"beta": beta, "alpha": alpha, "v": v, "fc": fc, "lambda": lam}
+    # Market-level scale on the Phase-1/2 intercept (estimation target).
+    u_scale = rng.lognormal(mean=np.log(1.0), sigma=0.20, size=(M,)).astype(np.float64)
+
+    return {
+        "beta": beta,
+        "alpha": alpha,
+        "v": v,
+        "fc": fc,
+        "lambda": lam,
+        "u_scale": u_scale,
+    }
 
 
 def compute_u_mj(
@@ -189,7 +202,17 @@ def solve_ccp_buy(
     """
     Solve for consumer CCPs for a single (market, product, consumer) given lambda_n.
 
-    We solve for CCP_buy(s,i) on a grid of price state s and inventory i.
+    State: (s, i) where
+      - s is price state in {0,...,S-1}
+      - i is inventory in {0,...,I_max}
+
+    Flow utilities (spec):
+      U0(s,i) = - v_j * 1{i=0}
+      U1(s,i) = u_eff - alpha_j * price(s) - fc_j
+                - waste_cost * (1 - lambda_n) * 1{i=I_max}
+
+    Inventory dynamics (spec):
+      i' = clip(i + a - c, 0, I_max),  c ~ Bernoulli(lambda_n)
 
     Returns:
       ccp_buy_s_i: (S, I_max+1) float64 in [0,1].
@@ -197,10 +220,12 @@ def solve_ccp_buy(
     S = int(P_price.shape[0])
     I_size = int(I_max + 1)
 
-    # Value function V(s,i) (inclusive value).
+    # Inclusive value V(s,i).
     V = np.zeros((S, I_size), dtype=np.float64)
 
-    # Iterate on Bellman fixed point for V(s,i).
+    lam = float(lambda_n)
+    one_minus_lam = 1.0 - lam
+
     for _ in range(int(max_iter)):
         V_old = V.copy()
 
@@ -211,29 +236,33 @@ def solve_ccp_buy(
             p = float(price_vals[s])
 
             for i in range(I_size):
-                # If buy:
                 I_buy = min(i + 1, I_max)
-                # If no-buy:
-                I_nb = i
 
-                # Expected continuation value accounting for consumption:
-                cont_buy = (1.0 - lambda_n) * EV_next[s, I_buy] + lambda_n * EV_next[
-                    s, max(I_buy - 1, 0)
-                ]
-                cont_nb = (1.0 - lambda_n) * EV_next[s, I_nb] + lambda_n * EV_next[
-                    s, max(I_nb - 1, 0)
-                ]
+                # Continuation value (integrating out consumption):
+                # If buy:
+                #   - no consume: i' = I_buy
+                #   - consume:    i' = i  (since i+1-1 = i, even at the cap)
+                cont_buy = one_minus_lam * EV_next[s, I_buy] + lam * EV_next[s, i]
+
+                # If no-buy:
+                #   - no consume: i' = i
+                #   - consume:    i' = max(i-1, 0)
+                cont_nb = (
+                    one_minus_lam * EV_next[s, i] + lam * EV_next[s, max(i - 1, 0)]
+                )
 
                 # Flow utilities:
-                u_buy = u_eff - alpha_j * p - fc_j - waste_cost * float(I_buy)
-                # Stockout penalty if inventory is 0 and consumption occurs:
-                u_nb = u_eff - v_j * float(i == 0)
+                u_buy = (
+                    float(u_eff)
+                    - float(alpha_j) * p
+                    - float(fc_j)
+                    - float(waste_cost) * one_minus_lam * float(i == I_max)
+                )
+                u_nb = -float(v_j) * float(i == 0)
 
-                # Choice-specific values:
-                Q_buy = u_buy + beta * cont_buy
-                Q_nb = u_nb + beta * cont_nb
+                Q_buy = u_buy + float(beta) * cont_buy
+                Q_nb = u_nb + float(beta) * cont_nb
 
-                # Inclusive value (log-sum-exp):
                 m = max(Q_buy, Q_nb)
                 V[s, i] = m + np.log(np.exp(Q_buy - m) + np.exp(Q_nb - m))
 
@@ -250,23 +279,24 @@ def solve_ccp_buy(
 
         for i in range(I_size):
             I_buy = min(i + 1, I_max)
-            I_nb = i
 
-            cont_buy = (1.0 - lambda_n) * EV[s, I_buy] + lambda_n * EV[
-                s, max(I_buy - 1, 0)
-            ]
-            cont_nb = (1.0 - lambda_n) * EV[s, I_nb] + lambda_n * EV[
-                s, max(I_nb - 1, 0)
-            ]
+            cont_buy = one_minus_lam * EV[s, I_buy] + lam * EV[s, i]
+            cont_nb = one_minus_lam * EV[s, i] + lam * EV[s, max(i - 1, 0)]
 
-            u_buy = u_eff - alpha_j * p - fc_j - waste_cost * float(I_buy)
-            u_nb = u_eff - v_j * float(i == 0)
+            u_buy = (
+                float(u_eff)
+                - float(alpha_j) * p
+                - float(fc_j)
+                - float(waste_cost) * one_minus_lam * float(i == I_max)
+            )
+            u_nb = -float(v_j) * float(i == 0)
 
-            Q_buy = u_buy + beta * cont_buy
-            Q_nb = u_nb + beta * cont_nb
+            Q_buy = u_buy + float(beta) * cont_buy
+            Q_nb = u_nb + float(beta) * cont_nb
 
-            denom = np.exp(Q_buy) + np.exp(Q_nb)
-            ccp_buy[s, i] = np.exp(Q_buy) / denom
+            # Stable logistic: P(buy) = 1 / (1 + exp(Q_nb - Q_buy))
+            d = np.clip(Q_nb - Q_buy, -60.0, 60.0)
+            ccp_buy[s, i] = 1.0 / (1.0 + np.exp(d))
 
     return ccp_buy
 
@@ -392,9 +422,12 @@ def generate_dgp(
       p_state_mjt: (M, J, T) int64 price states
       u_mj_true: (M, J) float64 intercepts (unscaled)
       theta_true: dict of true parameters:
-        - beta:               scalar float64 stored as a 0-d ndarray
-        - alpha, v, fc:       (J,) float64
-        - lambda:             (M,N) float64
+        - beta:    scalar float64 stored as a 0-d ndarray
+        - alpha:   (J,) float64
+        - v:       (J,) float64
+        - fc:      (J,) float64
+        - lambda:  (M,N) float64
+        - u_scale: (M,) float64
     """
     norm = normalize_stockpiling_dgp_inputs(
         seed=seed,
@@ -443,6 +476,7 @@ def generate_dgp(
     v = theta_true["v"]
     fc = theta_true["fc"]
     lambda_true = theta_true["lambda"]
+    u_scale = theta_true["u_scale"]
 
     for m in range(M):
         lambda_mn = lambda_true[m]  # (N,)
@@ -460,8 +494,8 @@ def generate_dgp(
             )
             p_state_mjt[m, j] = p_state_t
 
-            # Effective intercept for this (market, product).
-            u_eff = float(u_mj_true[m, j])
+            # Effective intercept for this (market, product): u_eff = u_scale_m * u_mj
+            u_eff = float(u_scale[m]) * float(u_mj_true[m, j])
 
             # Solve per-consumer CCPs (only lambda varies across consumers).
             ccp_buy_n_s_i = solve_market_product_ccps(

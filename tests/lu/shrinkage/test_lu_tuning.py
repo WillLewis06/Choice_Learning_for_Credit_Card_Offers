@@ -5,6 +5,14 @@ Constraints for this test module
 - No pytest fixture injection: all tests are plain functions with no fixture args.
 - Shared test utilities are imported from `lu_conftest` (a normal Python module).
 - Patching uses unittest.mock.patch (not the pytest monkeypatch fixture).
+
+Notes on updated Lu code
+- LuShrinkageEstimator now requires `posterior_config=LuPosteriorConfig(...)`.
+- Tuning controls (pilot_length, ridge, targets, factors) are read-only properties
+  backed by `shrink._fit_config: LuShrinkageFitConfig`. Tests must set this
+  before calling tune_shrinkage().
+- tune_k no longer performs explicit input validation; tests should not expect
+  invalid-argument rejection from tune_k().
 """
 
 from __future__ import annotations
@@ -17,7 +25,8 @@ import pytest
 import tensorflow as tf
 
 import lu.shrinkage.lu_tuning as lu_tuning
-from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
+from lu.shrinkage.lu_posterior import LuPosteriorConfig
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator, LuShrinkageFitConfig
 from lu_conftest import assert_all_finite_tf, tiny_market_data
 
 
@@ -54,6 +63,27 @@ def _assert_state_unchanged(before: dict, after: dict) -> None:
     assert np.array_equal(before["phi"], after["phi"])
 
 
+def _make_posterior_config(n_draws: int, seed: int) -> LuPosteriorConfig:
+    return LuPosteriorConfig(
+        n_draws=int(n_draws),
+        seed=int(seed),
+        dtype=tf.float64,
+        eps=1e-12,
+        beta_p_mean=-1.0,
+        beta_p_var=1.0,
+        beta_w_mean=0.3,
+        beta_w_var=1.0,
+        r_mean=0.0,
+        r_var=1.0,
+        E_bar_mean=0.0,
+        E_bar_var=1.0,
+        T0_sq=1e-2,
+        T1_sq=1.0,
+        a_phi=1.0,
+        b_phi=1.0,
+    )
+
+
 def _build_shrink(
     tiny_data: dict, n_draws: int = 25, seed: int = 123
 ) -> LuShrinkageEstimator:
@@ -62,12 +92,11 @@ def _build_shrink(
         wjt=tiny_data["wjt"],
         qjt=tiny_data["qjt"],
         q0t=tiny_data["q0t"],
-        n_draws=n_draws,
-        seed=seed,
+        posterior_config=_make_posterior_config(n_draws=n_draws, seed=seed),
     )
 
 
-def _set_tuning_params(
+def _set_fit_config(
     shrink: LuShrinkageEstimator,
     pilot_length: int = 1,
     ridge: float = 1e-6,
@@ -77,13 +106,18 @@ def _set_tuning_params(
     factor_rw: float = 1.1,
     factor_tmh: float = 1.5,
 ) -> None:
-    shrink.pilot_length = pilot_length
-    shrink.ridge = ridge
-    shrink.target_low = target_low
-    shrink.target_high = target_high
-    shrink.max_rounds = max_rounds
-    shrink.factor_rw = factor_rw
-    shrink.factor_tmh = factor_tmh
+    # Test-only direct assignment: tune_shrinkage reads via properties that
+    # dereference shrink._fit_config.
+    shrink._fit_config = LuShrinkageFitConfig(
+        n_iter=1,
+        pilot_length=int(pilot_length),
+        ridge=float(ridge),
+        target_low=float(target_low),
+        target_high=float(target_high),
+        max_rounds=int(max_rounds),
+        factor_rw=float(factor_rw),
+        factor_tmh=float(factor_tmh),
+    )
 
 
 @contextmanager
@@ -180,54 +214,6 @@ def _patched_updates(accept_all: bool):
 # -----------------------------------------------------------------------------
 # tune_k unit tests
 # -----------------------------------------------------------------------------
-def test_tune_k_validate_input_rejects_invalid_args():
-    theta0 = tf.constant(0.0, tf.float64)
-    k0 = tf.constant(1.0, tf.float64)
-
-    def step_fn(theta, k):
-        return theta, tf.constant(0.0, tf.float64)
-
-    bad_calls = [
-        dict(
-            pilot_length=0,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=0,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.6,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.0,
-            name="x",
-        ),
-        dict(pilot_length=1, target_low=0.3, target_high=0.5, max_rounds=1, factor=1.1, name=123),  # type: ignore[arg-type]
-    ]
-
-    for kw in bad_calls:
-        with pytest.raises(Exception):
-            lu_tuning.tune_k(theta0=theta0, step_fn=step_fn, k0=k0, **kw)
-
-
 def test_tune_k_shrinks_k_when_acceptance_below_band():
     theta0 = tf.constant(0.0, tf.float64)
     k0 = tf.constant(1.0, tf.float64)
@@ -331,21 +317,15 @@ def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types():
 
     # Missing attribute
     shrink = _build_shrink(data)
-    _set_tuning_params(shrink)
+    _set_fit_config(shrink)
     delattr(shrink, "qjt")
     with pytest.raises(Exception):
         lu_tuning.tune_shrinkage(shrink)
 
-    # Wrong type for state variable (must be tf.Variable)
+    # Wrong type for state variable (must be tf.Variable with .read_value())
     shrink = _build_shrink(data)
-    _set_tuning_params(shrink)
+    _set_fit_config(shrink)
     shrink.beta_p = shrink.beta_p.read_value()  # type: ignore[assignment]
-    with pytest.raises(Exception):
-        lu_tuning.tune_shrinkage(shrink)
-
-    # Invalid factor_rw
-    shrink = _build_shrink(data)
-    _set_tuning_params(shrink, factor_rw=1.0)
     with pytest.raises(Exception):
         lu_tuning.tune_shrinkage(shrink)
 
@@ -353,7 +333,7 @@ def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types():
 def test_tune_shrinkage_returns_four_positive_finite_scalars():
     data = tiny_market_data()
     shrink = _build_shrink(data)
-    _set_tuning_params(
+    _set_fit_config(
         shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
     )
 
@@ -367,7 +347,7 @@ def test_tune_shrinkage_returns_four_positive_finite_scalars():
 def test_tune_shrinkage_does_not_mutate_sampler_state():
     data = tiny_market_data()
     shrink = _build_shrink(data)
-    _set_tuning_params(
+    _set_fit_config(
         shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
     )
 
@@ -382,7 +362,7 @@ def test_tune_shrinkage_does_not_mutate_sampler_state():
 def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
     data = tiny_market_data()
     shrink = _build_shrink(data)
-    _set_tuning_params(
+    _set_fit_config(
         shrink,
         pilot_length=1,
         max_rounds=1,

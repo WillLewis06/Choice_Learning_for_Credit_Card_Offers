@@ -4,8 +4,8 @@ stockpiling_posterior.py
 Likelihood and prediction utilities for the Phase-3 stockpiling model.
 
 This module is intentionally stateless:
-  - `inputs` is a plain mapping of fixed/known tensors and hyperparameters.
-  - The current constrained parameter state is passed explicitly via `theta`.
+  - `inputs` is a typed mapping of fixed/known tensors and hyperparameters.
+  - the current constrained parameter state is passed explicitly via `theta`.
 
 Observed data:
   - purchases a_mnjt: (M,N,J,T) int32 in {0,1}
@@ -16,36 +16,38 @@ Latent state:
   - per-period consumption is integrated out via known lambda_mn: (M,N) float64
 
 Likelihood:
-  - inventory is marginalized via a forward filter over the finite inventory state.
+  - inventory is marginalized with a forward filter over the finite inventory state.
 
-Expected `inputs` keys (dict-like mapping):
-  Required:
-    - "a_mnjt": tf.Tensor (M,N,J,T) int32
-    - "s_mjt": tf.Tensor (M,J,T) int32
-    - "u_mj": tf.Tensor (M,J) float64
-    - "P_price_mj": tf.Tensor (M,J,S,S) float64
-    - "price_vals_mj": tf.Tensor (M,J,S) float64
-    - "lambda_mn": tf.Tensor (M,N) float64
-    - "waste_cost": tf.Tensor () float64
-    - "inventory_maps": tuple of tensors returned by build_inventory_maps(I_max)
-  Optional:
-    - "tol": float (default 1e-6)
-    - "max_iter": int (default 2000)
-    - "init_I_dist": tf.Tensor (I_max+1,) float64 initial inventory distribution
+Required `inputs` keys:
+  - a_mnjt: tf.Tensor (M,N,J,T) int32
+  - s_mjt: tf.Tensor (M,J,T) int32
+  - u_mj: tf.Tensor (M,J) float64
+  - P_price_mj: tf.Tensor (M,J,S,S) float64
+  - price_vals_mj: tf.Tensor (M,J,S) float64
+  - lambda_mn: tf.Tensor (M,N) float64, in (0,1)
+  - waste_cost: tf.Tensor () float64
+  - inventory_maps: tuple returned by build_inventory_maps(I_max)
+  - tol: float
+  - max_iter: int
+  - pi_I0: tf.Tensor (I_max+1,) float64 initial inventory distribution (sums to 1)
+
+Notes:
+  - This module does not clamp or repair invalid inputs. All external inputs must be
+    validated upstream (configs / input validation).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping
+from typing import TypedDict
 
 import tensorflow as tf
 
 from ching.stockpiling_model import solve_ccp_buy
 
 __all__ = [
-    "StockpilingInputs",
     "InventoryMaps",
+    "StockpilingInputs",
     "logprior_normal",
     "loglik_mnj_from_theta",
     "predict_p_buy_mnjt_from_theta",
@@ -53,65 +55,56 @@ __all__ = [
 
 # (I_vals, stockout_mask, at_cap_mask, idx_down, idx_up)
 InventoryMaps = tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
-StockpilingInputs = Mapping[str, Any]
 
 TWO_PI_F64 = tf.constant(2.0 * math.pi, dtype=tf.float64)
 ONE_F64 = tf.constant(1.0, dtype=tf.float64)
 EPS_F64 = tf.constant(1e-12, dtype=tf.float64)
 
 
-def logprior_normal(z: tf.Tensor, sigma_z: tf.Tensor) -> tf.Tensor:
-    """
-    Elementwise Normal(0, sigma_z^2) log-density, returned with the same shape as `z`.
+class StockpilingInputs(TypedDict):
+    """Typed container for fixed inputs required by the stockpiling posterior."""
 
-    Inputs are assumed float64.
+    a_mnjt: tf.Tensor
+    s_mjt: tf.Tensor
+    u_mj: tf.Tensor
+    P_price_mj: tf.Tensor
+    price_vals_mj: tf.Tensor
+    lambda_mn: tf.Tensor
+    waste_cost: tf.Tensor
+    inventory_maps: InventoryMaps
+    tol: float
+    max_iter: int
+    pi_I0: tf.Tensor
+
+
+def logprior_normal(z: tf.Tensor, sigma_z: tf.Tensor) -> tf.Tensor:
+    """Elementwise Normal(0, sigma_z^2) log density.
+
+    Args:
+      z: float64 tensor
+      sigma_z: float64 tensor broadcastable to z, strictly positive
+
+    Returns:
+      logp: float64 tensor with the same shape as z
     """
     const = -0.5 * tf.math.log(TWO_PI_F64)
     return const - tf.math.log(sigma_z) - 0.5 * tf.square(z / sigma_z)
 
 
 def _inventory_maps(inputs: StockpilingInputs) -> InventoryMaps:
-    """
-    Return inventory maps.
-
-    Required: inputs["inventory_maps"] present and matches build_inventory_maps(I_max).
-    """
+    """Return precomputed inventory maps."""
     return inputs["inventory_maps"]
-
-
-def _init_inventory_dist(inputs: StockpilingInputs, I: tf.Tensor) -> tf.Tensor:
-    """
-    Return an initial inventory distribution pi0 over I in {0,...,I_max}.
-
-    Args:
-      inputs: mapping that may include "init_I_dist"
-      I: int32 scalar tensor, number of inventory states (I_max+1)
-
-    Returns:
-      pi0: (I,) float64, sums to 1.
-    """
-    init = inputs.get("init_I_dist", None)
-    if init is None:
-        return tf.ones(tf.stack([I]), dtype=tf.float64) / tf.cast(I, tf.float64)
-
-    pi0 = tf.reshape(init, (-1,))
-    s = tf.reduce_sum(pi0)
-    uniform = tf.ones(tf.stack([I]), dtype=pi0.dtype) / tf.cast(I, pi0.dtype)
-    return tf.where(s > tf.cast(0.0, pi0.dtype), pi0 / s, uniform)
 
 
 def _ccp_buy_from_theta(
     theta: dict[str, tf.Tensor], inputs: StockpilingInputs
 ) -> tf.Tensor:
-    """
-    Compute buy CCPs for the given theta and fixed inputs.
+    """Compute buy CCPs for the given theta and fixed inputs.
 
     Returns:
       ccp_buy: (M,N,J,S,I) float64
     """
     maps = _inventory_maps(inputs)
-    tol = float(inputs.get("tol", 1e-6))
-    max_iter = int(inputs.get("max_iter", 2000))
 
     ccp_buy, _, _ = solve_ccp_buy(
         u_mj=inputs["u_mj"],
@@ -121,26 +114,14 @@ def _ccp_buy_from_theta(
         lambda_mn=inputs["lambda_mn"],
         waste_cost=inputs["waste_cost"],
         maps=maps,
-        tol=tol,
-        max_iter=max_iter,
+        tol=float(inputs["tol"]),
+        max_iter=int(inputs["max_iter"]),
     )
     return ccp_buy
 
 
 def _shift_down(post: tf.Tensor, idx_up: tf.Tensor) -> tf.Tensor:
-    """
-    Map mass via I' = max(I-1,0) (down-shift with absorption at 0).
-
-    Args:
-      post: (..., I) float64
-      idx_up: (I,) int32 indices min(k+1, I_max)
-
-    Returns:
-      down: (..., I) float64 where:
-        down[...,0]     = post[...,0] + post[...,1]
-        down[...,k]     = post[...,k+1] for k=1..I_max-1
-        down[...,I_max] = 0
-    """
+    """Map mass via I' = max(I-1, 0) (down-shift with absorption at 0)."""
     I = tf.shape(idx_up)[0]
 
     def case_I1() -> tf.Tensor:
@@ -157,19 +138,7 @@ def _shift_down(post: tf.Tensor, idx_up: tf.Tensor) -> tf.Tensor:
 
 
 def _shift_up(post: tf.Tensor, idx_down: tf.Tensor) -> tf.Tensor:
-    """
-    Map mass via I' = min(I+1, I_max) (up-shift with absorption at I_max).
-
-    Args:
-      post: (..., I) float64
-      idx_down: (I,) int32 indices max(k-1, 0)
-
-    Returns:
-      up: (..., I) float64 where:
-        up[...,0]     = 0
-        up[...,k]     = post[...,k-1] for k=1..I_max-1
-        up[...,I_max] = post[...,I_max-1] + post[...,I_max]
-    """
+    """Map mass via I' = min(I+1, I_max) (up-shift with absorption at I_max)."""
     I = tf.shape(idx_down)[0]
 
     def case_I1() -> tf.Tensor:
@@ -192,23 +161,11 @@ def _transition_inventory(
     idx_down: tf.Tensor,
     idx_up: tf.Tensor,
 ) -> tf.Tensor:
-    """
-    Inventory transition: pi_{t+1} from post(I_t | history, a_t) by marginalizing c_t.
-
-    Args:
-      post:         (M,N,J,I) float64 posterior over I_t after observing a_t
-      lambda_mn_11: (M,N,1,1) float64 consumption probability
-      a_t:          (M,N,J) int32 observed action in {0,1}
-      idx_down:     (I,) int32 indices max(k-1, 0)
-      idx_up:       (I,) int32 indices min(k+1, I_max)
-
-    Returns:
-      pi_next: (M,N,J,I) float64
-    """
+    """Inventory transition pi_{t+1} from post(I_t | history, a_t) by marginalizing c_t."""
     lam = lambda_mn_11  # (M,N,1,1)
     one_minus = ONE_F64 - lam
 
-    down = _shift_down(post, idx_up)  # I' = max(I-1,0)
+    down = _shift_down(post, idx_up)  # I' = max(I-1, 0)
     up = _shift_up(post, idx_down)  # I' = min(I+1, I_max)
 
     # a=0: I' = I - c
@@ -229,21 +186,19 @@ def _filter_step_core(
     idx_down: tf.Tensor,
     idx_up: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """
-    One forward-filter step.
+    """One forward-filter step.
 
     Returns:
       p_buy_I:    (M,N,J,I) float64  CCP evaluated at current price state s_t
       denom_safe: (M,N,J) float64    P(a_t | history)
-      pi_next:    (M,N,J,I) float64
+      pi_next:    (M,N,J,I) float64  next-period inventory prior
     """
-    M = tf.shape(pi_acc)[0]
-    N = tf.shape(pi_acc)[1]
-    J = tf.shape(pi_acc)[2]
+    mnjs_shape = tf.shape(pi_acc)[:3]  # (3,) = (M,N,J)
 
     s_t_mj = s_mjt[:, :, t]  # (M,J)
-    s_idx = tf.broadcast_to(s_t_mj[:, None, :], tf.stack([M, N, J]))  # (M,N,J)
+    s_idx = tf.broadcast_to(s_t_mj[:, None, :], mnjs_shape)  # (M,N,J)
 
+    # CCP evaluated at current price state: p_buy_I[m,n,j,I] = CCP[m,n,j,s_t,I]
     p_buy_I = tf.gather(ccp_buy, s_idx, axis=3, batch_dims=3)  # (M,N,J,I)
 
     a_t_mnj = a_mnjt[:, :, :, t]  # (M,N,J)
@@ -251,11 +206,13 @@ def _filter_step_core(
         tf.equal(a_t_mnj[..., None], 1), p_buy_I, ONE_F64 - p_buy_I
     )  # (M,N,J,I)
 
+    # Bayes update over inventory I_t
     numer = pi_acc * e
     denom = tf.reduce_sum(numer, axis=3)  # (M,N,J)
     denom_safe = tf.maximum(denom, EPS_F64)
     post = numer / denom_safe[..., None]
 
+    # Propagate inventory prior using the structural transition and known consumption rate
     pi_next = _transition_inventory(
         post=post,
         lambda_mn_11=lambda_mn_11,
@@ -269,11 +226,10 @@ def _filter_step_core(
 def loglik_mnj_from_theta(
     theta: dict[str, tf.Tensor], inputs: StockpilingInputs
 ) -> tf.Tensor:
-    """
-    Compute log-likelihood contributions per (m,n,j), marginalizing over inventory.
+    """Log-likelihood per (m,n,j), integrating out latent inventory.
 
     Returns:
-      ll_mnj: (M,N,J) float64, sum over t of log P(a_t | s_1:t, a_1:t-1).
+      ll_mnj: (M,N,J) float64
     """
     a_mnjt = inputs["a_mnjt"]
     s_mjt = inputs["s_mjt"]
@@ -288,13 +244,13 @@ def loglik_mnj_from_theta(
 
     ccp_buy = _ccp_buy_from_theta(theta=theta, inputs=inputs)  # (M,N,J,S,I)
 
-    pi0 = _init_inventory_dist(inputs, I)  # (I,)
+    pi0 = tf.reshape(inputs["pi_I0"], (-1,))  # (I,)
     pi = tf.broadcast_to(pi0[None, None, None, :], tf.stack([M, N, J, I]))  # (M,N,J,I)
 
-    lam_mn = tf.clip_by_value(inputs["lambda_mn"], 0.0, 1.0)  # (M,N)
-    lambda_mn_11 = lam_mn[:, :, None, None]  # (M,N,1,1)
+    lambda_mn_11 = inputs["lambda_mn"][:, :, None, None]  # (M,N,1,1)
 
     ll0 = tf.zeros((M, N, J), dtype=tf.float64)
+    t0 = tf.constant(0, dtype=tf.int32)
 
     def body(
         t: tf.Tensor, ll_acc: tf.Tensor, pi_acc: tf.Tensor
@@ -312,7 +268,6 @@ def loglik_mnj_from_theta(
         ll_acc = ll_acc + tf.math.log(denom_safe)
         return t + 1, ll_acc, pi_next
 
-    t0 = tf.constant(0, dtype=tf.int32)
     _, ll_final, _ = tf.while_loop(
         cond=lambda t, ll_acc, pi_acc: t < T,
         body=body,
@@ -324,8 +279,7 @@ def loglik_mnj_from_theta(
 def predict_p_buy_mnjt_from_theta(
     theta: dict[str, tf.Tensor], inputs: StockpilingInputs
 ) -> tf.Tensor:
-    """
-    Predict P(a_t=1 | s_1:t, a_1:t-1) for each (m,n,j,t), integrating out latent inventory.
+    """Predict P(a_t=1 | s_1:t, a_1:t-1) for each (m,n,j,t), integrating out inventory.
 
     Returns:
       p_buy_mnjt: (M,N,J,T) float64
@@ -343,13 +297,13 @@ def predict_p_buy_mnjt_from_theta(
 
     ccp_buy = _ccp_buy_from_theta(theta=theta, inputs=inputs)  # (M,N,J,S,I)
 
-    pi0 = _init_inventory_dist(inputs, I)  # (I,)
+    pi0 = tf.reshape(inputs["pi_I0"], (-1,))  # (I,)
     pi = tf.broadcast_to(pi0[None, None, None, :], tf.stack([M, N, J, I]))  # (M,N,J,I)
 
-    lam_mn = tf.clip_by_value(inputs["lambda_mn"], 0.0, 1.0)  # (M,N)
-    lambda_mn_11 = lam_mn[:, :, None, None]  # (M,N,1,1)
+    lambda_mn_11 = inputs["lambda_mn"][:, :, None, None]  # (M,N,1,1)
 
     out_ta = tf.TensorArray(tf.float64, size=T)
+    t0 = tf.constant(0, dtype=tf.int32)
 
     def body(
         t: tf.Tensor, pi_acc: tf.Tensor, out_acc: tf.TensorArray
@@ -364,11 +318,13 @@ def predict_p_buy_mnjt_from_theta(
             idx_down=idx_down,
             idx_up=idx_up,
         )
+
+        # Predictive probability of buying at t given history up to t-1:
+        # p_hat = sum_I pi_t(I) * CCP(s_t, I)
         p_hat = tf.reduce_sum(pi_acc * p_buy_I, axis=3)  # (M,N,J)
         out_acc = out_acc.write(t, p_hat)
         return t + 1, pi_next, out_acc
 
-    t0 = tf.constant(0, dtype=tf.int32)
     _, _, out_final = tf.while_loop(
         cond=lambda t, pi_acc, out_acc: t < T,
         body=body,

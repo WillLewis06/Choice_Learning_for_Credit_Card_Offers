@@ -6,6 +6,9 @@ This script:
   2) Fits two BLP estimators (strong-IV and weak-IV).
   3) Fits the Lu shrinkage estimator (Bayesian sparse market-product shocks).
   4) Compares recovered shocks and sigma against ground truth.
+
+All estimator configuration is set in this orchestration layer and passed down as
+validated config objects (no defaults, no fallbacks).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import numpy as np
+import tensorflow as tf
 
 from datasets.lu_dgp import (
     BasicLuChoiceModel,
@@ -23,7 +27,10 @@ from datasets.lu_dgp import (
     generate_market_conditions,
 )
 from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
-from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
+from lu.blp.blp_input_validation import validate_blp_config
+from lu.shrinkage.lu_posterior import LuPosteriorConfig
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator, LuShrinkageFitConfig
+from lu.shrinkage.lu_validate_input import posterior_validate_input
 from toolbox.assess_estimator import print_assessment
 
 
@@ -40,30 +47,71 @@ def main() -> None:
     n_draws = 50
 
     # -------------------------------------------------------------------------
-    # BLP fitting configuration (shared across strong-IV and weak-IV runs)
+    # BLP configuration (validated in orchestration; no defaults)
     # -------------------------------------------------------------------------
-    blp_sigma_init = 1.0
-    blp_sigma_min = 1e-3
-    blp_sigma_max = 5.0
-    blp_grid_step = 25
+    blp_config_raw = {
+        "n_draws": n_draws,
+        "seed": seed,
+        # Contraction mapping / inversion controls
+        "damping": 0.5,
+        "tol": 1e-12,
+        "share_tol": 1e-12,
+        "max_iter": 2000,
+        # Objective penalty used when inversion fails
+        "fail_penalty": 1e8,
+        # Sigma search region and grid
+        "sigma_lower": 1e-3,
+        "sigma_upper": 5.0,
+        "sigma_grid_points": 25,
+        # Nelder-Mead controls
+        "nelder_mead_maxiter": 500,
+        "nelder_mead_xatol": 1e-6,
+        "nelder_mead_fatol": 1e-6,
+    }
+    blp_config = validate_blp_config(blp_config_raw)
 
     # -------------------------------------------------------------------------
-    # Lu shrinkage configuration: MCMC length plus proposal-scale tuning controls
+    # Lu shrinkage posterior/prior configuration (validated; no defaults)
     # -------------------------------------------------------------------------
-    shrink_n_iter = 500
+    posterior_config = LuPosteriorConfig(
+        # Monte Carlo integration settings
+        n_draws=n_draws,
+        seed=seed,
+        # Numeric settings
+        dtype=tf.float64,
+        eps=1e-15,
+        # Global priors: Normal(mean, var)
+        beta_p_mean=0.0,
+        beta_p_var=10.0,
+        beta_w_mean=0.0,
+        beta_w_var=10.0,
+        r_mean=0.0,
+        r_var=0.5,
+        # Market common shock prior: Normal(mean, var)
+        E_bar_mean=0.0,
+        E_bar_var=10.0,
+        # Spike-and-slab variances
+        T0_sq=1e-3,
+        T1_sq=1.0,
+        # Beta prior for phi
+        a_phi=1.0,
+        b_phi=1.0,
+    )
+    posterior_validate_input(posterior_config)
 
-    # Tuning targets and multiplicative adjustments for RW-MH vs TMH blocks.
-    shrink_target_low = 0.3
-    shrink_target_high = 0.5
-    shrink_max_rounds = 100
-    shrink_factor_rw = 1.3
-    shrink_factor_tmh = 1.05
-
-    # Pilot chain length used to tune each proposal scale once.
-    shrink_pilot_length = 20
-
-    # Small ridge used inside TMH to stabilize linear algebra.
-    shrink_ridge = 1e-6
+    # -------------------------------------------------------------------------
+    # Lu shrinkage tuning + sampling configuration (no burn-in/thinning)
+    # -------------------------------------------------------------------------
+    fit_config = LuShrinkageFitConfig(
+        n_iter=500,
+        pilot_length=20,
+        ridge=1e-6,
+        target_low=0.3,
+        target_high=0.5,
+        max_rounds=100,
+        factor_rw=1.3,
+        factor_tmh=1.05,
+    )
 
     # -------------------------------------------------------------------------
     # Loop over DGP variants. Each variant changes sparsity and endogeneity.
@@ -95,7 +143,7 @@ def main() -> None:
         #   beta_{p,i} ~ Normal(beta_p_true, sigma_true)
         #
         # utilities(...) returns u_{i,j,t}. generate_market converts these to:
-        #   sjt, s0t : expected shares (inside and outside)
+        #   sjt, s0t : expected shares (inside and outside) for BLP
         #   qjt, q0t : multinomial draws (counts) used by the shrinkage estimator
         # ---------------------------------------------------------------------
         model = BasicLuChoiceModel(
@@ -112,14 +160,14 @@ def main() -> None:
         print("=== Market generated ===")
 
         # ---------------------------------------------------------------------
-        # Step 3: Fit BLP under two instrument sets.
+        # Step 3: Fit BLP under two instrument sets (strong-IV vs weak-IV).
         #
-        # Both BLP estimators use the same demand regressors (pjt, wjt) and differ
-        # only in Zjt construction:
+        # Both BLP estimators use demand regressors (pjt, wjt) and differ only in Zjt:
         #   - strong IVs: uses wjt and ujt (designed to be informative in the DGP)
         #   - weak IVs  : uses only wjt (intentionally less informative)
         #
-        # Each estimator internally performs RC integration with n_draws draws.
+        # The sigma search region and optimization controls are provided via the
+        # validated BLP config.
         # ---------------------------------------------------------------------
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
@@ -128,16 +176,10 @@ def main() -> None:
             pjt=pjt,
             wjt=wjt,
             Zjt=Zjt_strong,
-            n_draws=n_draws,
-            seed=seed,
+            config=blp_config,
         )
         print("=== Strong IVs and Estimator built ===")
-        blp_strong.fit(
-            sigma_init=blp_sigma_init,
-            sigma_min=blp_sigma_min,
-            sigma_max=blp_sigma_max,
-            grid_step=blp_grid_step,
-        )
+        blp_strong.fit()
         res_strong = blp_strong.get_results()
         print("=== Strong Estimator fitted ===")
 
@@ -148,28 +190,21 @@ def main() -> None:
             pjt=pjt,
             wjt=wjt,
             Zjt=Zjt_weak,
-            n_draws=n_draws,
-            seed=seed,
+            config=blp_config,
         )
         print("=== Weak IVs and Estimator built ===")
-        blp_weak.fit(
-            sigma_init=blp_sigma_init,
-            sigma_min=blp_sigma_min,
-            sigma_max=blp_sigma_max,
-            grid_step=blp_grid_step,
-        )
+        blp_weak.fit()
         res_weak = blp_weak.get_results()
         print("=== Weak Estimator fitted ===")
 
         # ---------------------------------------------------------------------
         # Step 4: Fit the Lu shrinkage estimator.
         #
-        # This estimator is Bayesian and samples from the posterior over:
+        # The estimator samples from the posterior over:
         #   - beta_p, beta_w, sigma (via r = log(sigma))
-        #   - market shocks E_bar_t and market-product shocks n_{j,t}
-        #   - sparsity indicators gamma_{j,t} and inclusion rates phi_t
+        #   - market shocks E_bar_t and market-product shocks njt[t,j]
+        #   - sparsity indicators gamma[t,j] and inclusion rates phi[t]
         #
-        # It uses the observed counts (qjt, q0t) and the same (pjt, wjt).
         # Proposal scales are tuned once using short pilot runs, then frozen.
         # ---------------------------------------------------------------------
         shrink = LuShrinkageEstimator(
@@ -177,30 +212,15 @@ def main() -> None:
             wjt=wjt,
             qjt=qjt,
             q0t=q0t,
-            n_draws=n_draws,
-            seed=seed,
+            posterior_config=posterior_config,
         )
         print("=== Shrinkage Estimator built ===")
-        shrink.fit(
-            n_iter=shrink_n_iter,
-            pilot_length=shrink_pilot_length,
-            ridge=shrink_ridge,
-            target_low=shrink_target_low,
-            target_high=shrink_target_high,
-            max_rounds=shrink_max_rounds,
-            factor_rw=shrink_factor_rw,
-            factor_tmh=shrink_factor_tmh,
-        )
+        shrink.fit(config=fit_config)
         res_shrink = shrink.get_results()
         print("=== Shrinkage Estimator fitted ===")
 
         # ---------------------------------------------------------------------
         # Step 5: Compare estimates to ground truth.
-        #
-        # print_assessment expects:
-        #   - results: estimator outputs including recovered shocks E_hat
-        #   - E_true : ground-truth demand shocks used in simulation (Ejt)
-        #   - sigma_true: ground-truth sigma for price heterogeneity
         # ---------------------------------------------------------------------
         print("=== Strong BLP Estimator Results ===")
         print_assessment(results=res_strong, E_true=Ejt, sigma_true=sigma_true)

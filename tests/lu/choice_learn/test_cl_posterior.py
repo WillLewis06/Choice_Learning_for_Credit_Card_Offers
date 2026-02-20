@@ -8,7 +8,7 @@ This module is written without pytest fixture injection:
   at module import time and reused across tests.
 
 Model under test:
-  delta_{t,j} = alpha * delta_cl_{t,j} + E_bar[t] + njt[t,j]
+  delta[t, j] = alpha * delta_cl[t, j] + E_bar[t] + njt[t, j]
   (standard logit with outside option, utility of outside option normalized to 0)
 """
 
@@ -65,14 +65,25 @@ def _make_tiny_inputs() -> dict:
     }
 
 
-posterior = LuPosteriorTF(dtype=tf.float64)
+_POSTERIOR_CONFIG = {
+    "alpha_mean": 1.0,
+    "alpha_var": 1.0,
+    "E_bar_mean": 0.0,
+    "E_bar_var": 1.0,
+    "T0_sq": 0.01,
+    "T1_sq": 1.0,
+    "a_phi": 2.0,
+    "b_phi": 2.0,
+}
+
+posterior = LuPosteriorTF(config=_POSTERIOR_CONFIG)
 tiny_inputs = _make_tiny_inputs()
 
 
 # -----------------------------------------------------------------------------
 # 1) Deterministic helpers
 # -----------------------------------------------------------------------------
-def test_mean_utility_jt_shape_and_identity():
+def test_mean_utility_shape_and_identity():
     J = 4
     delta_cl_t = tf.constant([0.3, -0.2, 0.0, 0.1], dtype=tf.float64)
     njt_t = tf.constant([0.1, -0.2, 0.0, 0.3], dtype=tf.float64)
@@ -80,11 +91,11 @@ def test_mean_utility_jt_shape_and_identity():
     alpha = tf.constant(1.7, dtype=tf.float64)
     E_bar_t = tf.constant(0.7, dtype=tf.float64)
 
-    delta = posterior._mean_utility_jt(
-        delta_cl_t=delta_cl_t,
+    delta = posterior._mean_utility(
+        delta_cl=delta_cl_t,
         alpha=alpha,
-        E_bar_t=E_bar_t,
-        njt_t=njt_t,
+        E_bar=E_bar_t,
+        n=njt_t,
     )
     assert tuple(delta.shape) == (J,)
 
@@ -92,57 +103,67 @@ def test_mean_utility_jt_shape_and_identity():
     assert np.allclose(delta.numpy(), expected.numpy(), atol=0.0, rtol=0.0)
 
     # E_bar_t adds equally to all components: differences don't depend on it.
-    delta2 = posterior._mean_utility_jt(
-        delta_cl_t=delta_cl_t,
+    delta2 = posterior._mean_utility(
+        delta_cl=delta_cl_t,
         alpha=alpha,
-        E_bar_t=E_bar_t + 3.0,
-        njt_t=njt_t,
+        E_bar=E_bar_t + 3.0,
+        n=njt_t,
     )
-    d = (delta - delta[0]).numpy()
-    d2 = (delta2 - delta2[0]).numpy()
-    assert np.allclose(d, d2, atol=1e-12, rtol=0.0)
+    d0 = (delta - delta[0]).numpy()
+    d1 = (delta2 - delta2[0]).numpy()
+    assert np.allclose(d0, d1, atol=1e-12, rtol=0.0)
 
 
 # -----------------------------------------------------------------------------
 # 2) Choice probabilities
 # -----------------------------------------------------------------------------
-def test_choice_probs_t_shapes_simplex_bounds():
+def test_choice_probs_shapes_simplex_bounds():
     J = 5
     delta_t = tf.constant([0.2, -0.1, 0.0, 0.3, -0.2], dtype=tf.float64)
 
-    sjt_t, s0t = posterior._choice_probs_t(delta_t=delta_t)
+    log_pj, log_p0 = posterior._log_choice_probs(delta=delta_t)
+    sjt_t = tf.exp(log_pj)
+    s0t = tf.exp(log_p0)
+
     assert tuple(sjt_t.shape) == (J,)
     assert s0t.shape == ()
     assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
 
 
-def test_choice_probs_t_extreme_negative_delta_outside_near_one():
+def test_choice_probs_extreme_negative_delta_outside_near_one():
     J = 4
     delta_t = tf.constant([-50.0] * J, dtype=tf.float64)
 
-    sjt_t, s0t = posterior._choice_probs_t(delta_t=delta_t)
-    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
+    log_pj, log_p0 = posterior._log_choice_probs(delta=delta_t)
+    sjt_t = tf.exp(log_pj)
+    s0t = tf.exp(log_p0)
 
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
     assert float(s0t.numpy()) > 1.0 - 1e-10
     assert np.max(sjt_t.numpy()) < 1e-10
 
 
-def test_choice_probs_t_extreme_positive_delta_outside_near_zero():
+def test_choice_probs_extreme_positive_delta_outside_near_zero():
     J = 4
     delta_t = tf.constant([50.0] * J, dtype=tf.float64)
 
-    sjt_t, s0t = posterior._choice_probs_t(delta_t=delta_t)
-    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
+    log_pj, log_p0 = posterior._log_choice_probs(delta=delta_t)
+    sjt_t = tf.exp(log_pj)
+    s0t = tf.exp(log_p0)
 
+    assert_prob_simplex_tf(sjt_t, s0t, atol=1e-12)
     assert float(s0t.numpy()) < 1e-10
     assert abs(float(tf.reduce_sum(sjt_t).numpy()) - 1.0) < 1e-10
 
 
-def test_choice_probs_t_monotone_under_inside_shift():
+def test_choice_probs_monotone_under_inside_shift():
     delta_t = tf.constant([0.2, -0.1, 0.0, 0.3, -0.2], dtype=tf.float64)
 
-    sjt0, s00 = posterior._choice_probs_t(delta_t=delta_t)
-    sjt1, s01 = posterior._choice_probs_t(delta_t=delta_t + 1.0)
+    log_pj0, log_p00 = posterior._log_choice_probs(delta=delta_t)
+    log_pj1, log_p01 = posterior._log_choice_probs(delta=delta_t + 1.0)
+
+    sjt0, s00 = tf.exp(log_pj0), tf.exp(log_p00)
+    sjt1, s01 = tf.exp(log_pj1), tf.exp(log_p01)
 
     assert float(s01.numpy()) < float(s00.numpy())
     assert float(tf.reduce_sum(sjt1).numpy()) > float(tf.reduce_sum(sjt0).numpy())
@@ -187,16 +208,15 @@ def test_market_loglik_outside_only_identity():
         njt_t=njt_t,
     )
 
-    delta_t = posterior._mean_utility_jt(
-        delta_cl_t=delta_cl_t,
+    delta_t = posterior._mean_utility(
+        delta_cl=delta_cl_t,
         alpha=alpha,
-        E_bar_t=E_bar_t,
-        njt_t=njt_t,
+        E_bar=E_bar_t,
+        n=njt_t,
     )
-    _, s0t = posterior._choice_probs_t(delta_t=delta_t)
-    s0t_c = tf.clip_by_value(s0t, posterior.eps, 1.0)
+    _, log_p0 = posterior._log_choice_probs(delta=delta_t)
 
-    expected = q0t_t * tf.math.log(s0t_c)
+    expected = q0t_t * log_p0
     assert np.allclose(ll.numpy(), expected.numpy(), atol=1e-10, rtol=0.0)
 
 
@@ -219,16 +239,15 @@ def test_market_loglik_inside_only_identity():
         njt_t=njt_t,
     )
 
-    delta_t = posterior._mean_utility_jt(
-        delta_cl_t=delta_cl_t,
+    delta_t = posterior._mean_utility(
+        delta_cl=delta_cl_t,
         alpha=alpha,
-        E_bar_t=E_bar_t,
-        njt_t=njt_t,
+        E_bar=E_bar_t,
+        n=njt_t,
     )
-    sjt_t, _ = posterior._choice_probs_t(delta_t=delta_t)
-    sjt_c = tf.clip_by_value(sjt_t, posterior.eps, 1.0)
+    log_pj, _ = posterior._log_choice_probs(delta=delta_t)
 
-    expected = tf.reduce_sum(qjt_t * tf.math.log(sjt_c))
+    expected = tf.reduce_sum(qjt_t * log_pj)
     assert np.allclose(ll.numpy(), expected.numpy(), atol=1e-10, rtol=0.0)
 
 
@@ -408,7 +427,7 @@ def test_logpost_equals_sum_logpost_vec_plus_logprior_global():
 # -----------------------------------------------------------------------------
 # 6) Numerical edge cases
 # -----------------------------------------------------------------------------
-def test_market_loglik_finite_when_shares_extremely_small_due_to_clipping():
+def test_market_loglik_finite_when_probabilities_extremely_small():
     J = 3
     qjt_t = tf.constant([10.0, 10.0, 10.0], dtype=tf.float64)
     q0t_t = tf.constant(10.0, dtype=tf.float64)
@@ -444,18 +463,18 @@ def test_mean_utility_equivariant_under_product_permutation():
     E_bar_t = tiny_inputs["E_bar"][t]
     alpha = tiny_inputs["alpha"]
 
-    delta = posterior._mean_utility_jt(
-        delta_cl_t=delta_cl_t,
+    delta = posterior._mean_utility(
+        delta_cl=delta_cl_t,
         alpha=alpha,
-        E_bar_t=E_bar_t,
-        njt_t=njt_t,
+        E_bar=E_bar_t,
+        n=njt_t,
     )
 
-    delta_perm_inputs = posterior._mean_utility_jt(
-        delta_cl_t=permute_vec_tf(delta_cl_t, perm),
+    delta_perm_inputs = posterior._mean_utility(
+        delta_cl=permute_vec_tf(delta_cl_t, perm),
         alpha=alpha,
-        E_bar_t=E_bar_t,
-        njt_t=permute_vec_tf(njt_t, perm),
+        E_bar=E_bar_t,
+        n=permute_vec_tf(njt_t, perm),
     )
 
     assert np.allclose(
@@ -470,12 +489,19 @@ def test_choice_probs_equivariant_under_product_permutation():
     perm = tf.constant([2, 0, 1], dtype=tf.int32)
     delta_t = tf.constant([0.2, -0.1, 0.3], dtype=tf.float64)
 
-    sj, s0 = posterior._choice_probs_t(delta_t=delta_t)
-    sj_p, s0_p = posterior._choice_probs_t(delta_t=permute_vec_tf(delta_t, perm))
+    log_pj, log_p0 = posterior._log_choice_probs(delta=delta_t)
+    log_pj_p, log_p0_p = posterior._log_choice_probs(
+        delta=permute_vec_tf(delta_t, perm)
+    )
 
-    assert np.allclose(float(s0_p.numpy()), float(s0.numpy()), atol=1e-12, rtol=0.0)
     assert np.allclose(
-        sj_p.numpy(), permute_vec_tf(sj, perm).numpy(), atol=1e-12, rtol=0.0
+        float(log_p0_p.numpy()), float(log_p0.numpy()), atol=1e-12, rtol=0.0
+    )
+    assert np.allclose(
+        log_pj_p.numpy(),
+        permute_vec_tf(log_pj, perm).numpy(),
+        atol=1e-12,
+        rtol=0.0,
     )
 
 

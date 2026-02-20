@@ -9,6 +9,8 @@ This file is Phase-3 agnostic.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import os
 import math
 import numpy as np
@@ -19,6 +21,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from datasets.zhang_with_lu_dgp import generate_choice_learn_market_shocks_dgp
 from zhang.featurebased import BaseFeatureBasedDeepHalo
 from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageEstimator
+
 
 # -----------------------------
 # Helpers (shared)
@@ -46,6 +49,15 @@ def build_items_tensor(xj: np.ndarray) -> tf.Tensor:
 
 
 def build_choice_index_tensor(qj_base: np.ndarray) -> tf.Tensor:
+    """
+    Convert base-market inside-good counts into a vector of chosen item indices.
+
+    Expected:
+      qj_base: (J,) integer counts
+
+    Returns:
+      choices: (sum_j qj_base[j],) int32 indices in [0, J)
+    """
     q = np.asarray(qj_base, dtype=np.int64)
     idx = np.repeat(np.arange(q.shape[0], dtype=np.int64), q)
     return tf.convert_to_tensor(idx, dtype=tf.int32)
@@ -54,10 +66,10 @@ def build_choice_index_tensor(qj_base: np.ndarray) -> tf.Tensor:
 def make_training_dataset(
     items_one: tf.Tensor,
     choices: tf.Tensor,
-    *,
     batch_size: int,
     shuffle_buffer: int,
 ) -> tf.data.Dataset:
+    """Build a tf.data dataset of (items_batch, choice_index_batch) pairs."""
     ds = tf.data.Dataset.from_tensor_slices(choices)
     ds = ds.shuffle(buffer_size=shuffle_buffer, reshuffle_each_iteration=True)
     ds = ds.batch(batch_size, drop_remainder=False)
@@ -72,6 +84,11 @@ def make_training_dataset(
 
 
 def probs_with_outside(u: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Convert inside-good utilities into logit probabilities with an outside option.
+
+    Outside utility is normalized to 0.
+    """
     u = np.asarray(u, dtype=np.float64)
     m = max(0.0, float(np.max(u)))
     exp_inside = np.exp(u - m)
@@ -81,11 +98,13 @@ def probs_with_outside(u: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
+    """Root-mean-square error."""
     d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
     return float(np.sqrt(np.mean(d * d)))
 
 
 def corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Correlation for two arrays after flattening."""
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
     a -= a.mean()
@@ -100,7 +119,6 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def run_choice_model(
-    *,
     seed: int,
     num_products: int,
     num_groups: int,
@@ -123,6 +141,13 @@ def run_choice_model(
     learning_rate: float,
     shuffle_buffer: int,
 ) -> dict[str, object]:
+    """
+    Phase 1: simulate a market and train a feature-based choice model.
+
+    Returns:
+      - dgp: dict of simulated objects
+      - delta_hat: (J,) estimated utilities from the trained model
+    """
     dgp = generate_choice_learn_market_shocks_dgp(
         seed=seed,
         num_markets=num_markets,
@@ -168,14 +193,10 @@ def run_choice_model(
     model.fit(ds_train, epochs=epochs, verbose=2)
     delta_hat = model(items_one, training=False).numpy()[0]
 
-    return {
-        "dgp": dgp,
-        "delta_hat": delta_hat,
-    }
+    return {"dgp": dgp, "delta_hat": delta_hat}
 
 
 def print_choice_model_diagnostics(
-    *,
     delta_hat: np.ndarray,
     delta_true: np.ndarray,
     qj_base: np.ndarray,
@@ -186,6 +207,7 @@ def print_choice_model_diagnostics(
     eval_include_outside: bool,
     eval_against_empirical: bool,
 ) -> None:
+    """Print Phase-1 diagnostics comparing baseline model probabilities to truth."""
     p_hat, p0_hat = probs_with_outside(delta_hat)
 
     print("")
@@ -211,7 +233,8 @@ def print_choice_model_diagnostics(
             )
 
     print(
-        f"utility recovery (centered): corr={corr(delta_hat - delta_hat.mean(), delta_true - delta_true.mean()):.4f} "
+        "utility recovery (centered): "
+        f"corr={corr(delta_hat - delta_hat.mean(), delta_true - delta_true.mean()):.4f} "
         f"| rmse={rmse(delta_hat - delta_hat.mean(), delta_true - delta_true.mean()):.4f}"
     )
 
@@ -221,52 +244,86 @@ def print_choice_model_diagnostics(
 # -----------------------------
 
 
-def run_market_shock_estimator(
-    *,
-    delta_hat: np.ndarray,
-    qjt_shock: np.ndarray,
-    q0t_shock: np.ndarray,
+def build_shrinkage_init_config(
     seed: int,
+    posterior: dict[str, float],
+    init_state: dict[str, tf.Tensor],
+) -> dict[str, object]:
+    """
+    Assemble the shrinkage estimator init config.
+
+    Required keys:
+      - seed: chain RNG seed (int)
+      - posterior: prior hyperparameters for LuPosteriorTF
+      - init_state: initial latent state tensors
+    """
+    return {
+        "seed": int(seed),
+        "posterior": dict(posterior),
+        "init_state": dict(init_state),
+    }
+
+
+def build_shrinkage_fit_config(
     n_iter: int,
     pilot_length: int,
-    max_rounds: int,
+    ridge: float,
     target_low: float,
     target_high: float,
+    max_rounds: int,
     factor_rw: float,
     factor_tmh: float,
-    ridge: float,
+    k_alpha0: float,
+    k_E_bar0: float,
+    k_njt0: float,
+    tune_seed: int,
 ) -> dict[str, object]:
-    T = qjt_shock.shape[0]
-    delta_cl = np.repeat(delta_hat[None, :], T, axis=0)
+    """Assemble the shrinkage estimator fit config (all keys required)."""
+    return {
+        "n_iter": int(n_iter),
+        "pilot_length": int(pilot_length),
+        "ridge": float(ridge),
+        "target_low": float(target_low),
+        "target_high": float(target_high),
+        "max_rounds": int(max_rounds),
+        "factor_rw": float(factor_rw),
+        "factor_tmh": float(factor_tmh),
+        "k_alpha0": float(k_alpha0),
+        "k_E_bar0": float(k_E_bar0),
+        "k_njt0": float(k_njt0),
+        "tune_seed": int(tune_seed),
+    }
 
+
+def run_market_shock_estimator(
+    delta_cl: tf.Tensor,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    init_config: Mapping[str, object],
+    fit_config: Mapping[str, object],
+) -> dict[str, object]:
+    """
+    Phase 2: recover market shocks with the Lu-style shrinkage estimator.
+
+    Inputs must be float64 tensors with static shapes:
+      - delta_cl: (T, J)
+      - qjt:      (T, J)
+      - q0t:      (T,)
+    """
     shrink = ChoiceLearnShrinkageEstimator(
-        delta_cl=delta_cl,
-        qjt=qjt_shock,
-        q0t=q0t_shock,
-        seed=seed,
+        delta_cl=delta_cl, qjt=qjt, q0t=q0t, config=init_config
     )
-
-    shrink.fit(
-        n_iter=n_iter,
-        pilot_length=pilot_length,
-        ridge=ridge,
-        target_low=target_low,
-        target_high=target_high,
-        max_rounds=max_rounds,
-        factor_rw=factor_rw,
-        factor_tmh=factor_tmh,
-    )
-
+    shrink.fit(fit_config)
     return shrink.get_results()
 
 
 def print_market_shock_diagnostics(
-    *,
     delta_hat: np.ndarray,
     dgp: dict[str, object],
     res: dict[str, object],
     eval_include_outside: bool,
 ) -> None:
+    """Print Phase-2 diagnostics comparing baseline vs posterior-mean vs oracle NLL."""
     qjt = np.asarray(dgp["qjt_shock"], dtype=np.float64)
     q0t = np.asarray(dgp["q0t_shock"], dtype=np.float64)
 
@@ -277,23 +334,27 @@ def print_market_shock_diagnostics(
     alpha_hat = float(res["alpha_hat"])
     E_bar_hat = np.asarray(res["E_bar_hat"], dtype=np.float64)
     njt_hat = np.asarray(res["njt_hat"], dtype=np.float64)
-    gamma_hat = np.asarray(res["gamma_hat"], dtype=np.float64)
     phi_hat = np.asarray(res["phi_hat"], dtype=np.float64)
 
     T = qjt.shape[0]
 
-    nll_base = nll_post = nll_oracle = 0.0
+    nll_base = 0.0
+    nll_post = 0.0
+    nll_oracle = 0.0
+
+    p_base_j, p_base_0 = probs_with_outside(delta_hat)
 
     for t in range(T):
-        pb_j, pb_0 = probs_with_outside(delta_hat)
-        pp_j, pp_0 = probs_with_outside(
+        p_post_j, p_post_0 = probs_with_outside(
             alpha_hat * delta_hat + E_bar_hat[t] + njt_hat[t]
         )
-        po_j, po_0 = probs_with_outside(delta_true + E_bar_true[t] + njt_true[t])
+        p_orac_j, p_orac_0 = probs_with_outside(
+            delta_true + E_bar_true[t] + njt_true[t]
+        )
 
-        nll_base -= np.sum(qjt[t] * np.log(pb_j)) + q0t[t] * math.log(pb_0)
-        nll_post -= np.sum(qjt[t] * np.log(pp_j)) + q0t[t] * math.log(pp_0)
-        nll_oracle -= np.sum(qjt[t] * np.log(po_j)) + q0t[t] * math.log(po_0)
+        nll_base -= np.sum(qjt[t] * np.log(p_base_j)) + q0t[t] * math.log(p_base_0)
+        nll_post -= np.sum(qjt[t] * np.log(p_post_j)) + q0t[t] * math.log(p_post_0)
+        nll_oracle -= np.sum(qjt[t] * np.log(p_orac_j)) + q0t[t] * math.log(p_orac_0)
 
     print("")
     print("============================================================")
@@ -317,7 +378,7 @@ def print_market_shock_diagnostics(
 
 
 def main() -> None:
-    # --- config ---
+    # --- DGP + phase-1 model config ---
     seed = 123
     num_products = 15
     num_groups = 5
@@ -326,9 +387,7 @@ def main() -> None:
     N_base = 2_000
     N_shock = 1_000
 
-    # NEW: Phase-1 item feature dimension (d_x)
     num_features = 4
-
     x_sd = 1.0
     coef_sd = 1.0
     p_g_active = 0.2
@@ -347,7 +406,13 @@ def main() -> None:
     learning_rate = 1e-3
     shuffle_buffer = 1_000
 
+    eval_include_outside = True
+    eval_against_empirical = True
+
+    # --- shrinkage (phase-2) config ---
     shrink_seed = 0
+    tune_seed = 1
+
     shrink_n_iter = 500
     shrink_pilot_length = 20
     shrink_max_rounds = 50
@@ -357,8 +422,20 @@ def main() -> None:
     shrink_factor_tmh = 1.2
     shrink_ridge = 1e-6
 
-    eval_include_outside = True
-    eval_against_empirical = True
+    k_alpha0 = 1.0
+    k_E_bar0 = 1.0
+    k_njt0 = 1.0
+
+    posterior_cfg = {
+        "alpha_mean": 1.0,
+        "alpha_var": 1.0,
+        "E_bar_mean": 0.0,
+        "E_bar_var": 1.0,
+        "T0_sq": 0.01,
+        "T1_sq": 1.0,
+        "a_phi": 1.0,
+        "b_phi": 1.0,
+    }
 
     # --- Phase 1 ---
     out1 = run_choice_model(
@@ -400,20 +477,56 @@ def main() -> None:
         eval_against_empirical=eval_against_empirical,
     )
 
-    # --- Phase 2 ---
-    res2 = run_market_shock_estimator(
-        delta_hat=delta_hat,
-        qjt_shock=dgp["qjt_shock"],
-        q0t_shock=dgp["q0t_shock"],
+    # --- Phase 2: build tensors + configs explicitly ---
+    qjt_shock = np.asarray(dgp["qjt_shock"], dtype=np.float64)
+    q0t_shock = np.asarray(dgp["q0t_shock"], dtype=np.float64)
+
+    T = int(qjt_shock.shape[0])
+    J = int(qjt_shock.shape[1])
+
+    delta_hat_tf = tf.constant(
+        np.asarray(delta_hat, dtype=np.float64), tf.float64
+    )  # (J,)
+    delta_cl_tf = tf.tile(delta_hat_tf[None, :], [T, 1])  # (T, J)
+
+    qjt_tf = tf.constant(qjt_shock, tf.float64)  # (T, J)
+    q0t_tf = tf.constant(q0t_shock, tf.float64)  # (T,)
+
+    init_state = {
+        "alpha": tf.constant(1.0, tf.float64),
+        "E_bar": tf.zeros([T], tf.float64),
+        "njt": tf.zeros([T, J], tf.float64),
+        "gamma": tf.zeros([T, J], tf.float64),
+        "phi": tf.fill([T], tf.constant(0.5, tf.float64)),
+    }
+
+    init_config = build_shrinkage_init_config(
         seed=shrink_seed,
+        posterior=posterior_cfg,
+        init_state=init_state,
+    )
+
+    fit_config = build_shrinkage_fit_config(
         n_iter=shrink_n_iter,
         pilot_length=shrink_pilot_length,
-        max_rounds=shrink_max_rounds,
+        ridge=shrink_ridge,
         target_low=shrink_target_low,
         target_high=shrink_target_high,
+        max_rounds=shrink_max_rounds,
         factor_rw=shrink_factor_rw,
         factor_tmh=shrink_factor_tmh,
-        ridge=shrink_ridge,
+        k_alpha0=k_alpha0,
+        k_E_bar0=k_E_bar0,
+        k_njt0=k_njt0,
+        tune_seed=tune_seed,
+    )
+
+    res2 = run_market_shock_estimator(
+        delta_cl=delta_cl_tf,
+        qjt=qjt_tf,
+        q0t=q0t_tf,
+        init_config=init_config,
+        fit_config=fit_config,
     )
 
     print_market_shock_diagnostics(

@@ -1,43 +1,44 @@
 """
 Diagnostics and reporting for the Lu shrinkage sampler.
 
-This module has two responsibilities:
-  - Maintain running sums needed to compute posterior means after sampling.
+Responsibilities:
+  - Maintain running sums used to compute posterior means after sampling.
   - Print a compact, TF-compatible progress line at the end of each iteration.
 
-There is no burn-in or thinning logic here: every iteration is accumulated.
-That choice is controlled by the caller (e.g. by choosing n_iter or by adding
-burn-in/thinning outside this class).
+Every iteration is accumulated by design. Burn-in and thinning are not implemented.
 """
 
 from __future__ import annotations
 
+from typing import Protocol
+
 import tensorflow as tf
 
 
-def round4(x: tf.Tensor) -> tf.Tensor:
+class _ShrinkageState(Protocol):
+    """Minimal sampler interface required by diagnostics/reporting."""
+
+    beta_p: tf.Tensor
+    beta_w: tf.Tensor
+    r: tf.Tensor
+    E_bar: tf.Tensor
+    njt: tf.Tensor
+    phi: tf.Tensor
+    gamma: tf.Tensor
+
+
+def format4(x: tf.Tensor) -> tf.Tensor:
     """Format tensor values as strings with 4 decimal places (no scientific notation)."""
     return tf.strings.as_string(x, precision=4, scientific=False)
 
 
-def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
-    """Print a one-line summary of the current MCMC state.
-
-    This is designed to be cheap and informative:
-      - global scalars: beta_p, beta_w, sigma
-      - simple scale checks: norms of E_bar and njt
-      - sparsity summaries: mean(gamma), mean(phi)
-
-    Implementation notes:
-      - Uses tf.print so it can run inside tf.function.
-      - Avoids .numpy() and Python-side formatting.
-    """
-    beta_p = shrink.beta_p
-    beta_w = shrink.beta_w
+def report_iteration_progress(shrink: _ShrinkageState, it: tf.Tensor) -> None:
+    """Print a one-line summary of the current MCMC state via tf.print."""
     sigma = tf.exp(shrink.r)
 
-    E_bar_norm = tf.norm(shrink.E_bar)
-    njt_norm = tf.norm(shrink.njt)
+    # Dimension-stable scale summaries (RMS).
+    E_bar_rms = tf.sqrt(tf.reduce_mean(tf.square(shrink.E_bar)))
+    njt_rms = tf.sqrt(tf.reduce_mean(tf.square(shrink.njt)))
 
     gamma_mean = tf.reduce_mean(shrink.gamma)
     phi_mean = tf.reduce_mean(shrink.phi)
@@ -46,47 +47,29 @@ def report_iteration_progress(shrink: "LuShrinkageEstimator", it) -> None:
         "[LuShrinkage] it=",
         it,
         " | beta_p=",
-        round4(beta_p),
+        format4(shrink.beta_p),
         ", beta_w=",
-        round4(beta_w),
+        format4(shrink.beta_w),
         ", sigma=",
-        round4(sigma),
-        " | E_bar_norm=",
-        round4(E_bar_norm),
-        ", njt_norm=",
-        round4(njt_norm),
+        format4(sigma),
+        " | E_bar_rms=",
+        format4(E_bar_rms),
+        ", njt_rms=",
+        format4(njt_rms),
         " | mean(gamma)=",
-        round4(gamma_mean),
+        format4(gamma_mean),
         ", mean(phi)=",
-        round4(phi_mean),
+        format4(phi_mean),
     )
 
 
 class LuShrinkageDiagnostics:
-    """Running-sum diagnostics for posterior means and iteration reporting.
-
-    Usage:
-      diag = LuShrinkageDiagnostics(T, J)
-      for it in range(n_iter):
-          ... update sampler state ...
-          diag.step(shrink, it)
-
-      saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = diag.get_sums()
-
-    Stored sums:
-      - saved: number of retained draws
-      - sum_beta: sum of [beta_p, beta_w] across draws
-      - sum_sigma: sum of sigma = exp(r) across draws
-      - sum_E_bar: sum of E_bar across draws
-      - sum_njt: sum of njt across draws
-      - sum_phi: sum of phi across draws
-      - sum_gamma: sum of gamma across draws
-    """
+    """Running-sum diagnostics for posterior means and iteration reporting."""
 
     def __init__(self, T: int, J: int):
         """Create zero-initialized running sums for a (T, J) problem."""
-        self.T = int(T)
-        self.J = int(J)
+        self.T = T
+        self.J = J
 
         # Mutable TF state so accumulation works inside tf.function.
         self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
@@ -104,7 +87,7 @@ class LuShrinkageDiagnostics:
             tf.zeros([self.T, self.J], tf.float64), trainable=False
         )
 
-    def _accumulate_draw(self, shrink: "LuShrinkageEstimator") -> None:
+    def _accumulate_draw(self, shrink: _ShrinkageState) -> None:
         """Add the current sampler state to the running sums."""
         self.saved.assign_add(1)
         self.sum_beta.assign_add(tf.stack([shrink.beta_p, shrink.beta_w], axis=0))
@@ -117,8 +100,8 @@ class LuShrinkageDiagnostics:
         self.sum_gamma.assign_add(shrink.gamma)
 
     @tf.function(reduce_retracing=True)
-    def step(self, shrink: "LuShrinkageEstimator", it) -> None:
-        """Record one iteration: accumulate sums and print a progress line."""
+    def step(self, shrink: _ShrinkageState, it: tf.Tensor) -> None:
+        """Accumulate one draw and print a progress line."""
         self._accumulate_draw(shrink)
         report_iteration_progress(shrink, it)
 

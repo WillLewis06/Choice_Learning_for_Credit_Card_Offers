@@ -1,52 +1,65 @@
 """
 bonus2_posterior.py
 
-Thin TensorFlow posterior wrapper for Bonus Q2 under the UPDATED spec:
+Posterior utilities for Bonus Q2.
 
-  v_{m,i,j,t} =
-      delta_{m,j}
-    + beta_market_j[j]
-    + beta_habit_j[j] * H_{m,i,j,t}
-    + beta_peer_j[j]  * P_{m,i,j,t}
-    + beta_dow_j[j, weekend_t[t]]
-    + S_m[m,t]
+This module provides:
+- Log-likelihood wrappers that delegate all model mechanics to bonus2_model.
+- Elementwise Normal(0, sigma^2) priors on unconstrained parameter blocks z (dropping constants).
+- Block log-targets for random-walk Metropolis updates.
 
-where:
-  H_{m,i,j,t+1} = decay * H_{m,i,j,t} + 1{ y_{m,i,t} = j }
-  S_m[m,t] = sum_k a_m[m,k] * sin(k*theta_t) + b_m[m,k] * cos(k*theta_t)
-
-All core mechanics (state construction, utilities, MNL loglik) live in:
-  bonus2.bonus2_model
+No input validation is performed here. Configs and external inputs are expected to be validated
+in bonus2_input_validation.py before tensors reach this module.
 
 Required `inputs` keys:
-  y_mit          (M,N,T)   int32  choices; 0=outside, j+1=inside product j
-  delta_mj       (M,J)     f64    Phase-1 baseline utilities (fixed)
-  weekend_t      (T,)      int32  weekday/weekend indicator in {0,1}
-  season_sin_kt  (K,T)     f64    sin((k+1)*theta_t[t]) basis
-  season_cos_kt  (K,T)     f64    cos((k+1)*theta_t[t]) basis
-  peer_adj_m     tuple[M]  tf.SparseTensor (N,N) known within-market adjacency
-  L              scalar    int32  peer lookback window length
-  decay          scalar    f64    known habit decay in (0,1), passed through
+  y_mit          (M,N,T)   int32    choices; 0=outside, c=j+1 for inside product j
+  delta_mj       (M,J)     float64  Phase-1 baseline utilities (fixed)
+  is_weekend_t   (T,)      int32    indicator in {0,1}
+  season_sin_kt  (K,T)     float64  seasonal basis
+  season_cos_kt  (K,T)     float64  seasonal basis
+  peer_adj_m     tuple[M]  tf.SparseTensor (N,N) within-market adjacency, float64 values
+  lookback       scalar    int32    peer lookback window length L
+  decay          scalar    float64  known habit decay in (0,1)
 
 Expected `z` keys (all float64):
-  z_beta_market_j  (J,)
-  z_beta_habit_j   (J,)
-  z_beta_peer_j    (J,)
-  z_beta_dow_j     (J,2)
-  z_a_m            (M,K)
-  z_b_m            (M,K)
-
-Priors:
-  - Elementwise Normal(0, sigma_z[z_key]^2) on each z block (dropping constants).
+  z_beta_intercept_j  (J,)
+  z_beta_habit_j      (J,)
+  z_beta_peer_j       (J,)
+  z_beta_weekend_jw   (J,2)
+  z_a_m               (M,K)
+  z_b_m               (M,K)
 """
 
 from __future__ import annotations
+
+from typing import TypedDict
 
 import tensorflow as tf
 
 from bonus2 import bonus2_model as model
 
-_NEG_HALF = tf.constant(-0.5, dtype=tf.float64)
+
+class PosteriorInputs(TypedDict):
+    """Tensor inputs required by the Bonus Q2 likelihood."""
+
+    y_mit: tf.Tensor
+    delta_mj: tf.Tensor
+    is_weekend_t: tf.Tensor
+    season_sin_kt: tf.Tensor
+    season_cos_kt: tf.Tensor
+    peer_adj_m: model.PeerAdjacency
+    lookback: tf.Tensor
+    decay: tf.Tensor
+
+
+Z_KEYS: tuple[str, ...] = (
+    "z_beta_intercept_j",
+    "z_beta_habit_j",
+    "z_beta_peer_j",
+    "z_beta_weekend_jw",
+    "z_a_m",
+    "z_b_m",
+)
 
 
 # =============================================================================
@@ -54,9 +67,9 @@ _NEG_HALF = tf.constant(-0.5, dtype=tf.float64)
 # =============================================================================
 
 
-def logprior_normal(z_block: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
-    """Elementwise Normal(0, sigma^2) log prior (dropping additive constants)."""
-    return _NEG_HALF * tf.square(z_block / sigma)
+def logprior_normal_sum(z_block: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
+    """Return sum of elementwise Normal(0, sigma^2) log prior (dropping constants)."""
+    return tf.reduce_sum(tf.constant(-0.5, tf.float64) * tf.square(z_block / sigma))
 
 
 # =============================================================================
@@ -64,95 +77,43 @@ def logprior_normal(z_block: tf.Tensor, sigma: tf.Tensor) -> tf.Tensor:
 # =============================================================================
 
 
-def loglik_mnt(z: dict[str, tf.Tensor], inputs: dict[str, tf.Tensor]) -> tf.Tensor:
+def loglik_mnt(z: dict[str, tf.Tensor], inputs: PosteriorInputs) -> tf.Tensor:
     """Per-(market, consumer, time) log-likelihood contributions (M,N,T)."""
     theta = model.unconstrained_to_theta(z)
     return model.loglik_mnt_from_theta(
         theta=theta,
         y_mit=inputs["y_mit"],
         delta_mj=inputs["delta_mj"],
-        weekend_t=inputs["weekend_t"],
+        is_weekend_t=inputs["is_weekend_t"],
         season_sin_kt=inputs["season_sin_kt"],
         season_cos_kt=inputs["season_cos_kt"],
         peer_adj_m=inputs["peer_adj_m"],
-        L=inputs["L"],
+        lookback=inputs["lookback"],
         decay=inputs["decay"],
     )
 
 
-def loglik(z: dict[str, tf.Tensor], inputs: dict[str, tf.Tensor]) -> tf.Tensor:
-    """Scalar total log-likelihood (sum over M,N,T)."""
+def loglik(z: dict[str, tf.Tensor], inputs: PosteriorInputs) -> tf.Tensor:
+    """Scalar total log-likelihood (sum over markets, consumers, and time)."""
     return tf.reduce_sum(loglik_mnt(z=z, inputs=inputs))
 
 
 # =============================================================================
-# Scalar log-posterior per block (for RW-MH)
+# Block log-targets for RW-MH
 # =============================================================================
 
 
-def _logpost_normal_block(
+def log_target_block_normal_prior(
     z: dict[str, tf.Tensor],
     z_key: str,
-    inputs: dict[str, tf.Tensor],
+    inputs: PosteriorInputs,
     sigma_z: dict[str, tf.Tensor],
 ) -> tf.Tensor:
-    """Scalar log posterior for a block with elementwise Normal prior."""
+    """Return scalar block log-target: log-likelihood + prior for the specified block.
+
+    This target is suitable for Metropolis updates of a single block z[z_key].
+    Priors for other blocks are omitted because they cancel in MH acceptance ratios.
+    """
     ll = loglik(z=z, inputs=inputs)
-    lp = tf.reduce_sum(logprior_normal(z[z_key], sigma_z[z_key]))
+    lp = logprior_normal_sum(z_block=z[z_key], sigma=sigma_z[z_key])
     return ll + lp
-
-
-def logpost_z_beta_market_j_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(
-        z=z, z_key="z_beta_market_j", inputs=inputs, sigma_z=sigma_z
-    )
-
-
-def logpost_z_beta_habit_j_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(
-        z=z, z_key="z_beta_habit_j", inputs=inputs, sigma_z=sigma_z
-    )
-
-
-def logpost_z_beta_peer_j_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(
-        z=z, z_key="z_beta_peer_j", inputs=inputs, sigma_z=sigma_z
-    )
-
-
-def logpost_z_beta_dow_j_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(
-        z=z, z_key="z_beta_dow_j", inputs=inputs, sigma_z=sigma_z
-    )
-
-
-def logpost_z_a_m_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(z=z, z_key="z_a_m", inputs=inputs, sigma_z=sigma_z)
-
-
-def logpost_z_b_m_all(
-    z: dict[str, tf.Tensor],
-    inputs: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-) -> tf.Tensor:
-    return _logpost_normal_block(z=z, z_key="z_b_m", inputs=inputs, sigma_z=sigma_z)

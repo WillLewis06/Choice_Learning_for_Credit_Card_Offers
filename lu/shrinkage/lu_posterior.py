@@ -1,167 +1,157 @@
 """
 TensorFlow posterior utilities for the Lu shrinkage estimator.
 
-This file defines `LuPosteriorTF`, a TF-native collection of:
-  - Choice probabilities for a random-coefficient logit (RC logit),
-  - Multinomial log-likelihood terms using observed counts (qjt, q0t),
-  - Prior terms for global parameters and the sparse shock structure,
-  - Convenience functions that return either per-market vectors or full scalars.
+This module provides:
+- RC-logit choice probabilities with fixed Monte Carlo draws,
+- multinomial log-likelihood terms using observed counts,
+- prior terms for global parameters and sparse market×product shocks,
+- posterior composition in both per-market-vector and full-scalar forms.
 
-The design is intentionally per-market:
-  - `loglik_vec(...)`, `logprior_market_vec(...)`, and `logpost_vec(...)` return
-    a length-T vector, which enables elementwise MH updates (e.g. for E_bar).
+All hyperparameters and numerical settings are required and must be supplied
+via a validated config. This module does not implement input validation.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import tensorflow as tf
 
 
-class LuPosteriorTF:
-    """Posterior pieces for the Lu shrinkage model (TF-only).
+@dataclass(frozen=True)
+class LuPosteriorConfig:
+    """Configuration container for LuPosteriorTF.
 
-    Utility (price-only random coefficient variant used in this codebase):
-      delta_jt = beta_p * pjt + beta_w * wjt + E_bar_t + njt
-
-    Heterogeneity in the price coefficient is simulated with fixed draws:
-      beta_p_i = beta_p + exp(r) * v_i,  v_i ~ Normal(0, 1)
-      sigma = exp(r) > 0
-
-    Sparse market-product shocks use a spike-and-slab (continuous mixture):
-      gamma | phi ~ Bernoulli(phi) elementwise
-      phi ~ Beta(a_phi, b_phi) per market
-
-      njt | gamma=1 ~ Normal(0, T1_sq)   (slab, large variance)
-      njt | gamma=0 ~ Normal(0, T0_sq)   (spike, small variance)
-
-    Likelihood uses multinomial counts and drops the combinatorial constant:
-      log p(q_t | s_t) = q0t * log(s0t) + sum_j qjt * log(sjt) + const
-
-    Interfaces are organized to match the MCMC updates:
-      - market_loglik: scalar likelihood contribution for one market
-      - loglik_vec: length-T vector of per-market likelihood contributions
-      - logprior_global: scalar prior for (beta_p, beta_w, r)
-      - logprior_market_vec: length-T vector for (E_bar, njt, gamma, phi) priors
-      - logpost_vec: length-T vector of (likelihood + market prior)
-      - logpost: full scalar posterior (sum over markets + global prior)
+    All fields are required and should be validated upstream (e.g., config
+    validation). This class does not apply defaults or type coercions.
     """
 
-    def __init__(
-        self,
-        n_draws: int,
-        seed: int,
-        beta_p_mean: float = 0.0,
-        beta_p_var: float = 10.0,
-        beta_w_mean: float = 0.0,
-        beta_w_var: float = 10.0,
-        r_mean: float = 0.0,
-        r_var: float = 0.5,
-        E_bar_mean: float = 0.0,
-        E_bar_var: float = 10.0,
-        T0_sq: float = 1e-3,
-        T1_sq: float = 1.0,
-        a_phi: float = 1.0,
-        b_phi: float = 1.0,
-        eps: float = 1e-15,
-        dtype=tf.float64,
-    ):
-        """Initialize hyperparameters and simulation draws.
+    # Monte Carlo integration settings
+    n_draws: int
+    seed: int
 
-        The RC logit likelihood integrates over `v_draws`. For performance and
-        determinism, those draws are generated once and stored as `self.v_draws`.
-        """
-        self.dtype = dtype
-        self.eps = tf.constant(eps, dtype=dtype)
+    # Numeric settings
+    dtype: tf.dtypes.DType
+    eps: float
 
-        self.n_draws = int(n_draws)
-        self.seed = int(seed)
+    # Global priors: Normal(mean, var)
+    beta_p_mean: float
+    beta_p_var: float
+    beta_w_mean: float
+    beta_w_var: float
+    r_mean: float
+    r_var: float
 
-        # Fixed simulation draws v_i ~ Normal(0,1), shape (n_draws,).
-        g = tf.random.Generator.from_seed(self.seed)
-        self.v_draws = tf.cast(g.normal(shape=(self.n_draws,)), dtype)
+    # Market common shock prior: Normal(mean, var)
+    E_bar_mean: float
+    E_bar_var: float
 
-        # Prior hyperparameters stored as TF constants for graph compatibility.
-        self.beta_p_mean = tf.constant(beta_p_mean, dtype=dtype)
-        self.beta_p_var = tf.constant(beta_p_var, dtype=dtype)
-        self.beta_w_mean = tf.constant(beta_w_mean, dtype=dtype)
-        self.beta_w_var = tf.constant(beta_w_var, dtype=dtype)
+    # Spike-and-slab variances for njt
+    T0_sq: float
+    T1_sq: float
 
-        self.r_mean = tf.constant(r_mean, dtype=dtype)
-        self.r_var = tf.constant(r_var, dtype=dtype)
+    # Beta prior for phi
+    a_phi: float
+    b_phi: float
 
-        self.E_bar_mean = tf.constant(E_bar_mean, dtype=dtype)
-        self.E_bar_var = tf.constant(E_bar_var, dtype=dtype)
 
-        # Spike-and-slab variances (and cached logs used repeatedly).
-        self.T0_sq = tf.constant(T0_sq, dtype=dtype)
-        self.T1_sq = tf.constant(T1_sq, dtype=dtype)
-        self.log_T0_sq = tf.math.log(self.T0_sq)
-        self.log_T1_sq = tf.math.log(self.T1_sq)
+class LuPosteriorTF:
+    """Posterior building blocks for the Lu shrinkage model (TensorFlow).
 
-        # Beta prior parameters for market inclusion rates.
-        self.a_phi = tf.constant(a_phi, dtype=dtype)
-        self.b_phi = tf.constant(b_phi, dtype=dtype)
+    Utility in market t for product j:
+        delta_jt = beta_p * pjt + beta_w * wjt + E_bar_t + njt
 
-        self.two_pi = tf.constant(2.0 * 3.141592653589793, dtype=self.dtype)
+    Price heterogeneity is integrated via fixed draws:
+        beta_p_i = beta_p + exp(r) * v_i,   v_i ~ Normal(0, 1)
+
+    Sparse shocks use a continuous spike-and-slab mixture:
+        gamma_tj | phi_t ~ Bernoulli(phi_t)
+        njt_tj | gamma_tj = 1 ~ Normal(0, T1_sq)   (slab)
+        njt_tj | gamma_tj = 0 ~ Normal(0, T0_sq)   (spike)
+        phi_t ~ Beta(a_phi, b_phi)
+
+    Likelihood uses multinomial counts and omits the combinatorial constant.
+    """
+
+    def __init__(self, config: LuPosteriorConfig):
+        """Initialize constants and fixed Monte Carlo draws."""
+        self.dtype = config.dtype
+        self.eps = tf.constant(config.eps, dtype=self.dtype)
+
+        # Fixed Monte Carlo draws v_i ~ Normal(0, 1), reused across all calls.
+        g = tf.random.Generator.from_seed(config.seed)
+        self.v_draws = g.normal(shape=(config.n_draws,), dtype=self.dtype)
+
+        # Shared constants.
+        two_pi = tf.constant(2.0 * 3.141592653589793, dtype=self.dtype)
+        self._log_two_pi = tf.math.log(two_pi)
+
+        # Prior hyperparameters as TF constants (graph-friendly).
+        self.beta_p_mean = tf.constant(config.beta_p_mean, dtype=self.dtype)
+        self.beta_p_var = tf.constant(config.beta_p_var, dtype=self.dtype)
+        self.beta_w_mean = tf.constant(config.beta_w_mean, dtype=self.dtype)
+        self.beta_w_var = tf.constant(config.beta_w_var, dtype=self.dtype)
+        self.r_mean = tf.constant(config.r_mean, dtype=self.dtype)
+        self.r_var = tf.constant(config.r_var, dtype=self.dtype)
+
+        self.E_bar_mean = tf.constant(config.E_bar_mean, dtype=self.dtype)
+        self.E_bar_var = tf.constant(config.E_bar_var, dtype=self.dtype)
+
+        self.T0_sq = tf.constant(config.T0_sq, dtype=self.dtype)
+        self.T1_sq = tf.constant(config.T1_sq, dtype=self.dtype)
+        self._log_T0_sq = tf.math.log(self.T0_sq)
+        self._log_T1_sq = tf.math.log(self.T1_sq)
+
+        self.a_phi = tf.constant(config.a_phi, dtype=self.dtype)
+        self.b_phi = tf.constant(config.b_phi, dtype=self.dtype)
+        self._log_beta_ab = (
+            tf.math.lgamma(self.a_phi)
+            + tf.math.lgamma(self.b_phi)
+            - tf.math.lgamma(self.a_phi + self.b_phi)
+        )
+
+        # Cached Normal log-density constants: -0.5 * log(2*pi*var).
+        self._lp0_beta_p = -0.5 * (self._log_two_pi + tf.math.log(self.beta_p_var))
+        self._lp0_beta_w = -0.5 * (self._log_two_pi + tf.math.log(self.beta_w_var))
+        self._lp0_r = -0.5 * (self._log_two_pi + tf.math.log(self.r_var))
+        self._lp0_E_bar = -0.5 * (self._log_two_pi + tf.math.log(self.E_bar_var))
 
     # ------------------------------------------------------------------
-    # Deterministic helpers (price-only random coefficient)
+    # Choice probabilities (price-only random coefficient)
     # ------------------------------------------------------------------
 
     def _mean_utility_jt(
         self,
-        pjt_t,
-        wjt_t,
-        beta_p,
-        beta_w,
-        E_bar_t,
-        njt_t,
-    ):
-        """Compute delta_t for one market.
-
-        For a single market t (vectors over products j=0..J-1):
-          delta_t = beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
-
-        Returns:
-            delta_t: Tensor of shape (J,).
-        """
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+    ) -> tf.Tensor:
+        """Mean utilities for one market (shape (J,))."""
         return beta_p * pjt_t + beta_w * wjt_t + E_bar_t + njt_t
 
-    def _choice_probs_t(self, pjt_t, delta_t, r):
-        """Compute (sjt_t, s0t) for one market under price-only RC logit.
-
-        Integration is done with fixed draws `v_draws`:
-          beta_p_i = beta_p + exp(r) * v_i
-
-        Outside option utility is normalized to 0. A max-shift is used for
-        numerical stability of exp().
-
-        Args:
-            pjt_t: Prices for market t, shape (J,).
-            delta_t: Mean utilities for market t, shape (J,).
-            r: log(sigma), scalar.
-
-        Returns:
-            sjt_t: Inside shares for market t, shape (J,).
-            s0t: Outside share for market t, scalar.
-        """
+    def _choice_probs_t(
+        self, pjt_t: tf.Tensor, delta_t: tf.Tensor, r: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        """RC-logit inside shares sjt (J,) and outside share s0 (scalar) for one market."""
         sigma = tf.exp(r)
         scaled_v = sigma * self.v_draws  # (R,)
 
-        # Draw-specific utilities: util[j, i] = delta[j] + p[j]*sigma*v[i].
-        mu = pjt_t[:, None] * scaled_v[None, :]  # (J,R)
-        util = delta_t[:, None] + mu  # (J,R)
+        # Draw-specific utility: util[j, i] = delta[j] + p[j] * sigma * v[i].
+        util = delta_t[:, None] + pjt_t[:, None] * scaled_v[None, :]  # (J, R)
 
-        # Stable logit including the outside option (utility 0).
-        m = tf.reduce_max(util, axis=0, keepdims=True)  # (1,R)
-        m = tf.maximum(m, tf.zeros_like(m))  # ensures outside=0 is included
+        # Stabilize exp() using a max-shift that also accounts for outside option u0 = 0.
+        m = tf.reduce_max(util, axis=0, keepdims=True)  # (1, R)
+        m = tf.maximum(m, tf.zeros_like(m))  # ensures shift >= 0 so outside is included
 
-        expu = tf.exp(util - m)  # (J,R)
-        exp0 = tf.exp(-m)  # (1,R)
-        denom = exp0 + tf.reduce_sum(expu, axis=0, keepdims=True)  # (1,R)
+        expu = tf.exp(util - m)  # (J, R)
+        exp0 = tf.exp(-m)  # (1, R)
+        denom = exp0 + tf.reduce_sum(expu, axis=0, keepdims=True)  # (1, R)
 
-        sjt_draw = expu / denom  # (J,R)
-        s0_draw = exp0 / denom  # (1,R)
+        sjt_draw = expu / denom  # (J, R)
+        s0_draw = exp0 / denom  # (1, R)
 
         sjt_t = tf.reduce_mean(sjt_draw, axis=1)  # (J,)
         s0t = tf.reduce_mean(s0_draw[0, :])  # scalar
@@ -174,24 +164,17 @@ class LuPosteriorTF:
     @tf.function(reduce_retracing=True)
     def market_loglik(
         self,
-        qjt_t,
-        q0t_t,
-        pjt_t,
-        wjt_t,
-        beta_p,
-        beta_w,
-        r,
-        E_bar_t,
-        njt_t,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
     ) -> tf.Tensor:
-        """Compute one market's multinomial log-likelihood term.
-
-        Returns:
-          q0t_t * log(s0t) + sum_j qjt_t[j] * log(sjt_t[j])
-
-        The multinomial combinatorial constant is omitted because it does not
-        depend on parameters and cancels in MH ratios.
-        """
+        """Multinomial log-likelihood contribution for one market (scalar)."""
         delta_t = self._mean_utility_jt(
             pjt_t=pjt_t,
             wjt_t=wjt_t,
@@ -202,37 +185,29 @@ class LuPosteriorTF:
         )
         sjt_t, s0t = self._choice_probs_t(pjt_t=pjt_t, delta_t=delta_t, r=r)
 
-        # Clip to avoid log(0).
+        # Numerical stability: prevent log(0) from underflowing shares to exactly 0.
         sjt_t = tf.clip_by_value(sjt_t, self.eps, 1.0)
         s0t = tf.clip_by_value(s0t, self.eps, 1.0)
 
-        ll = tf.reduce_sum(qjt_t * tf.math.log(sjt_t))
-        ll += q0t_t * tf.math.log(s0t)
-        return ll
+        return tf.reduce_sum(qjt_t * tf.math.log(sjt_t)) + q0t_t * tf.math.log(s0t)
 
     @tf.function(reduce_retracing=True)
     def loglik_vec(
         self,
-        qjt,
-        q0t,
-        pjt,
-        wjt,
-        beta_p,
-        beta_w,
-        r,
-        E_bar,
-        njt,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
     ) -> tf.Tensor:
-        """Compute per-market log-likelihood contributions (shape (T,)).
-
-        Returns a length-T vector so callers can either:
-          - sum over markets for global updates, or
-          - keep the vector form for elementwise MH updates.
-        """
+        """Per-market log-likelihood vector (shape (T,))."""
         T = tf.shape(pjt)[0]
 
-        def per_t(t):
-            """Return market t log-likelihood (scalar)."""
+        def _market_ll(t: tf.Tensor) -> tf.Tensor:
             return self.market_loglik(
                 qjt_t=qjt[t],
                 q0t_t=q0t[t],
@@ -245,110 +220,86 @@ class LuPosteriorTF:
                 njt_t=njt[t],
             )
 
-        return tf.map_fn(per_t, tf.range(T), fn_output_signature=self.dtype)
+        return tf.map_fn(_market_ll, tf.range(T), fn_output_signature=self.dtype)
 
     # ------------------------------------------------------------------
     # Priors
     # ------------------------------------------------------------------
 
-    def logprior_global(self, beta_p, beta_w, r) -> tf.Tensor:
-        """Compute the scalar prior for (beta_p, beta_w, r).
-
-        These are independent Normal priors:
-          beta_p ~ Normal(beta_p_mean, beta_p_var)
-          beta_w ~ Normal(beta_w_mean, beta_w_var)
-          r      ~ Normal(r_mean, r_var)
-        """
+    def logprior_global(
+        self, beta_p: tf.Tensor, beta_w: tf.Tensor, r: tf.Tensor
+    ) -> tf.Tensor:
+        """Global prior for (beta_p, beta_w, r), scalar."""
         lp_beta_p = (
-            -0.5 * tf.math.log(self.two_pi * self.beta_p_var)
+            self._lp0_beta_p
             - 0.5 * tf.square(beta_p - self.beta_p_mean) / self.beta_p_var
         )
         lp_beta_w = (
-            -0.5 * tf.math.log(self.two_pi * self.beta_w_var)
+            self._lp0_beta_w
             - 0.5 * tf.square(beta_w - self.beta_w_mean) / self.beta_w_var
         )
-        lp_r = (
-            -0.5 * tf.math.log(self.two_pi * self.r_var)
-            - 0.5 * tf.square(r - self.r_mean) / self.r_var
-        )
+        lp_r = self._lp0_r - 0.5 * tf.square(r - self.r_mean) / self.r_var
         return lp_beta_p + lp_beta_w + lp_r
 
     def logprior_market_vec(
         self,
-        E_bar,
-        njt,
-        gamma,
-        phi,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+        phi: tf.Tensor,
     ) -> tf.Tensor:
-        """Compute per-market prior contributions for (E_bar, njt, gamma, phi).
-
-        For each market t, this includes:
-          - E_bar[t] prior: Normal(E_bar_mean, E_bar_var)
-          - njt[t,:] prior: Normal with variance chosen by gamma[t,:]
-          - gamma[t,:] prior: Bernoulli(phi[t]) elementwise
-          - phi[t] prior: Beta(a_phi, b_phi)
-
-        Returns:
-            lp_t: Tensor of shape (T,).
-        """
-        # E_bar prior: independent across markets.
+        """Per-market prior vector for (E_bar, njt, gamma, phi), shape (T,)."""
+        # E_bar[t] ~ Normal(E_bar_mean, E_bar_var)
         lp_E = (
-            -0.5 * tf.math.log(self.two_pi * self.E_bar_var)
-            - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
+            self._lp0_E_bar - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
         )  # (T,)
 
-        # njt prior: spike vs slab variance selected by gamma.
-        var = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq  # (T,J)
-        log_var = gamma * self.log_T1_sq + (1.0 - gamma) * self.log_T0_sq  # (T,J)
-        lp_n_entry = -0.5 * (tf.math.log(self.two_pi) + log_var + tf.square(njt) / var)
+        # njt[t, j] ~ Normal(0, var_tj) where var_tj selects spike vs slab via gamma.
+        one_minus_gamma = 1.0 - gamma
+        var = gamma * self.T1_sq + one_minus_gamma * self.T0_sq  # (T, J)
+        log_var = gamma * self._log_T1_sq + one_minus_gamma * self._log_T0_sq  # (T, J)
+        lp_n_entry = -0.5 * (
+            self._log_two_pi + log_var + tf.square(njt) / var
+        )  # (T, J)
         lp_n = tf.reduce_sum(lp_n_entry, axis=1)  # (T,)
 
-        # gamma prior: Bernoulli(phi) independent across products.
-        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)  # (T,)
-        phi_b = phi[:, None]  # (T,1) broadcasts to (T,J)
-        lp_g_entry = gamma * tf.math.log(phi_b) + (1.0 - gamma) * tf.math.log(
+        # gamma[t, j] | phi[t] ~ Bernoulli(phi[t]) (independent across j).
+        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)  # numerical stability
+        phi_b = phi[:, None]  # (T, 1) -> broadcast to (T, J)
+        lp_g_entry = gamma * tf.math.log(phi_b) + one_minus_gamma * tf.math.log(
             1.0 - phi_b
-        )
+        )  # (T, J)
         lp_g = tf.reduce_sum(lp_g_entry, axis=1)  # (T,)
 
-        # phi prior: Beta(a_phi, b_phi) independent across markets.
-        a = self.a_phi
-        b = self.b_phi
-        logB = tf.math.lgamma(a) + tf.math.lgamma(b) - tf.math.lgamma(a + b)
+        # phi[t] ~ Beta(a_phi, b_phi)
         lp_phi = (
-            (a - 1.0) * tf.math.log(phi) + (b - 1.0) * tf.math.log(1.0 - phi) - logB
+            (self.a_phi - 1.0) * tf.math.log(phi)
+            + (self.b_phi - 1.0) * tf.math.log(1.0 - phi)
+            - self._log_beta_ab
         )  # (T,)
 
         return lp_E + lp_n + lp_g + lp_phi
 
     # ------------------------------------------------------------------
-    # Posterior (per-market factorization)
+    # Posterior composition
     # ------------------------------------------------------------------
 
     @tf.function(reduce_retracing=True)
     def logpost_vec(
         self,
-        qjt,
-        q0t,
-        pjt,
-        wjt,
-        beta_p,
-        beta_w,
-        r,
-        E_bar,
-        njt,
-        gamma,
-        phi,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+        phi: tf.Tensor,
     ) -> tf.Tensor:
-        """Compute per-market log posterior terms (shape (T,)).
-
-        Returns:
-          logpost_t = loglik_t + logprior_market_t
-
-        The global prior logprior_global(beta_p, beta_w, r) is excluded so that:
-          - market-level MH updates can use logpost_vec directly, and
-          - global-parameter updates can add the global prior once after summing.
-        """
+        """Per-market posterior terms (likelihood + market priors), shape (T,)."""
         ll_t = self.loglik_vec(
             qjt=qjt,
             q0t=q0t,
@@ -365,23 +316,19 @@ class LuPosteriorTF:
 
     def logpost(
         self,
-        qjt,
-        q0t,
-        pjt,
-        wjt,
-        beta_p,
-        beta_w,
-        r,
-        E_bar,
-        njt,
-        gamma,
-        phi,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+        phi: tf.Tensor,
     ) -> tf.Tensor:
-        """Compute the full scalar log posterior.
-
-        Full posterior is:
-          sum_t logpost_vec[t] + logprior_global(beta_p, beta_w, r)
-        """
+        """Full scalar log posterior: sum_t logpost_vec[t] + global prior."""
         lp_t = self.logpost_vec(
             qjt=qjt,
             q0t=q0t,

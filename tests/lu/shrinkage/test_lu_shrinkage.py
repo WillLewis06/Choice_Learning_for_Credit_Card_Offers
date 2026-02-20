@@ -5,9 +5,7 @@ Constraints for this test module
 - No pytest fixture injection: all tests are plain functions with no fixture args.
 - Shared test utilities and tiny-problem builders are imported from `lu_conftest`
   (a normal Python helper module, not a pytest conftest plugin).
-- Tests that call `fit()` patch:
-  - tuning (to keep tests fast and deterministic), and
-  - debug file I/O (to avoid writing to disk during tests).
+- Tests that call `fit()` patch tuning (to keep tests fast and deterministic).
 """
 
 from __future__ import annotations
@@ -21,8 +19,8 @@ import tensorflow as tf
 
 import lu.shrinkage.lu_shrinkage as lu_shrinkage_mod
 from lu.shrinkage.lu_diagnostics import LuShrinkageDiagnostics
-from lu.shrinkage.lu_posterior import LuPosteriorTF
-from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator
+from lu.shrinkage.lu_posterior import LuPosteriorConfig, LuPosteriorTF
+from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator, LuShrinkageFitConfig
 
 from lu_conftest import (
     assert_all_finite_tf,
@@ -38,19 +36,47 @@ ATOL = 1e-10
 # -----------------------------------------------------------------------------
 # Local constructors / helpers (no pytest fixtures)
 # -----------------------------------------------------------------------------
+def _make_posterior_config(n_draws: int, seed: int) -> LuPosteriorConfig:
+    """
+    Fully-specified posterior configuration (no defaults).
+
+    The numerical values here are chosen only to be sane and stable for tests.
+    Most tests exercise shape/probability/log-density identities and are not
+    sensitive to the specific prior hyperparameters.
+    """
+    return LuPosteriorConfig(
+        n_draws=int(n_draws),
+        seed=int(seed),
+        dtype=DTYPE,
+        eps=1e-12,
+        beta_p_mean=-1.0,
+        beta_p_var=1.0,
+        beta_w_mean=0.3,
+        beta_w_var=1.0,
+        r_mean=0.0,
+        r_var=1.0,
+        E_bar_mean=0.0,
+        E_bar_var=1.0,
+        T0_sq=1e-2,
+        T1_sq=1.0,
+        a_phi=1.0,
+        b_phi=1.0,
+    )
+
+
 def _make_estimator(
     data: dict,
     n_draws: int = 20,
     seed: int = 123,
 ) -> LuShrinkageEstimator:
     """Construct a LuShrinkageEstimator on the provided market panel."""
+    posterior_config = _make_posterior_config(n_draws=n_draws, seed=seed)
     return LuShrinkageEstimator(
         pjt=data["pjt"],
         wjt=data["wjt"],
         qjt=data["qjt"],
         q0t=data["q0t"],
-        n_draws=n_draws,
-        seed=seed,
+        posterior_config=posterior_config,
     )
 
 
@@ -92,11 +118,6 @@ def _assert_results_schema(res: dict, T: int, J: int) -> None:
     assert np.shape(res["E_hat"]) == (T, J)
 
 
-def _noop_debug_save_k(self, k_r, k_E_bar, k_beta, k_njt) -> None:
-    """Disable debug file writes in tests."""
-    return None
-
-
 def _stub_tune_shrinkage(_shrink: LuShrinkageEstimator):
     """Return fixed proposal scales so fit() is fast and deterministic in tests."""
     k = tf.constant(0.1, dtype=DTYPE)
@@ -104,15 +125,10 @@ def _stub_tune_shrinkage(_shrink: LuShrinkageEstimator):
 
 
 @contextmanager
-def _patched_tuning_and_debug():
-    """
-    Patch:
-    - LuShrinkageEstimator._debug_save_k (disk I/O)
-    - lu_shrinkage_mod.tune_shrinkage (pilot tuning loop)
-    """
-    with patch.object(LuShrinkageEstimator, "_debug_save_k", _noop_debug_save_k):
-        with patch.object(lu_shrinkage_mod, "tune_shrinkage", _stub_tune_shrinkage):
-            yield
+def _patched_tuning():
+    """Patch lu_shrinkage_mod.tune_shrinkage (pilot tuning loop)."""
+    with patch.object(lu_shrinkage_mod, "tune_shrinkage", _stub_tune_shrinkage):
+        yield
 
 
 # -----------------------------------------------------------------------------
@@ -131,7 +147,13 @@ def test_init_raises_on_shape_or_rank_mismatch():
     q0t = data["q0t"]
     T, J = data["T"], data["J"]
 
-    base = dict(pjt=pjt, wjt=wjt, qjt=qjt, q0t=q0t, n_draws=10, seed=0)
+    base = dict(
+        pjt=pjt,
+        wjt=wjt,
+        qjt=qjt,
+        q0t=q0t,
+        posterior_config=_make_posterior_config(n_draws=10, seed=0),
+    )
 
     bad_cases = [
         dict(pjt=pjt[:, : J - 1]),
@@ -157,8 +179,8 @@ def test_fit_raises_on_invalid_arguments():
     """
     fit() should fail fast on invalid arguments via fit_validate_input.
 
-    This test intentionally does not patch tuning or debug I/O because validation
-    happens before those paths are reached.
+    This test intentionally does not patch tuning because validation happens
+    before those paths are reached.
     """
     data = tiny_market_np()
     est = _make_estimator(data)
@@ -195,7 +217,7 @@ def test_fit_raises_on_invalid_arguments():
         kwargs = dict(base)
         kwargs.update(overrides)
         with pytest.raises(Exception):
-            est.fit(**kwargs)
+            est.fit(config=LuShrinkageFitConfig(**kwargs))
 
 
 # -----------------------------------------------------------------------------
@@ -307,17 +329,19 @@ def test_fit_runs_with_mocked_tuning():
     est = _make_estimator(data)
     T, J = data["T"], data["J"]
 
-    with _patched_tuning_and_debug():
+    with _patched_tuning():
         n_iter = 2
         est.fit(
-            n_iter=n_iter,
-            pilot_length=2,
-            ridge=1e-6,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=2,
-            factor_rw=1.1,
-            factor_tmh=1.5,
+            config=LuShrinkageFitConfig(
+                n_iter=n_iter,
+                pilot_length=2,
+                ridge=1e-6,
+                target_low=0.3,
+                target_high=0.5,
+                max_rounds=2,
+                factor_rw=1.1,
+                factor_tmh=1.5,
+            )
         )
 
     assert est._diag is not None
@@ -338,7 +362,7 @@ def test_fit_round_trip_improves_share_fit():
     """
     data = tiny_market_np()
 
-    with _patched_tuning_and_debug():
+    with _patched_tuning():
         pjt = tf.constant(data["pjt"], dtype=DTYPE)  # (T,J)
         wjt = tf.constant(data["wjt"], dtype=DTYPE)  # (T,J)
         T, J = data["T"], data["J"]
@@ -355,7 +379,9 @@ def test_fit_round_trip_improves_share_fit():
         w_c = wjt - tf.reduce_mean(wjt, axis=1, keepdims=True)
         njt_true = 0.15 * p_c - 0.10 * w_c
 
-        posterior_sim = LuPosteriorTF(n_draws=25, seed=123, dtype=DTYPE)
+        posterior_sim = LuPosteriorTF(
+            config=_make_posterior_config(n_draws=25, seed=123)
+        )
 
         def _choice_probs_batch(beta_p, beta_w, r, E_bar, njt):
             sjt_list = []
@@ -405,21 +431,22 @@ def test_fit_round_trip_improves_share_fit():
             wjt=data["wjt"],
             qjt=qjt,
             q0t=q0t,
-            n_draws=20,
-            seed=123,
+            posterior_config=_make_posterior_config(n_draws=20, seed=123),
         )
 
         misfit0 = _misfit(est)
 
         est.fit(
-            n_iter=30,
-            pilot_length=2,
-            ridge=1e-6,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=2,
-            factor_rw=1.1,
-            factor_tmh=1.5,
+            config=LuShrinkageFitConfig(
+                n_iter=30,
+                pilot_length=2,
+                ridge=1e-6,
+                target_low=0.3,
+                target_high=0.5,
+                max_rounds=2,
+                factor_rw=1.1,
+                factor_tmh=1.5,
+            )
         )
 
         misfit1 = _misfit(est)
@@ -432,16 +459,18 @@ def test_get_results_shapes_and_E_identity():
     est = _make_estimator(data)
     T, J = data["T"], data["J"]
 
-    with _patched_tuning_and_debug():
+    with _patched_tuning():
         est.fit(
-            n_iter=2,
-            pilot_length=2,
-            ridge=1e-6,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=2,
-            factor_rw=1.1,
-            factor_tmh=1.5,
+            config=LuShrinkageFitConfig(
+                n_iter=2,
+                pilot_length=2,
+                ridge=1e-6,
+                target_low=0.3,
+                target_high=0.5,
+                max_rounds=2,
+                factor_rw=1.1,
+                factor_tmh=1.5,
+            )
         )
 
     res = est.get_results()
@@ -492,7 +521,7 @@ def test_logpost_is_equivariant_to_product_permutation():
     gamma = tf.cast(njt > 0.0, DTYPE)  # (T,J)
     phi = tf.fill([T], tf.constant(0.4, dtype=DTYPE))  # (T,)
 
-    posterior = LuPosteriorTF(n_draws=25, seed=0, dtype=DTYPE)
+    posterior = LuPosteriorTF(config=_make_posterior_config(n_draws=25, seed=0))
 
     lp0 = posterior.logpost_vec(
         qjt=qjt,

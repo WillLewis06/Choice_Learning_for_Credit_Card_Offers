@@ -1,21 +1,15 @@
 """
-BLP-style demand estimator used in the Lu simulation pipeline.
+Minimal BLP-style demand estimator for simulation use.
 
-This module provides:
-  - Simple instrument builders (strong vs weak instruments).
-  - A minimal two-step GMM estimator for sigma in a random-coefficient logit.
-  - Recovery of mean utilities via Berry inversion (contraction mapping).
-  - IV regression of delta on X = [pjt, wjt] to recover (beta_p, beta_w).
-  - Recovery of demand shocks E_hat = delta - X beta_hat.
+Implements:
+  - Instrument construction helpers.
+  - Berry inversion to recover mean utilities delta given sigma.
+  - 2SLS regression of delta on X = [pjt, wjt] using instruments Zjt.
+  - Two-step GMM over sigma using moments E[z * E_hat] = 0.
 
-What this estimator does (high level):
-  1) For a candidate sigma, invert observed shares to get delta (mean utilities).
-  2) Run IV regression: delta = X beta + E (E is the demand shock).
-  3) Form moments: g_bar(sigma) = mean(z * E).
-  4) Minimize Q(sigma) = g_bar' W g_bar using a two-step weighting matrix.
-
-This is a simulation-oriented implementation: it prioritizes clarity and stable
-behavior (warm starts, damping, penalties) over econometric completeness.
+Contract:
+  - Data arrays are assumed to be produced internally and already consistent.
+  - The `config` mapping is assumed to be validated upstream (no defaults here).
 """
 
 from __future__ import annotations
@@ -26,471 +20,261 @@ from scipy.optimize import minimize
 from lu.blp.inversion import invert_all_markets
 
 
-def build_strong_IVs(wjt, ujt):
-    """Build 'strong' instruments using both wjt and a cost shifter ujt.
-
-    Returns Zjt with last axis holding instrument components:
-      Z_strong = [1, wjt, wjt^2, ujt, ujt^2]
-
-    This matches the simulation-side instrument construction used in the Lu-style
-    experiments: ujt is treated as an exogenous cost shifter correlated with pjt.
-    """
-    wjt = np.asarray(wjt, dtype=float)
-    ujt = np.asarray(ujt, dtype=float)
-    ones = np.ones_like(wjt)
-    return np.stack([ones, wjt, wjt**2, ujt, ujt**2], axis=2)
+def build_strong_IVs(wjt: np.ndarray, ujt: np.ndarray) -> np.ndarray:
+    """Return strong instruments Z = [1, w, w^2, u, u^2] with shape (T, J, 5)."""
+    w = np.asarray(wjt)
+    u = np.asarray(ujt)
+    ones = np.ones_like(w)
+    return np.stack([ones, w, w**2, u, u**2], axis=2)
 
 
-def build_weak_IVs(wjt):
-    """Build 'weak' instruments as polynomials of wjt only.
-
-    Returns Zjt with last axis holding instrument components:
-      Z_weak = [1, wjt, wjt^2, wjt^3, wjt^4]
-
-    These instruments are deliberately weaker in the simulation design: they
-    contain no additional excluded shifter like ujt.
-    """
-    wjt = np.asarray(wjt, dtype=float)
-    ones = np.ones_like(wjt)
-    return np.stack([ones, wjt, wjt**2, wjt**3, wjt**4], axis=2)
+def build_weak_IVs(wjt: np.ndarray) -> np.ndarray:
+    """Return weak instruments Z = [1, w, w^2, w^3, w^4] with shape (T, J, 5)."""
+    w = np.asarray(wjt)
+    ones = np.ones_like(w)
+    return np.stack([ones, w, w**2, w**3, w**4], axis=2)
 
 
 class BLPEstimator:
-    """Minimal BLP-style estimator for the simulation environment.
-
-    Demand-side specification (aligned with the simulation regressors):
-      delta_jt = beta_p * pjt + beta_w * wjt + E_hat_jt
-
-    Implementation outline:
-      - For each candidate sigma, recover delta via Berry inversion.
-      - Estimate beta by IV regression using instruments Zjt.
-      - Construct moment conditions from Zjt and E_hat.
-      - Minimize the GMM objective over sigma via a grid + Nelder–Mead.
-
-    Notes:
-      - X is constructed internally as [pjt, wjt] (no constant).
-      - All computations are done with numpy; inversion is imported from
-        `market_shock_estimators.inversion`.
-    """
+    """Two-step GMM estimator for sigma with IV recovery of (beta_p, beta_w)."""
 
     def __init__(
         self,
-        sjt,
-        s0t,
-        pjt,
-        wjt,
-        Zjt,
-        n_draws,
-        seed,
-        *,
-        tol=1e-8,
-        share_tol=1e-10,
-        max_iter=10_000,
-        sigma_max=5.0,
-        fail_penalty=1e12,
-        damping=1.0,
-    ):
-        """Store data, configure inversion controls, and validate inputs.
-
-        Key stored objects:
-          - Observed shares: sjt (inside) and s0t (outside)
-          - Regressors: pjt, wjt, and instruments Zjt
-          - Simulation draws used to integrate the random coefficient on price
-
-        The estimator keeps a warm-start delta from the last successful inversion
-        to speed up repeated objective evaluations during optimization.
+        sjt: np.ndarray,
+        s0t: np.ndarray,
+        pjt: np.ndarray,
+        wjt: np.ndarray,
+        Zjt: np.ndarray,
+        config: dict,
+    ) -> None:
         """
-        self.sjt = np.asarray(sjt, dtype=float)
-        self.s0t = np.asarray(s0t, dtype=float)
-        self.pjt = np.asarray(pjt, dtype=float)
-        self.wjt = np.asarray(wjt, dtype=float)
-        self.Zjt = np.asarray(Zjt, dtype=float)
+        Store data/config and precompute objects reused across sigma evaluations.
 
-        self.n_draws = int(n_draws)
-        self.seed = int(seed)
+        Args:
+            sjt: Inside shares, shape (T, J).
+            s0t: Outside shares, shape (T,).
+            pjt: Prices, shape (T, J).
+            wjt: Observed characteristic, shape (T, J).
+            Zjt: Instruments, shape (T, J, Kz).
+            config: Validated configuration mapping (validated upstream).
+        """
+        # Core data arrays.
+        self.sjt = np.asarray(sjt)
+        self.s0t = np.asarray(s0t)
+        self.pjt = np.asarray(pjt)
+        self.wjt = np.asarray(wjt)
+        self.Zjt = np.asarray(Zjt)
 
-        # Demand regressors: Xjt[t,j,:] = [pjt[t,j], wjt[t,j]]
+        # Validated config mapping (no validation here by design).
+        self.config = config
+
+        # Demand regressors (no constant): X[t, j, :] = [pjt, wjt].
         self.Xjt = np.stack([self.pjt, self.wjt], axis=2)
 
-        # Fixed simulation draws for the RC integration (owned by the estimator).
-        rng = np.random.default_rng(self.seed)
-        self.v_draws = rng.standard_normal(self.n_draws).astype(float)
+        # Fixed simulation draws for integrating the random coefficient on price.
+        rng = np.random.default_rng(self.config["seed"])
+        self.v_draws = rng.standard_normal(self.config["n_draws"])
 
-        # Inversion controls (shared by all objective evaluations).
-        self.tol = float(tol)
-        self.share_tol = float(share_tol)
-        self.max_iter = int(max_iter)
-        self.damping = float(damping)
+        # Deterministic logit starting values for each market: log(sjt) - log(s0t).
+        self._delta_init0 = np.log(self.sjt) - np.log(self.s0t)[:, None]
+        self._delta_warm_start = self._delta_init0
 
-        # A global cap on sigma (separate from per-fit bounds).
-        self.sigma_max = float(sigma_max)
-
-        # Penalty value used when sigma is invalid or inversion fails.
-        self.fail_penalty = float(fail_penalty)
-
-        # Warm-start for inversion once the first successful delta is computed.
-        self._delta_warm_start = None
-
-        # Active sigma bounds (set within fit()).
-        self._sigma_lo = None
-        self._sigma_hi = None
+        # Active sigma bounds used by the safe objective during fit().
+        self._sigma_lo: float | None = None
+        self._sigma_hi: float | None = None
 
         # Outputs populated after fit().
-        self.sigma_hat = None
-        self.beta_hat = None
-        self.beta_p_hat = None
-        self.beta_w_hat = None
-        self.E_hat = None
         self.success = False
+        self.sigma_hat: float | None = None
+        self.beta_hat: np.ndarray | None = None
+        self.beta_p_hat: float | None = None
+        self.beta_w_hat: float | None = None
+        self.E_hat: np.ndarray | None = None
 
-        self._check_inputs()
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
-
-    def _check_inputs(self):
-        """Validate shapes, finiteness, and basic share identities."""
-        if self.sjt.ndim != 2:
-            raise ValueError(f"sjt must be 2D (T,J). Got ndim={self.sjt.ndim}.")
-        if self.pjt.ndim != 2:
-            raise ValueError(f"pjt must be 2D (T,J). Got ndim={self.pjt.ndim}.")
-        if self.wjt.ndim != 2:
-            raise ValueError(f"wjt must be 2D (T,J). Got ndim={self.wjt.ndim}.")
-        if self.s0t.ndim != 1:
-            raise ValueError(f"s0t must be 1D (T,). Got ndim={self.s0t.ndim}.")
-        if self.Xjt.ndim != 3:
-            raise ValueError(f"Xjt must be 3D (T,J,Kx). Got ndim={self.Xjt.ndim}.")
-        if self.Zjt.ndim != 3:
-            raise ValueError(f"Zjt must be 3D (T,J,Kz). Got ndim={self.Zjt.ndim}.")
-        if self.v_draws.ndim != 1:
-            raise ValueError(f"v_draws must be 1D (R,). Got ndim={self.v_draws.ndim}.")
-
-        T, J = self.sjt.shape
-
-        # Shape consistency across observed objects.
-        if self.pjt.shape != (T, J):
-            raise ValueError(f"pjt must have shape {(T, J)}. Got {self.pjt.shape}.")
-        if self.wjt.shape != (T, J):
-            raise ValueError(f"wjt must have shape {(T, J)}. Got {self.wjt.shape}.")
-        if self.s0t.shape != (T,):
-            raise ValueError(f"s0t must have shape {(T,)}. Got {self.s0t.shape}.")
-        if self.Xjt.shape != (T, J, 2):
-            raise ValueError(f"Xjt must have shape (T,J,2). Got {self.Xjt.shape}.")
-        if self.Zjt.shape[0] != T or self.Zjt.shape[1] != J:
-            raise ValueError(
-                f"Zjt must have shape (T,J,Kz) with T={T}, J={J}. Got {self.Zjt.shape}."
-            )
-        if self.v_draws.size < 1:
-            raise ValueError("n_draws must be >= 1 (v_draws non-empty).")
-
-        # All inputs must be finite.
-        for name, arr in [
-            ("sjt", self.sjt),
-            ("s0t", self.s0t),
-            ("pjt", self.pjt),
-            ("wjt", self.wjt),
-            ("Xjt", self.Xjt),
-            ("Zjt", self.Zjt),
-            ("v_draws", self.v_draws),
-        ]:
-            if not np.all(np.isfinite(arr)):
-                raise ValueError(f"{name} contains NaN or inf.")
-
-        # Basic share validity.
-        if np.any(self.sjt <= 0.0):
-            raise ValueError("sjt must be strictly positive.")
-        if np.any(self.s0t <= 0.0):
-            raise ValueError("s0t must be strictly positive.")
-        if np.any(self.sjt >= 1.0):
-            raise ValueError("sjt must be strictly less than 1.")
-        if np.any(self.s0t >= 1.0):
-            raise ValueError("s0t must be strictly less than 1.")
-
-        # Share identity: s0t + sum_j sjt = 1 per market.
-        share_id_tol = 1e-8
-        share_err = np.max(np.abs(self.s0t + self.sjt.sum(axis=1) - 1.0))
-        if not np.isfinite(share_err) or share_err > share_id_tol:
-            raise ValueError(
-                "Share identity violated: "
-                f"max|s0t+sum(sjt)-1|={share_err:.3e} > {share_id_tol:.1e}"
-            )
-
-        # Parameter sanity.
-        if not isinstance(self.n_draws, (int, np.integer)) or int(self.n_draws) < 1:
-            raise ValueError("n_draws must be a positive integer.")
-        if not isinstance(self.seed, (int, np.integer)):
-            raise ValueError("seed must be an integer.")
-        if not np.isfinite(self.sigma_max) or self.sigma_max <= 0.0:
-            raise ValueError("sigma_max must be a finite positive scalar.")
-        if not np.isfinite(self.fail_penalty) or self.fail_penalty <= 0.0:
-            raise ValueError("fail_penalty must be a finite positive scalar.")
-        if not (0.0 < float(self.damping) <= 1.0):
-            raise ValueError("damping must be in (0,1].")
-        if not np.isfinite(self.tol) or self.tol <= 0.0:
-            raise ValueError("tol must be a finite positive scalar.")
-        if not np.isfinite(self.share_tol) or self.share_tol <= 0.0:
-            raise ValueError("share_tol must be a finite positive scalar.")
-        if not isinstance(self.max_iter, (int, np.integer)) or int(self.max_iter) < 1:
-            raise ValueError("max_iter must be a positive integer.")
-
-    # ------------------------------------------------------------------
-    # Core estimation primitives
-    # ------------------------------------------------------------------
-
-    def _invert_demand(self, sigma):
-        """Recover delta for all markets via Berry inversion.
-
-        This wraps `invert_all_markets(...)` and maintains a warm-start delta so
-        repeated objective evaluations are faster and more stable.
-        """
+    def _invert_demand(self, sigma: float) -> np.ndarray:
+        """Invert shares to recover delta for all markets at a given sigma."""
+        # Berry contraction mapping (warm-started from the last successful delta).
         delta = invert_all_markets(
             sjt=self.sjt,
-            s0t=self.s0t,
             pjt=self.pjt,
             sigma=float(sigma),
             v_draws=self.v_draws,
             delta_init=self._delta_warm_start,
-            damping=self.damping,
-            tol=self.tol,
-            share_tol=self.share_tol,
-            max_iter=self.max_iter,
+            damping=self.config["damping"],
+            tol=self.config["tol"],
+            share_tol=self.config["share_tol"],
+            max_iter=self.config["max_iter"],
         )
         self._delta_warm_start = delta
         return delta
 
-    def _estimate_beta(self, delta):
-        """Estimate (beta_p, beta_w) by IV regression given delta.
+    def _estimate_beta(self, delta: np.ndarray) -> np.ndarray:
+        """Compute 2SLS beta for delta = X beta + E using instruments Z."""
+        # Stack markets/products into a single regression.
+        y = delta.reshape(-1, 1)  # (n, 1)
+        X = self.Xjt.reshape(y.shape[0], -1)  # (n, 2)
+        Z = self.Zjt.reshape(y.shape[0], -1)  # (n, Kz)
 
-        This runs the 2SLS estimator:
-          beta_hat = (X' Pz X)^+ (X' Pz delta)
-
-        where:
-          X is stacked [pjt, wjt] across all (t,j),
-          Z is stacked instruments across all (t,j),
-          Pz = Z (Z'Z)^+ Z'.
-
-        Returns:
-            beta_hat: Array of shape (2, 1) with entries [beta_p, beta_w].
-        """
-        delta_vec = delta.reshape(-1, 1)  # (n_obs, 1)
-        X = self.Xjt.reshape(delta_vec.shape[0], -1)  # (n_obs, 2)
-        Z = self.Zjt.reshape(delta_vec.shape[0], -1)  # (n_obs, Kz)
-
+        # Closed-form 2SLS: beta = (X' Pz X)^-1 X' Pz y, with Pz = Z(Z'Z)^-1 Z'.
         ZTZ_inv = np.linalg.pinv(Z.T @ Z)
-        Pz = Z @ ZTZ_inv @ Z.T
+        XTZ = X.T @ Z
 
-        XPZX = X.T @ Pz @ X
-        XPZy = X.T @ Pz @ delta_vec
+        A = XTZ @ ZTZ_inv @ XTZ.T
+        B = XTZ @ ZTZ_inv @ (Z.T @ y)
+        return np.linalg.pinv(A) @ B  # (2, 1)
 
-        beta_hat = np.linalg.pinv(XPZX) @ XPZy
-        return beta_hat
+    def _compute_E_hat(self, delta: np.ndarray, beta_hat: np.ndarray) -> np.ndarray:
+        """Compute E_hat = delta - X beta_hat with shape (T, J)."""
+        y = delta.reshape(-1, 1)
+        X = self.Xjt.reshape(y.shape[0], -1)
+        E = y - X @ beta_hat
+        return E.reshape(self.sjt.shape)
 
-    def _compute_E_hat(self, delta, beta_hat):
-        """Compute recovered demand shocks E_hat = delta - X beta_hat."""
-        delta_vec = delta.reshape(-1, 1)
-        X = self.Xjt.reshape(delta_vec.shape[0], -1)
+    def _moments_and_omega(self, E_hat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return g_bar = mean(z * E) and Omega_hat = cov(z * E)."""
+        E = E_hat.reshape(-1, 1)  # (n, 1)
+        Z = self.Zjt.reshape(E.shape[0], -1)  # (n, Kz)
 
-        E_vec = delta_vec - X @ beta_hat
-        return E_vec.reshape(self.sjt.shape)
+        # Moment per observation: m_i = z_i * E_i.
+        m = Z * E
+        g_bar = m.mean(axis=0)
 
-    def _moments_and_omega(self, E_hat):
-        """Compute mean moments and the moment covariance estimate.
-
-        Moments are formed per observation i=(t,j):
-          m_i = z_i * E_i
-
-        Returned objects:
-          - g_bar: sample mean of m_i across i
-          - Omega_hat: sample covariance of m_i across i
-
-        Returns:
-            g_bar: Array of shape (Kz,).
-            Omega_hat: Array of shape (Kz, Kz).
-        """
-        E_vec = E_hat.reshape(-1, 1)  # (n, 1)
-        Z = self.Zjt.reshape(E_vec.shape[0], -1)  # (n, Kz)
-
-        m = Z * E_vec  # (n, Kz)
-        g_bar = m.mean(axis=0)  # (Kz,)
-
+        # Sample covariance of the moment vector.
         m_centered = m - g_bar
-        Omega_hat = (m_centered.T @ m_centered) / float(m.shape[0])  # (Kz, Kz)
+        Omega_hat = (m_centered.T @ m_centered) / float(m.shape[0])
         return g_bar, Omega_hat
 
-    def _gmm_objective(self, sigma, W):
-        """Compute Q(sigma) = g_bar(sigma)' W g_bar(sigma).
-
-        This method also updates cached scalars beta_p_hat and beta_w_hat as a
-        convenience for inspection during optimization.
-        """
-        delta = self._invert_demand(sigma)
+    def _gmm_objective(self, sigma: float, W: np.ndarray) -> float:
+        """Return Q(sigma) = g_bar(sigma)' W g_bar(sigma)."""
+        delta = self._invert_demand(float(sigma))
         beta_hat = self._estimate_beta(delta)
-
-        # Store split coefficients: X = [p, w].
-        self.beta_p_hat = float(beta_hat[0, 0])
-        self.beta_w_hat = float(beta_hat[1, 0])
-
         E_hat = self._compute_E_hat(delta, beta_hat)
         g_bar, _ = self._moments_and_omega(E_hat)
         return float(g_bar @ W @ g_bar)
 
-    def _safe_gmm_objective(self, sigma, W):
-        """Evaluate the GMM objective with hard penalties on failure.
+    def _safe_gmm_objective(self, sigma: float, W: np.ndarray) -> float:
+        """Return the objective, or fail_penalty on any numerical failure."""
+        fail = self.config["fail_penalty"]
 
-        This is used inside the optimizer. Any invalid sigma, out-of-bounds sigma,
-        inversion failure, or linear algebra error returns `fail_penalty`.
-        """
-        sigma = float(sigma)
-        if not np.isfinite(sigma) or sigma <= 0.0:
-            return self.fail_penalty
+        s = float(sigma)
+        if (not np.isfinite(s)) or (s <= 0.0):
+            return float(fail)
 
-        # Active bounds are set by fit().
-        sigma_lo = self._sigma_lo
-        sigma_hi = self._sigma_hi
-        if sigma_lo is not None and sigma < float(sigma_lo):
-            return self.fail_penalty
-        if sigma_hi is not None and sigma > float(sigma_hi):
-            return self.fail_penalty
+        # Enforce the sigma bounds during search (set by fit()).
+        if (self._sigma_lo is not None) and (s < self._sigma_lo):
+            return float(fail)
+        if (self._sigma_hi is not None) and (s > self._sigma_hi):
+            return float(fail)
 
         try:
-            q = self._gmm_objective(sigma, W)
+            q = self._gmm_objective(s, W)
         except (RuntimeError, ValueError, FloatingPointError, np.linalg.LinAlgError):
-            return self.fail_penalty
+            return float(fail)
 
-        if (q is None) or (not np.isfinite(q)):
-            return self.fail_penalty
-
+        if (not np.isfinite(q)) or (q >= fail):
+            return float(fail)
         return float(q)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def fit(self, sigma_init, sigma_min=1e-3, sigma_max=1.0, grid_step=25):
-        """Fit sigma via two-step GMM and compute final beta and E_hat.
-
-        Step 1:
-          - Use W1 = (Z'Z)^+.
-          - Choose a starting value by log-spaced grid search over [sigma_min, sigma_max].
-          - Refine with Nelder–Mead over log(sigma).
-
-        Step 2:
-          - Recompute E_hat at sigma_hat_1.
-          - Estimate Omega_hat from m_i = z_i * E_i and set W2 = Omega_hat^+.
-          - Re-optimize sigma with Nelder–Mead over log(sigma).
-
-        Results stored on the instance:
-          - sigma_hat: final sigma estimate (step 2)
-          - beta_hat: (2,1) estimate for [beta_p, beta_w]
-          - E_hat: (T,J) recovered demand shocks
+    def fit(self) -> None:
         """
-        sigma_init = float(sigma_init)
-        sigma_min = float(sigma_min)
-        sigma_max = float(sigma_max)
-        grid_step = int(grid_step)
+        Run two-step GMM for sigma and store final beta and E_hat.
 
-        # Apply a hard cap (self.sigma_max) to avoid exploring unstable regions.
-        sigma_lo = sigma_min
-        sigma_hi = min(sigma_max, self.sigma_max)
-
-        if not np.isfinite(sigma_lo) or sigma_lo <= 0.0:
-            raise ValueError("sigma_min must be a finite positive scalar.")
-        if not np.isfinite(sigma_hi) or sigma_hi <= 0.0:
-            raise ValueError("sigma_max must be a finite positive scalar.")
-        if sigma_hi < sigma_lo:
-            raise ValueError("sigma_max must be >= sigma_min after applying caps.")
-
+        Uses:
+          - W1 = (Z'Z)^-1 for step 1.
+          - W2 = Omega_hat(sigma_hat_1)^-1 for step 2.
+        """
+        sigma_lo = self.config["sigma_lower"]
+        sigma_hi = self.config["sigma_upper"]
         self._sigma_lo = float(sigma_lo)
         self._sigma_hi = float(sigma_hi)
 
-        # Step-1 weighting matrix W1 = (Z'Z)^+ using stacked instruments.
+        # Step-1 weighting matrix: W1 = (Z'Z)^-1 using stacked instruments.
         Z = self.Zjt.reshape(-1, self.Zjt.shape[2])
         W1 = np.linalg.pinv(Z.T @ Z)
 
-        # -------------------------
-        # Step 1: grid search
-        # -------------------------
+        # Step 1a: log-spaced grid search for a feasible starting point.
         sigmas = np.logspace(
-            np.log10(self._sigma_lo), np.log10(self._sigma_hi), grid_step
+            np.log10(self._sigma_lo),
+            np.log10(self._sigma_hi),
+            self.config["sigma_grid_points"],
         )
-        best = {"Q": np.inf, "sigma": None}
+        best_sigma: float | None = None
+        best_q = np.inf
         for s in sigmas:
             q = self._safe_gmm_objective(float(s), W1)
-            if np.isfinite(q) and (q < best["Q"]) and (q < self.fail_penalty):
-                best["Q"] = float(q)
-                best["sigma"] = float(s)
+            if q < best_q:
+                best_q = float(q)
+                best_sigma = float(s)
 
-        sigma_start = best["sigma"]
-        if sigma_start is None:
-            sigma_start = min(max(sigma_init, self._sigma_lo), self._sigma_hi)
+        if (
+            (best_sigma is None)
+            or (not np.isfinite(best_q))
+            or (best_q >= self.config["fail_penalty"])
+        ):
+            raise RuntimeError(
+                "No feasible sigma found in the configured grid search bounds."
+            )
 
-        # -------------------------
-        # Step 1: Nelder–Mead on log(sigma)
-        # -------------------------
-        best1 = {"Q": np.inf, "sigma": None}
-
-        def obj1(theta_vec):
-            sigma = float(np.exp(theta_vec[0]))
-            q = self._safe_gmm_objective(sigma, W1)
-            if np.isfinite(q) and (q < best1["Q"]) and (q < self.fail_penalty):
-                best1["Q"] = float(q)
-                best1["sigma"] = float(sigma)
-            return float(q)
+        # Step 1b: Nelder–Mead on theta = log(sigma) to enforce positivity.
+        def obj1(theta_vec: np.ndarray) -> float:
+            return self._safe_gmm_objective(float(np.exp(theta_vec[0])), W1)
 
         res1 = minimize(
-            fun=obj1, x0=np.array([np.log(sigma_start)]), method="Nelder-Mead"
+            fun=obj1,
+            x0=np.array([np.log(best_sigma)]),
+            method="Nelder-Mead",
+            options={
+                "maxiter": self.config["nelder_mead_maxiter"],
+                "xatol": self.config["nelder_mead_xatol"],
+                "fatol": self.config["nelder_mead_fatol"],
+            },
         )
+        sigma_hat_1 = float(np.exp(res1.x[0]))
+        if (sigma_hat_1 < self._sigma_lo) or (sigma_hat_1 > self._sigma_hi):
+            raise RuntimeError(
+                "Step-1 optimization ended outside the configured sigma bounds."
+            )
 
-        sigma_hat_1 = best1["sigma"]
-        if sigma_hat_1 is None:
-            sigma_hat_1 = float(np.exp(res1.x[0]))
-        sigma_hat_1 = float(min(max(sigma_hat_1, self._sigma_lo), self._sigma_hi))
-
-        # Build W2 at sigma_hat_1.
+        # Build W2 at sigma_hat_1 (Omega_hat^-1).
         delta_1 = self._invert_demand(sigma_hat_1)
         beta_1 = self._estimate_beta(delta_1)
         E_1 = self._compute_E_hat(delta_1, beta_1)
-
         _, Omega_hat = self._moments_and_omega(E_1)
         W2 = np.linalg.pinv(Omega_hat)
 
-        # -------------------------
-        # Step 2: Nelder–Mead on log(sigma)
-        # -------------------------
-        best2 = {"Q": np.inf, "sigma": None}
-
-        def obj2(theta_vec):
-            sigma = float(np.exp(theta_vec[0]))
-            q = self._safe_gmm_objective(sigma, W2)
-            if np.isfinite(q) and (q < best2["Q"]) and (q < self.fail_penalty):
-                best2["Q"] = float(q)
-                best2["sigma"] = float(sigma)
-            return float(q)
+        # Step 2: Nelder–Mead on theta = log(sigma).
+        def obj2(theta_vec: np.ndarray) -> float:
+            return self._safe_gmm_objective(float(np.exp(theta_vec[0])), W2)
 
         res2 = minimize(
-            fun=obj2, x0=np.array([np.log(sigma_hat_1)]), method="Nelder-Mead"
+            fun=obj2,
+            x0=np.array([np.log(sigma_hat_1)]),
+            method="Nelder-Mead",
+            options={
+                "maxiter": self.config["nelder_mead_maxiter"],
+                "xatol": self.config["nelder_mead_xatol"],
+                "fatol": self.config["nelder_mead_fatol"],
+            },
         )
+        sigma_hat_2 = float(np.exp(res2.x[0]))
+        if (sigma_hat_2 < self._sigma_lo) or (sigma_hat_2 > self._sigma_hi):
+            raise RuntimeError(
+                "Step-2 optimization ended outside the configured sigma bounds."
+            )
 
-        sigma_hat_2 = best2["sigma"]
-        if sigma_hat_2 is None:
-            sigma_hat_2 = float(np.exp(res2.x[0]))
-        sigma_hat_2 = float(min(max(sigma_hat_2, self._sigma_lo), self._sigma_hi))
-
-        # -------------------------
-        # Final recomputation at sigma_hat_2
-        # -------------------------
+        # Final recomputation at sigma_hat_2 to store outputs used downstream.
         self.sigma_hat = sigma_hat_2
 
         delta_hat = self._invert_demand(self.sigma_hat)
         self.beta_hat = self._estimate_beta(delta_hat)
+        self.beta_p_hat = float(self.beta_hat[0, 0])
+        self.beta_w_hat = float(self.beta_hat[1, 0])
         self.E_hat = self._compute_E_hat(delta_hat, self.beta_hat)
 
-        print("[BLP] Fit complete")
         self.success = True
 
-    def get_results(self):
-        """Return the minimal result dictionary used by downstream code."""
+    def get_results(self) -> dict:
+        """Return a minimal result dictionary for downstream simulation code."""
         return {
             "success": self.success,
             "sigma_hat": self.sigma_hat,

@@ -1,29 +1,15 @@
 """
 ching/stockpiling_input_validation.py
 
-Single validation + normalization module for Phase-3 stockpiling (DGP + estimator).
+Validation + normalization module for Phase-3 stockpiling (DGP + estimator).
 
-Design goals:
-  - All "expected vs got" input validation lives here.
+Principles:
+  - All external inputs are validated here (configs and boundary inputs to DGP/estimator).
   - Other modules call a single normalize_* function at their boundaries and then compute.
-  - Dict-like inputs (sigmas, k, init_theta) are validated with strict schemas (missing + extra keys).
-
-Public API:
-  DGP:
-    - validate_stockpiling_dgp_inputs(...)
-    - normalize_stockpiling_dgp_inputs(...)
-
-  Estimator init (__init__):
-    - validate_stockpiling_estimator_init_inputs(...)
-    - normalize_stockpiling_estimator_init_inputs(...)
-
-  Estimator fit:
-    - validate_stockpiling_estimator_fit_inputs(n_iter, k)
-    - normalize_stockpiling_estimator_fit_inputs(n_iter, k)
-
-  Fit-time initial state:
-    - validate_stockpiling_estimator_init_theta_inputs(init_theta, M, J)
-    - normalize_stockpiling_estimator_init_theta(init_theta, M, J)
+  - Dict-like inputs (sigmas, k, init_theta, cfg) are validated with strict schemas:
+      * required keys must be present
+      * extra keys are rejected
+  - No fallbacks: missing or invalid inputs raise immediately.
 """
 
 from __future__ import annotations
@@ -31,6 +17,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+
+# Numeric tolerances used for probability and transition-matrix checks.
+ATOL_PROB = 1e-6
 
 
 # =============================================================================
@@ -138,24 +127,24 @@ def _require_in_int_range(a: np.ndarray, name: str, lo: int, hi_exclusive: int) 
         )
 
 
-def _validate_probability_vector(pi: np.ndarray, name: str, atol: float) -> None:
+def _validate_probability_vector(pi: np.ndarray, name: str) -> None:
     _require_finite(pi, name)
     if pi.size:
         if (pi < 0.0).any():
             mn = float(pi.min())
             raise ValueError(f"{name}: expected nonnegative entries, got min={mn}")
         s = float(pi.sum())
-        if not np.isfinite(s) or abs(s - 1.0) > atol:
+        if not np.isfinite(s) or abs(s - 1.0) > ATOL_PROB:
             raise ValueError(f"{name}: expected to sum to 1, got sum={s}")
 
 
-def _validate_transition_matrix(P: np.ndarray, name: str, atol: float) -> None:
+def _validate_transition_matrix(P: np.ndarray, name: str) -> None:
     _require_finite(P, name)
     if (P < 0.0).any():
         mn = float(P.min())
         raise ValueError(f"{name}: expected nonnegative entries, got min={mn}")
     row_sums = P.sum(axis=-1)
-    if not np.allclose(row_sums, 1.0, atol=atol, rtol=0.0):
+    if not np.allclose(row_sums, 1.0, atol=ATOL_PROB, rtol=0.0):
         mx_err = float(np.max(np.abs(row_sums - 1.0)))
         raise ValueError(f"{name}: rows must sum to 1; max |sum-1|={mx_err}")
 
@@ -172,7 +161,6 @@ def _validate_price_inputs(
     price_vals_mj: Any,
     M: int,
     J: int,
-    atol: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     P = _as_np(P_price_mj, "P_price_mj", dtype=np.float64)
     _require_ndim(P, 4, "P_price_mj")
@@ -188,7 +176,7 @@ def _validate_price_inputs(
         raise ValueError(
             f"P_price_mj: expected shape (M,J,S,S)=({M},{J},{S},{S}), got {P.shape}"
         )
-    _validate_transition_matrix(P, "P_price_mj", atol=atol)
+    _validate_transition_matrix(P, "P_price_mj")
 
     pv = _as_np(price_vals_mj, "price_vals_mj", dtype=np.float64)
     _require_ndim(pv, 3, "price_vals_mj")
@@ -206,46 +194,25 @@ def _validate_price_inputs(
     return P, pv, S
 
 
-def _coerce_scalar_or_1d(
-    x: Any,
-    name: str,
-    length: int,
-    dtype: Any,
-    require_positive: bool,
-) -> np.ndarray:
+def _require_1d_positive_array(x: Any, name: str, length: int) -> np.ndarray:
     length = _require_int_scalar(length, f"{name} length", min_value=1)
-
-    a = _as_np(x, name, dtype=dtype)
-    if a.ndim == 0:
-        a = np.full((length,), float(a), dtype=dtype)
-    else:
-        _require_ndim(a, 1, name)
-
+    a = _as_np(x, name, dtype=np.float64)
+    _require_ndim(a, 1, name)
     _require_shape(a, (length,), name)
     _require_finite(a, name)
-
-    if require_positive and a.size and (a <= 0.0).any():
+    if a.size and (a <= 0.0).any():
         mn = float(a.min())
         raise ValueError(f"{name}: expected all > 0, got min={mn}")
-
     return a
 
 
+# =============================================================================
+# Config preflight
+# =============================================================================
+
+
 def validate_stockpiling_phase3_config(cfg: Any, M: int, J: int) -> None:
-    """
-    Validate the Phase-3 configuration dict used by run_ching.py before constructing
-    price processes / running the DGP / running MCMC.
-
-    This is a *config preflight* check:
-      - validates cfg schema (missing + extra keys)
-      - validates scalar ranges for DGP/DP/price-process construction/MCMC
-      - validates init_theta/k/sigmas schemas and ranges using existing validators
-
-    Args:
-      cfg: Phase-3 config dict (see CFG_PHASE3 in run_ching.py).
-      M: Number of markets (derived from Phase-2 outputs).
-      J: Number of products (derived from Phase-1 outputs).
-    """
+    """Validate the Phase-3 config dict used to run the stockpiling simulation/estimator."""
     M = _require_int_scalar(M, "M", min_value=1)
     J = _require_int_scalar(J, "J", min_value=1)
 
@@ -258,6 +225,7 @@ def validate_stockpiling_phase3_config(cfg: Any, M: int, J: int) -> None:
         "waste_cost",
         "dp_tol",
         "dp_max_iter",
+        "pi_I0",
         # Price process construction
         "price_seed",
         "p_stay",
@@ -282,13 +250,17 @@ def validate_stockpiling_phase3_config(cfg: Any, M: int, J: int) -> None:
     _require_int_scalar(d["T"], "cfg_phase3['T']", min_value=1)
     I_max = _require_int_scalar(d["I_max"], "cfg_phase3['I_max']", min_value=0)
     S = _require_int_scalar(d["S"], "cfg_phase3['S']", min_value=2)
-    _ = S  # S used later for range checks, but keep validation explicit here
 
     _require_float_scalar(d["waste_cost"], "cfg_phase3['waste_cost']", min_value=0.0)
     _require_float_scalar(d["dp_tol"], "cfg_phase3['dp_tol']", min_value=0.0)
     _require_int_scalar(d["dp_max_iter"], "cfg_phase3['dp_max_iter']", min_value=1)
 
-    # Price process construction (for build_price_processes)
+    pi = _as_np(d["pi_I0"], "cfg_phase3['pi_I0']", dtype=np.float64)
+    _require_ndim(pi, 1, "cfg_phase3['pi_I0']")
+    _require_shape(pi, (I_max + 1,), "cfg_phase3['pi_I0']")
+    _validate_probability_vector(pi, "cfg_phase3['pi_I0']")
+
+    # Price process construction
     _require_int_scalar(d["price_seed"], "cfg_phase3['price_seed']", min_value=0)
 
     p_stay = _require_float_scalar(d["p_stay"], "cfg_phase3['p_stay']")
@@ -339,20 +311,16 @@ def validate_stockpiling_phase3_config(cfg: Any, M: int, J: int) -> None:
         d["mcmc_n_iter"], "cfg_phase3['mcmc_n_iter']", min_value=1
     )
 
-    # init_theta schema/ranges (allows scalar or vector forms per existing validator)
     validate_stockpiling_estimator_init_theta_inputs(
         init_theta=d["init_theta"],
         M=M,
         J=J,
     )
-
-    # k schema/ranges (reuses existing fit validator; also validates n_iter >= 1)
     validate_stockpiling_estimator_fit_inputs(
         n_iter=n_iter,
         k=d["k"],
     )
 
-    # sigmas schema/ranges (same requirements as estimator __init__)
     required_sigma_keys = {"z_beta", "z_alpha", "z_v", "z_fc", "z_u_scale"}
     sig = _require_dict_schema(
         d["sigmas"], "cfg_phase3['sigmas']", required_sigma_keys, allow_extra=False
@@ -364,8 +332,7 @@ def validate_stockpiling_phase3_config(cfg: Any, M: int, J: int) -> None:
         if v <= 0.0:
             raise ValueError(f"cfg_phase3['sigmas']['{key}']: expected > 0, got {v}")
 
-    # Optional: sanity check that I_max is consistent with init inventory distribution usage in run_ching.
-    _ = I_max
+    _ = S  # S validated here; used downstream when constructing price processes.
 
 
 # =============================================================================
@@ -384,17 +351,10 @@ def validate_stockpiling_dgp_inputs(
     I_max: int,
     waste_cost: float,
     seed: int,
-    tol: float | None = None,
-    max_iter: int | None = None,
+    tol: float,
+    max_iter: int,
 ) -> None:
-    """
-    Validate inputs to datasets/ching_dgp.generate_dgp(...) for Phase-3 stockpiling.
-
-    Infers:
-      - M from E_bar_true
-      - J from delta_true
-      - S from P_price_mj / price_vals_mj
-    """
+    """Validate inputs to the Phase-3 stockpiling DGP generator."""
     delta = _as_np(delta_true, "delta_true", dtype=np.float64)
     _require_ndim(delta, 1, "delta_true")
     _require_finite(delta, "delta_true")
@@ -419,13 +379,10 @@ def validate_stockpiling_dgp_inputs(
     _require_int_scalar(I_max, "I_max", min_value=0)
     _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
     _require_int_scalar(seed, "seed", min_value=0)
+    _require_float_scalar(tol, "tol", min_value=0.0)
+    _require_int_scalar(max_iter, "max_iter", min_value=1)
 
     _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
-
-    if tol is not None:
-        _require_float_scalar(tol, "tol", min_value=0.0)
-    if max_iter is not None:
-        _require_int_scalar(max_iter, "max_iter", min_value=1)
 
 
 def normalize_stockpiling_dgp_inputs(
@@ -439,15 +396,10 @@ def normalize_stockpiling_dgp_inputs(
     I_max: int,
     waste_cost: float,
     seed: int,
-    tol: float | None = None,
-    max_iter: int | None = None,
+    tol: float,
+    max_iter: int,
 ) -> dict[str, Any]:
-    """
-    Validate and normalize DGP inputs into canonical numpy dtypes/shapes.
-
-    Returns a dict with arrays converted to float64 and scalars to Python int/float,
-    plus inferred dimensions M,J,S.
-    """
+    """Validate and normalize DGP inputs into canonical numpy dtypes/shapes."""
     validate_stockpiling_dgp_inputs(
         delta_true=delta_true,
         E_bar_true=E_bar_true,
@@ -471,7 +423,7 @@ def normalize_stockpiling_dgp_inputs(
     J = int(delta.shape[0])
     P, pv, S = _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
 
-    out: dict[str, Any] = {
+    return {
         "delta_true": delta,
         "E_bar_true": E_bar,
         "njt_true": njt,
@@ -482,15 +434,12 @@ def normalize_stockpiling_dgp_inputs(
         "I_max": int(I_max),
         "waste_cost": float(waste_cost),
         "seed": int(seed),
+        "tol": float(tol),
+        "max_iter": int(max_iter),
         "M": M,
         "J": J,
         "S": S,
     }
-    if tol is not None:
-        out["tol"] = float(tol)
-    if max_iter is not None:
-        out["max_iter"] = int(max_iter)
-    return out
 
 
 # =============================================================================
@@ -500,7 +449,7 @@ def normalize_stockpiling_dgp_inputs(
 
 def validate_stockpiling_estimator_init_inputs(
     a_mnjt: Any,
-    p_state_mjt: Any,
+    s_mjt: Any,
     u_mj: Any,
     price_vals_mj: Any,
     P_price_mj: Any,
@@ -513,22 +462,7 @@ def validate_stockpiling_estimator_init_inputs(
     sigmas: dict[str, Any],
     rng_seed: int,
 ) -> None:
-    """
-    Validate inputs to StockpilingEstimator.__init__.
-
-    Validates internal consistency of shapes:
-      a_mnjt        (M,N,J,T)    indicator in {0,1}
-      p_state_mjt   (M,J,T)      integer in {0,...,S-1}
-      u_mj          (M,J)        finite float
-      lambda_mn     (M,N)        finite float in (0,1)
-      price_vals_mj (M,J,S)      finite float > 0
-      P_price_mj    (M,J,S,S)    finite row-stochastic
-      pi_I0         (I_max+1,)   probability vector
-
-    Also validates:
-      tol >= 0, max_iter >= 1, rng_seed >= 0
-      sigmas schema and strictly positive values
-    """
+    """Validate inputs to StockpilingEstimator.__init__."""
     I_max = _require_int_scalar(I_max, "I_max", min_value=0)
     _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
     _require_float_scalar(tol, "tol", min_value=0.0)
@@ -539,10 +473,10 @@ def validate_stockpiling_estimator_init_inputs(
     _require_integer_valued_array(a, "a_mnjt")
     _require_values_in_set(np.asarray(a, dtype=np.int64), "a_mnjt", {0, 1})
 
-    p_state = _as_np(p_state_mjt, "p_state_mjt")
-    _require_ndim(p_state, 3, "p_state_mjt")
-    _require_shape(p_state, (M, J, T), "p_state_mjt")
-    _require_integer_valued_array(p_state, "p_state_mjt")
+    s = _as_np(s_mjt, "s_mjt")
+    _require_ndim(s, 3, "s_mjt")
+    _require_shape(s, (M, J, T), "s_mjt")
+    _require_integer_valued_array(s, "s_mjt")
 
     u = _as_np(u_mj, "u_mj", dtype=np.float64)
     _require_ndim(u, 2, "u_mj")
@@ -560,16 +494,15 @@ def validate_stockpiling_estimator_init_inputs(
             f"lambda_mn: expected entries in (0,1), got min={mn}, max={mx}"
         )
 
-    P, pv, S = _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
-    _ = (P, pv)
+    _, _, S = _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
 
-    p_state_i64 = np.asarray(p_state, dtype=np.int64)
-    _require_in_int_range(p_state_i64, "p_state_mjt", lo=0, hi_exclusive=S)
+    s_i64 = np.asarray(s, dtype=np.int64)
+    _require_in_int_range(s_i64, "s_mjt", lo=0, hi_exclusive=S)
 
     pi = _as_np(pi_I0, "pi_I0", dtype=np.float64)
     _require_ndim(pi, 1, "pi_I0")
     _require_shape(pi, (I_max + 1,), "pi_I0")
-    _validate_probability_vector(pi, "pi_I0", atol=1e-6)
+    _validate_probability_vector(pi, "pi_I0")
 
     required_sigma_keys = {"z_beta", "z_alpha", "z_v", "z_fc", "z_u_scale"}
     sig = _require_dict_schema(sigmas, "sigmas", required_sigma_keys, allow_extra=False)
@@ -581,7 +514,7 @@ def validate_stockpiling_estimator_init_inputs(
 
 def normalize_stockpiling_estimator_init_inputs(
     a_mnjt: Any,
-    p_state_mjt: Any,
+    s_mjt: Any,
     u_mj: Any,
     price_vals_mj: Any,
     P_price_mj: Any,
@@ -594,14 +527,10 @@ def normalize_stockpiling_estimator_init_inputs(
     sigmas: dict[str, Any],
     rng_seed: int,
 ) -> dict[str, Any]:
-    """
-    Validate and normalize inputs to StockpilingEstimator.__init__.
-
-    Returns canonical numpy arrays and scalars plus inferred dimensions.
-    """
+    """Validate and normalize inputs to StockpilingEstimator.__init__."""
     validate_stockpiling_estimator_init_inputs(
         a_mnjt=a_mnjt,
-        p_state_mjt=p_state_mjt,
+        s_mjt=s_mjt,
         u_mj=u_mj,
         price_vals_mj=price_vals_mj,
         P_price_mj=P_price_mj,
@@ -616,7 +545,7 @@ def normalize_stockpiling_estimator_init_inputs(
     )
 
     a = np.asarray(_as_np(a_mnjt, "a_mnjt"), dtype=np.int32)
-    p_state = np.asarray(_as_np(p_state_mjt, "p_state_mjt"), dtype=np.int32)
+    s = np.asarray(_as_np(s_mjt, "s_mjt"), dtype=np.int32)
     u = _as_np(u_mj, "u_mj", dtype=np.float64)
     lam = _as_np(lambda_mn, "lambda_mn", dtype=np.float64)
 
@@ -630,7 +559,7 @@ def normalize_stockpiling_estimator_init_inputs(
 
     return {
         "a_mnjt": a,
-        "p_state_mjt": p_state,
+        "s_mjt": s,
         "u_mj": u,
         "lambda_mn": lam,
         "P_price_mj": P,
@@ -659,16 +588,8 @@ def validate_stockpiling_estimator_fit_inputs(
     n_iter: int,
     k: dict[str, Any],
 ) -> None:
-    """
-    Validate inputs to StockpilingEstimator.fit(n_iter, k).
-
-    Args:
-      n_iter: positive int
-      k: dict with required keys {"beta","alpha","v","fc","u_scale"}.
-         Step sizes must be finite floats.
-         beta/alpha/v/fc must be > 0; u_scale may be 0 to freeze its update step.
-    """
-    _ = _require_int_scalar(n_iter, "n_iter", min_value=1)
+    """Validate inputs to StockpilingEstimator.fit(n_iter, k)."""
+    _require_int_scalar(n_iter, "n_iter", min_value=1)
 
     required = {"beta", "alpha", "v", "fc", "u_scale"}
     k_dict = _require_dict_schema(k, "k", required, allow_extra=False)
@@ -704,15 +625,14 @@ def validate_stockpiling_estimator_init_theta_inputs(
     M: int,
     J: int,
 ) -> None:
-    """
-    Validate init_theta passed to StockpilingEstimator.fit.
+    """Validate init_theta passed to StockpilingEstimator.fit.
 
     Required keys: {"beta","alpha","v","fc","u_scale"} and no extras.
 
     Shape conventions:
       - beta: scalar in (0,1)
-      - alpha, v, fc: scalar or shape (J,)
-      - u_scale: scalar or shape (M,)
+      - alpha, v, fc: shape (J,)
+      - u_scale: shape (M,)
     """
     M = _require_int_scalar(M, "M", min_value=1)
     J = _require_int_scalar(J, "J", min_value=1)
@@ -724,34 +644,10 @@ def validate_stockpiling_estimator_init_theta_inputs(
     if beta <= 0.0 or beta >= 1.0:
         raise ValueError(f"init_theta['beta']: expected in (0,1), got {beta}")
 
-    _coerce_scalar_or_1d(
-        d["alpha"],
-        "init_theta['alpha']",
-        length=J,
-        dtype=np.float64,
-        require_positive=True,
-    )
-    _coerce_scalar_or_1d(
-        d["v"],
-        "init_theta['v']",
-        length=J,
-        dtype=np.float64,
-        require_positive=True,
-    )
-    _coerce_scalar_or_1d(
-        d["fc"],
-        "init_theta['fc']",
-        length=J,
-        dtype=np.float64,
-        require_positive=True,
-    )
-    _coerce_scalar_or_1d(
-        d["u_scale"],
-        "init_theta['u_scale']",
-        length=M,
-        dtype=np.float64,
-        require_positive=True,
-    )
+    _require_1d_positive_array(d["alpha"], "init_theta['alpha']", length=J)
+    _require_1d_positive_array(d["v"], "init_theta['v']", length=J)
+    _require_1d_positive_array(d["fc"], "init_theta['fc']", length=J)
+    _require_1d_positive_array(d["u_scale"], "init_theta['u_scale']", length=M)
 
 
 def normalize_stockpiling_estimator_init_theta(
@@ -759,44 +655,18 @@ def normalize_stockpiling_estimator_init_theta(
     M: int,
     J: int,
 ) -> dict[str, Any]:
-    """
-    Validate and normalize init_theta into canonical shapes/dtypes.
-
-    Returns:
-      - beta: float
-      - alpha, v, fc: np.ndarray float64 shape (J,)
-      - u_scale: np.ndarray float64 shape (M,)
-    """
+    """Validate and normalize init_theta into canonical shapes/dtypes."""
     validate_stockpiling_estimator_init_theta_inputs(init_theta=init_theta, M=M, J=J)
 
     beta = float(init_theta["beta"])
-    alpha = _coerce_scalar_or_1d(
-        init_theta["alpha"],
-        "init_theta['alpha']",
-        length=int(J),
-        dtype=np.float64,
-        require_positive=True,
-    )
-    v = _coerce_scalar_or_1d(
-        init_theta["v"],
-        "init_theta['v']",
-        length=int(J),
-        dtype=np.float64,
-        require_positive=True,
-    )
-    fc = _coerce_scalar_or_1d(
-        init_theta["fc"],
-        "init_theta['fc']",
-        length=int(J),
-        dtype=np.float64,
-        require_positive=True,
-    )
-    u_scale = _coerce_scalar_or_1d(
-        init_theta["u_scale"],
-        "init_theta['u_scale']",
-        length=int(M),
-        dtype=np.float64,
-        require_positive=True,
-    )
+    alpha = _as_np(init_theta["alpha"], "init_theta['alpha']", dtype=np.float64)
+    v = _as_np(init_theta["v"], "init_theta['v']", dtype=np.float64)
+    fc = _as_np(init_theta["fc"], "init_theta['fc']", dtype=np.float64)
+    u_scale = _as_np(init_theta["u_scale"], "init_theta['u_scale']", dtype=np.float64)
+
+    _require_shape(alpha, (int(J),), "init_theta['alpha']")
+    _require_shape(v, (int(J),), "init_theta['v']")
+    _require_shape(fc, (int(J),), "init_theta['fc']")
+    _require_shape(u_scale, (int(M),), "init_theta['u_scale']")
 
     return {"beta": beta, "alpha": alpha, "v": v, "fc": fc, "u_scale": u_scale}

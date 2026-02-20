@@ -5,11 +5,17 @@ Constraints for this test module
 - No pytest fixture injection: all tests are plain functions with no fixture args.
 - Shared assertion helpers are imported from `lu_conftest` (a normal Python module).
 - Patching uses unittest.mock.patch (not the pytest monkeypatch fixture).
+
+Notes on current implementation
+- tune_k() does not perform argument validation (validation belongs upstream).
+- tune_shrinkage() expects a "tune view" object with specific attributes
+  (constructed in cl_shrinkage.fit via SimpleNamespace).
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -17,7 +23,6 @@ import pytest
 import tensorflow as tf
 
 import lu.choice_learn.cl_tuning as cl_tuning
-from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageEstimator
 from lu_conftest import assert_all_finite_tf
 
 DTYPE = tf.float64
@@ -26,36 +31,80 @@ DTYPE = tf.float64
 # -----------------------------------------------------------------------------
 # Helpers (test-only)
 # -----------------------------------------------------------------------------
-def _tiny_cl_data_np(seed: int = 0) -> dict:
+def _tiny_cl_data(seed: int = 0) -> dict:
     """
     Tiny (T=2, J=3) choice-learn panel for tuning tests.
 
+    Returns tf.float64 tensors (the updated codebase rejects NumPy arrays).
     Keys
-    - delta_cl: (T,J) np.float64
-    - qjt: (T,J) np.float64
-    - q0t: (T,) np.float64
+    - T, J: int
+    - delta_cl: (T,J) tf.float64
+    - qjt: (T,J) tf.float64
+    - q0t: (T,) tf.float64
     """
     rng = np.random.default_rng(seed)
     T, J = 2, 3
 
-    delta_cl = rng.normal(size=(T, J)).astype(np.float64)
-    qjt = rng.integers(low=1, high=15, size=(T, J)).astype(np.float64)
-    q0t = rng.integers(low=5, high=25, size=(T,)).astype(np.float64)
+    delta_cl = tf.constant(rng.normal(size=(T, J)).astype(np.float64), dtype=DTYPE)
+    qjt = tf.constant(
+        rng.integers(low=1, high=15, size=(T, J)).astype(np.float64), dtype=DTYPE
+    )
+    q0t = tf.constant(
+        rng.integers(low=5, high=25, size=(T,)).astype(np.float64), dtype=DTYPE
+    )
 
     return {"T": T, "J": J, "delta_cl": delta_cl, "qjt": qjt, "q0t": q0t}
 
 
-def _build_shrink(tiny_data: dict, seed: int = 123) -> ChoiceLearnShrinkageEstimator:
-    return ChoiceLearnShrinkageEstimator(
-        delta_cl=tiny_data["delta_cl"],
+def _build_tune_view(tiny_data: dict) -> SimpleNamespace:
+    """
+    Build the minimal object required by cl_tuning.tune_shrinkage().
+    Mirrors the SimpleNamespace constructed inside cl_shrinkage.fit().
+    """
+    T = int(tiny_data["T"])
+    J = int(tiny_data["J"])
+
+    # Latent state: must be tf.Variable because tune_shrinkage snapshots .read_value().
+    alpha = tf.Variable(tf.constant(1.0, dtype=DTYPE), trainable=False)
+    E_bar = tf.Variable(tf.zeros([T], dtype=DTYPE), trainable=False)
+    njt = tf.Variable(tf.zeros([T, J], dtype=DTYPE), trainable=False)
+    gamma = tf.Variable(tf.zeros([T, J], dtype=DTYPE), trainable=False)
+    phi = tf.Variable(tf.fill([T], tf.constant(0.5, dtype=DTYPE)), trainable=False)
+
+    view = SimpleNamespace(
+        # Tuning hyperparameters (filled by _set_tuning_params)
+        pilot_length=1,
+        ridge=tf.constant(1e-6, dtype=DTYPE),
+        target_low=0.3,
+        target_high=0.5,
+        max_rounds=1,
+        factor_rw=1.1,
+        factor_tmh=1.5,
+        k_alpha0=tf.constant(0.2, dtype=DTYPE),
+        k_E_bar0=tf.constant(0.2, dtype=DTYPE),
+        k_njt0=tf.constant(0.2, dtype=DTYPE),
+        tune_seed=0,
+        # Required sizes
+        T=T,
+        J=J,
+        # Data
         qjt=tiny_data["qjt"],
         q0t=tiny_data["q0t"],
-        seed=seed,
+        delta_cl=tiny_data["delta_cl"],
+        # State
+        alpha=alpha,
+        E_bar=E_bar,
+        njt=njt,
+        gamma=gamma,
+        phi=phi,
+        # Posterior helper (not used in these tests because we patch update_*)
+        posterior=object(),
     )
+    return view
 
 
 def _set_tuning_params(
-    shrink: ChoiceLearnShrinkageEstimator,
+    view: SimpleNamespace,
     pilot_length: int = 1,
     ridge: float = 1e-6,
     target_low: float = 0.3,
@@ -63,14 +112,23 @@ def _set_tuning_params(
     max_rounds: int = 1,
     factor_rw: float = 1.1,
     factor_tmh: float = 1.5,
+    k_alpha0: float = 0.2,
+    k_E_bar0: float = 0.2,
+    k_njt0: float = 0.2,
+    tune_seed: int = 0,
 ) -> None:
-    shrink.pilot_length = pilot_length
-    shrink.ridge = ridge
-    shrink.target_low = target_low
-    shrink.target_high = target_high
-    shrink.max_rounds = max_rounds
-    shrink.factor_rw = factor_rw
-    shrink.factor_tmh = factor_tmh
+    view.pilot_length = int(pilot_length)
+    view.ridge = tf.constant(float(ridge), dtype=DTYPE)
+    view.target_low = float(target_low)
+    view.target_high = float(target_high)
+    view.max_rounds = int(max_rounds)
+    view.factor_rw = float(factor_rw)
+    view.factor_tmh = float(factor_tmh)
+
+    view.k_alpha0 = tf.constant(float(k_alpha0), dtype=DTYPE)
+    view.k_E_bar0 = tf.constant(float(k_E_bar0), dtype=DTYPE)
+    view.k_njt0 = tf.constant(float(k_njt0), dtype=DTYPE)
+    view.tune_seed = int(tune_seed)
 
 
 def _assert_scalar_positive(x: tf.Tensor) -> None:
@@ -80,13 +138,13 @@ def _assert_scalar_positive(x: tf.Tensor) -> None:
     assert float(x_t.numpy()) > 0.0
 
 
-def _snapshot_state(shrink: ChoiceLearnShrinkageEstimator) -> dict:
+def _snapshot_state(view: SimpleNamespace) -> dict:
     return {
-        "alpha": float(shrink.alpha.read_value().numpy()),
-        "E_bar": shrink.E_bar.read_value().numpy().copy(),
-        "njt": shrink.njt.read_value().numpy().copy(),
-        "gamma": shrink.gamma.read_value().numpy().copy(),
-        "phi": shrink.phi.read_value().numpy().copy(),
+        "alpha": float(view.alpha.read_value().numpy()),
+        "E_bar": view.E_bar.read_value().numpy().copy(),
+        "njt": view.njt.read_value().numpy().copy(),
+        "gamma": view.gamma.read_value().numpy().copy(),
+        "phi": view.phi.read_value().numpy().copy(),
     }
 
 
@@ -101,7 +159,7 @@ def _assert_state_unchanged(before: dict, after: dict) -> None:
 @contextmanager
 def _patched_updates(accept_all: bool):
     """
-    Patch cl_tuning update_* functions so that:
+    Patch cl_tuning.update_* functions so that:
     - proposals do not change the pilot state (identity updates)
     - acceptance is deterministic (all accept or all reject)
     """
@@ -150,8 +208,9 @@ def _patched_updates(accept_all: bool):
         k_njt: tf.Tensor,
         ridge: tf.Tensor,
     ):
+        # tune_shrinkage scales acceptance as acc_sum / T_float, so set acc_sum=T if accepting all.
         if accept_all:
-            acc_sum = tf.cast(tf.shape(njt)[0], tf.float64)
+            acc_sum = tf.cast(tf.shape(njt)[0], tf.float64)  # equals T
         else:
             acc_sum = tf.constant(0.0, tf.float64)
         return njt, acc_sum
@@ -165,54 +224,6 @@ def _patched_updates(accept_all: bool):
 # -----------------------------------------------------------------------------
 # tune_k unit tests
 # -----------------------------------------------------------------------------
-def test_tune_k_validate_input_rejects_invalid_args():
-    theta0 = tf.constant(0.0, tf.float64)
-    k0 = tf.constant(1.0, tf.float64)
-
-    def step_fn(theta, k):
-        return theta, tf.constant(0.0, tf.float64)
-
-    bad_calls = [
-        dict(
-            pilot_length=0,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=0,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.6,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.1,
-            name="x",
-        ),
-        dict(
-            pilot_length=1,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=1,
-            factor=1.0,
-            name="x",
-        ),
-        dict(pilot_length=1, target_low=0.3, target_high=0.5, max_rounds=1, factor=1.1, name=123),  # type: ignore[arg-type]
-    ]
-
-    for kw in bad_calls:
-        with pytest.raises(Exception):
-            cl_tuning.tune_k(theta0=theta0, step_fn=step_fn, k0=k0, **kw)
-
-
 def test_tune_k_shrinks_k_when_acceptance_below_band():
     theta0 = tf.constant(0.0, tf.float64)
     k0 = tf.constant(1.0, tf.float64)
@@ -220,17 +231,18 @@ def test_tune_k_shrinks_k_when_acceptance_below_band():
     def step_fn(theta, k):
         return theta, tf.constant(0.0, tf.float64)  # always reject
 
-    k_out = cl_tuning.tune_k(
-        theta0=theta0,
-        step_fn=step_fn,
-        k0=k0,
-        pilot_length=2,
-        target_low=0.3,
-        target_high=0.5,
-        max_rounds=3,
-        factor=1.1,
-        name="reject",
-    )
+    with patch("builtins.print"):
+        k_out = cl_tuning.tune_k(
+            theta0=theta0,
+            step_fn=step_fn,
+            k0=k0,
+            pilot_length=2,
+            target_low=0.3,
+            target_high=0.5,
+            max_rounds=3,
+            factor=1.1,
+            name="reject",
+        )
 
     _assert_scalar_positive(k_out)
     assert float(k_out.numpy()) < float(k0.numpy())
@@ -243,17 +255,18 @@ def test_tune_k_grows_k_when_acceptance_above_band():
     def step_fn(theta, k):
         return theta, tf.constant(1.0, tf.float64)  # always accept
 
-    k_out = cl_tuning.tune_k(
-        theta0=theta0,
-        step_fn=step_fn,
-        k0=k0,
-        pilot_length=2,
-        target_low=0.3,
-        target_high=0.5,
-        max_rounds=3,
-        factor=1.1,
-        name="accept",
-    )
+    with patch("builtins.print"):
+        k_out = cl_tuning.tune_k(
+            theta0=theta0,
+            step_fn=step_fn,
+            k0=k0,
+            pilot_length=2,
+            target_low=0.3,
+            target_high=0.5,
+            max_rounds=3,
+            factor=1.1,
+            name="accept",
+        )
 
     _assert_scalar_positive(k_out)
     assert float(k_out.numpy()) > float(k0.numpy())
@@ -266,17 +279,18 @@ def test_tune_k_keeps_k_unchanged_when_acceptance_in_band():
     def step_fn(theta, k):
         return theta, tf.constant(0.4, tf.float64)  # in-band
 
-    k_out = cl_tuning.tune_k(
-        theta0=theta0,
-        step_fn=step_fn,
-        k0=k0,
-        pilot_length=5,
-        target_low=0.3,
-        target_high=0.5,
-        max_rounds=10,
-        factor=1.1,
-        name="inband",
-    )
+    with patch("builtins.print"):
+        k_out = cl_tuning.tune_k(
+            theta0=theta0,
+            step_fn=step_fn,
+            k0=k0,
+            pilot_length=5,
+            target_low=0.3,
+            target_high=0.5,
+            max_rounds=10,
+            factor=1.1,
+            name="inband",
+        )
 
     assert float(k_out.numpy()) == float(k0.numpy())
 
@@ -294,17 +308,19 @@ def test_tune_k_preserves_theta_shape_scalar_and_vector():
         def step_fn(theta, k):
             return theta, tf.constant(0.4, tf.float64)  # in-band
 
-        k_out = cl_tuning.tune_k(
-            theta0=theta0,
-            step_fn=step_fn,
-            k0=k0,
-            pilot_length=3,
-            target_low=0.3,
-            target_high=0.5,
-            max_rounds=5,
-            factor=1.1,
-            name=f"shape_{shape_case}",
-        )
+        with patch("builtins.print"):
+            k_out = cl_tuning.tune_k(
+                theta0=theta0,
+                step_fn=step_fn,
+                k0=k0,
+                pilot_length=3,
+                target_low=0.3,
+                target_high=0.5,
+                max_rounds=5,
+                factor=1.1,
+                name=f"shape_{shape_case}",
+            )
+
         _assert_scalar_positive(k_out)
 
 
@@ -312,63 +328,68 @@ def test_tune_k_preserves_theta_shape_scalar_and_vector():
 # tune_shrinkage wiring tests
 # -----------------------------------------------------------------------------
 def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types():
-    data = _tiny_cl_data_np()
-    shrink = _build_shrink(data)
-    _set_tuning_params(shrink)
+    data = _tiny_cl_data()
+    view = _build_tune_view(data)
+    _set_tuning_params(view)
 
     # Missing attribute
-    delattr(shrink, "qjt")
+    delattr(view, "qjt")
     with pytest.raises(Exception):
-        cl_tuning.tune_shrinkage(shrink)
+        with patch("builtins.print"):
+            cl_tuning.tune_shrinkage(view)
 
-    # Wrong type for state variable (must be tf.Variable)
-    shrink = _build_shrink(data)
-    _set_tuning_params(shrink)
-    shrink.alpha = shrink.alpha.read_value()  # type: ignore[assignment]
+    # Wrong type for state variable (must be tf.Variable so .read_value exists)
+    view = _build_tune_view(data)
+    _set_tuning_params(view)
+    view.alpha = view.alpha.read_value()  # type: ignore[assignment]
     with pytest.raises(Exception):
-        cl_tuning.tune_shrinkage(shrink)
-
-    # Invalid factor_rw
-    shrink = _build_shrink(data)
-    _set_tuning_params(shrink, factor_rw=1.0)
-    with pytest.raises(Exception):
-        cl_tuning.tune_shrinkage(shrink)
+        with patch("builtins.print"):
+            cl_tuning.tune_shrinkage(view)
 
 
 def test_tune_shrinkage_returns_three_positive_finite_scalars():
-    data = _tiny_cl_data_np()
-    shrink = _build_shrink(data)
+    data = _tiny_cl_data()
+    view = _build_tune_view(data)
     _set_tuning_params(
-        shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
+        view,
+        target_low=0.0,
+        target_high=1.0,
+        max_rounds=1,
+        pilot_length=1,
+        k_alpha0=0.2,
+        k_E_bar0=0.2,
+        k_njt0=0.2,
     )
 
     with _patched_updates(accept_all=True):
-        k_alpha, k_E_bar, k_njt = cl_tuning.tune_shrinkage(shrink)
+        with patch("builtins.print"):
+            k_alpha, k_E_bar, k_njt = cl_tuning.tune_shrinkage(view)
 
     for k in [k_alpha, k_E_bar, k_njt]:
         _assert_scalar_positive(k)
 
 
 def test_tune_shrinkage_does_not_mutate_sampler_state():
-    data = _tiny_cl_data_np()
-    shrink = _build_shrink(data)
+    data = _tiny_cl_data()
+    view = _build_tune_view(data)
     _set_tuning_params(
-        shrink, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
+        view, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
     )
 
     with _patched_updates(accept_all=False):
-        before = _snapshot_state(shrink)
-        _ = cl_tuning.tune_shrinkage(shrink)
-        after = _snapshot_state(shrink)
+        before = _snapshot_state(view)
+        with patch("builtins.print"):
+            _ = cl_tuning.tune_shrinkage(view)
+        after = _snapshot_state(view)
 
     _assert_state_unchanged(before, after)
 
 
 def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
-    data = _tiny_cl_data_np()
-    shrink = _build_shrink(data)
+    data = _tiny_cl_data()
+    view = _build_tune_view(data)
     _set_tuning_params(
-        shrink,
+        view,
         pilot_length=1,
         max_rounds=1,
         target_low=0.3,
@@ -394,25 +415,25 @@ def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
         return tf.convert_to_tensor(k0, dtype=tf.float64)
 
     with patch.object(cl_tuning, "tune_k", stub_tune_k):
-        _ = cl_tuning.tune_shrinkage(shrink)
+        with patch("builtins.print"):
+            _ = cl_tuning.tune_shrinkage(view)
 
     names = [n for (n, _) in calls]
     assert (
         len(calls) >= 3
-    ), f"Expected at least 3 tune_k calls, got {len(calls)} with names={names}"
+    ), f"Expected at least 3 tune_k calls, got {len(calls)} names={names}"
 
     atol = 1e-6
     for name, factor in calls:
         if name in ["alpha", "E_bar"]:
-            exp = float(shrink.factor_rw)
+            exp = float(view.factor_rw)
             assert abs(factor - exp) <= atol, (
-                f"{name} used factor={factor}, expected factor_rw={shrink.factor_rw} "
+                f"{name} used factor={factor}, expected factor_rw={view.factor_rw} "
                 f"(abs diff={abs(factor - exp):.3e}, atol={atol:.3e})"
             )
-
         if name in ["njt"]:
-            exp = float(shrink.factor_tmh)
+            exp = float(view.factor_tmh)
             assert abs(factor - exp) <= atol, (
-                f"{name} used factor={factor}, expected factor_tmh={shrink.factor_tmh} "
+                f"{name} used factor={factor}, expected factor_tmh={view.factor_tmh} "
                 f"(abs diff={abs(factor - exp):.3e}, atol={atol:.3e})"
             )
