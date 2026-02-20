@@ -1,3 +1,4 @@
+# tests/ching/test_ching_dgp.py
 from __future__ import annotations
 
 import numpy as np
@@ -14,12 +15,19 @@ def test_sample_theta_true_shapes_ranges_and_types() -> None:
 
     assert set(theta.keys()) == {"beta", "alpha", "v", "fc", "lambda"}
 
-    # Market-product blocks
-    for k in ["beta", "alpha", "v", "fc"]:
-        v = theta[k]
-        assert v.shape == (M, J)
-        assert v.dtype == np.float64
-        assert np.isfinite(v).all()
+    # Global beta (0-d ndarray)
+    beta = theta["beta"]
+    assert isinstance(beta, np.ndarray)
+    assert beta.shape == ()
+    assert beta.dtype == np.float64
+    assert np.isfinite(beta)
+
+    # Per-product blocks
+    for k in ["alpha", "v", "fc"]:
+        arr = theta[k]
+        assert arr.shape == (J,)
+        assert arr.dtype == np.float64
+        assert np.isfinite(arr).all()
 
     # Market-consumer block
     lam = theta["lambda"]
@@ -28,8 +36,8 @@ def test_sample_theta_true_shapes_ranges_and_types() -> None:
     assert np.isfinite(lam).all()
 
     # Constraints
-    assert np.all((theta["beta"] > 0.0) & (theta["beta"] < 1.0))
-    assert np.all((theta["lambda"] > 0.0) & (theta["lambda"] < 1.0))
+    assert (float(beta) > 0.0) and (float(beta) < 1.0)
+    assert np.all((lam > 0.0) & (lam < 1.0))
     assert np.all(theta["alpha"] > 0.0)
     assert np.all(theta["v"] > 0.0)
     assert np.all(theta["fc"] > 0.0)
@@ -115,10 +123,10 @@ def test_solve_ccp_buy_shape_range_and_absorbing_price_monotonicity() -> None:
     # With beta=0, CCP reduces to static logit in (u1-u0), so cheaper state must imply >= buy prob.
     u_eff = 1.0
     beta = 0.0
-    alpha = 1.0
-    v = 2.0
-    fc = 0.1
-    lambda_ = 0.3
+    alpha_j = 1.0
+    v_j = 2.0
+    fc_j = 0.1
+    lambda_n = 0.3
     I_max = 2
     price_vals = np.asarray([1.0, 0.8], dtype=np.float64)  # state 1 cheaper
     P_absorb = np.eye(2, dtype=np.float64)
@@ -127,10 +135,10 @@ def test_solve_ccp_buy_shape_range_and_absorbing_price_monotonicity() -> None:
     ccp = dgp.solve_ccp_buy(
         u_eff=u_eff,
         beta=beta,
-        alpha=alpha,
-        v=v,
-        fc=fc,
-        lambda_=lambda_,
+        alpha_j=alpha_j,
+        v_j=v_j,
+        fc_j=fc_j,
+        lambda_n=lambda_n,
         I_max=I_max,
         P_price=P_absorb,
         price_vals=price_vals,
@@ -214,11 +222,18 @@ def test_generate_dgp_shapes_types_and_internal_consistency() -> None:
     assert np.isfinite(u_mj_true).all()
 
     assert set(theta_true.keys()) == {"beta", "alpha", "v", "fc", "lambda"}
-    for k in ["beta", "alpha", "v", "fc"]:
-        v = theta_true[k]
-        assert v.shape == (M, J)
-        assert v.dtype == np.float64
-        assert np.isfinite(v).all()
+
+    beta = theta_true["beta"]
+    assert isinstance(beta, np.ndarray)
+    assert beta.shape == ()
+    assert beta.dtype == np.float64
+    assert np.isfinite(beta)
+
+    for k in ["alpha", "v", "fc"]:
+        arr = theta_true[k]
+        assert arr.shape == (J,)
+        assert arr.dtype == np.float64
+        assert np.isfinite(arr).all()
 
     lam = theta_true["lambda"]
     assert lam.shape == (M, N)

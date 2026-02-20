@@ -96,15 +96,6 @@ CFG_PHASE1: dict[str, Any] = {
     "eval_against_empirical": True,
 }
 
-# NOTE: This must match lu/choice_learn/cl_validate_input.py exactly:
-#   init_state.alpha : ()      float64 tf.Tensor
-#   init_state.E_bar : (T,)    float64 tf.Tensor
-#   init_state.njt   : (T,J)   float64 tf.Tensor
-#   init_state.gamma : (T,J)   float64 tf.Tensor, binary {0,1}
-#   init_state.phi   : (T,)    float64 tf.Tensor, in (0,1)
-# and fit_config requires keys:
-#   n_iter, pilot_length, ridge, target_low, target_high, max_rounds,
-#   factor_rw, factor_tmh, k_alpha0, k_E_bar0, k_njt0, tune_seed
 CFG_PHASE2: dict[str, Any] = {
     "init_config": {
         "seed": 0,
@@ -191,8 +182,6 @@ CFG_PHASE3: dict[str, Any] = {
 }
 
 EVAL_EPS = 1e-12
-MCMC_PRINT_EVERY = 25
-
 
 # =============================================================================
 # Price process helpers
@@ -542,7 +531,6 @@ def run_phase3_estimation(
         n_iter=int(cfg["mcmc_n_iter"]),
         k=dict(cfg["k"]),
         init_theta=dict(cfg["init_theta"]),
-        print_every=int(MCMC_PRINT_EVERY),
     )
 
     return {
@@ -716,6 +704,11 @@ def main() -> None:
         discount_high=float(CFG_PHASE3["discount_high"]),
         price_noise_sd=float(CFG_PHASE3["price_noise_sd"]),
     )
+
+    print("")
+    print("============================================================")
+    print("PHASE 3: Ching - Stockpiling")
+    print("============================================================")
 
     panel = run_phase3_dgp(
         CFG_PHASE3,

@@ -51,6 +51,21 @@ def test_compute_delta_true_reduces_to_quadratic_when_g_true_zero() -> None:
     np.testing.assert_allclose(delta, expected, rtol=0.0, atol=1e-12)
 
 
+def test_compute_delta_true_uses_first_feature_column_when_xj_2d() -> None:
+    x_scalar = np.asarray([-2.0, -1.0, 0.0, 0.5, 2.0], dtype=np.float64)
+    xj_2d = np.stack([x_scalar, 999.0 * np.ones_like(x_scalar)], axis=1)  # (J,2)
+
+    a_true = 0.4
+    b_true = -0.2
+    g_true = np.asarray([0.0, 1.5, -0.3, 0.7, 2.0], dtype=np.float64)
+
+    delta_1d = dgp.compute_delta_true(x_scalar, a_true, b_true, g_true)
+    delta_2d = dgp.compute_delta_true(xj_2d, a_true, b_true, g_true)
+
+    assert delta_2d.shape == x_scalar.shape
+    np.testing.assert_allclose(delta_2d, delta_1d, rtol=0.0, atol=1e-12)
+
+
 def test_compute_njt_true_matches_group_effect_indexing() -> None:
     # J=4 products, G=2 groups
     group_id = np.asarray([0, 0, 1, 1], dtype=np.int64)
@@ -147,6 +162,7 @@ def test_generate_choice_learn_market_shocks_dgp_keys_shapes_and_sums() -> None:
         num_groups=2,
         N_base=500,
         N_shock=400,
+        num_features=1,
         x_sd=1.0,
         coef_sd=1.0,
         p_g_active=0.3,
@@ -190,8 +206,9 @@ def test_generate_choice_learn_market_shocks_dgp_keys_shapes_and_sums() -> None:
     T = 4
     J = 6
     G = 2
+    num_features = 1
 
-    assert xj.shape == (J,)
+    assert xj.shape == (J, num_features)
     assert group_id.shape == (J,)
     assert qj_base.shape == (J,)
     assert isinstance(q0_base, int)
@@ -227,6 +244,26 @@ def test_generate_choice_learn_market_shocks_dgp_keys_shapes_and_sums() -> None:
     assert np.isfinite(njt_true).all()
 
 
+def test_generate_choice_learn_market_shocks_dgp_rejects_invalid_num_features() -> None:
+    with pytest.raises(ValueError):
+        _ = dgp.generate_choice_learn_market_shocks_dgp(
+            seed=0,
+            num_markets=2,
+            num_products=5,
+            num_groups=2,
+            N_base=100,
+            N_shock=80,
+            num_features=0,
+            x_sd=1.0,
+            coef_sd=1.0,
+            p_g_active=0.2,
+            g_sd=1.0,
+            sd_E=0.5,
+            p_active=0.2,
+            sd_u=0.5,
+        )
+
+
 def test_generate_choice_learn_market_shocks_dgp_is_deterministic_given_seed() -> None:
     kwargs = dict(
         seed=11,
@@ -235,6 +272,7 @@ def test_generate_choice_learn_market_shocks_dgp_is_deterministic_given_seed() -
         num_groups=3,
         N_base=200,
         N_shock=150,
+        num_features=2,
         x_sd=1.0,
         coef_sd=1.0,
         p_g_active=0.25,

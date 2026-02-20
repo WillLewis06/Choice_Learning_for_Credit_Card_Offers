@@ -189,7 +189,6 @@ class StockpilingEstimator:
         n_iter: int,
         k: dict[str, Any],
         init_theta: Mapping[str, Any],
-        print_every: int,
     ) -> dict[str, Any]:
         """Run MCMC and return posterior means and acceptance rates.
 
@@ -197,7 +196,6 @@ class StockpilingEstimator:
           n_iter: number of MCMC iterations
           k: proposal scales dict with keys {"beta","alpha","v","fc","u_scale"}
           init_theta: constrained initial state dict with keys {"beta","alpha","v","fc","u_scale"}
-          print_every: print diagnostics every this many iterations
 
         Returns:
           dict with keys:
@@ -318,8 +316,7 @@ class StockpilingEstimator:
                 tf.cast(acc_u_scale, tf.float64)
             )
 
-            if print_every > 0 and (it % int(print_every) == 0):
-                report_iteration_progress(z=z, it=tf.constant(it, dtype=tf.int32))
+            report_iteration_progress(z=z, it=tf.constant(it, dtype=tf.int32))
 
         denom = tf.cast(n_iter_i, tf.float64)
         theta_mean = {
