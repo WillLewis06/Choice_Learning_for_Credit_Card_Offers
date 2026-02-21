@@ -220,7 +220,13 @@ class LuShrinkageEstimator:
         )
 
     def get_results(self) -> dict:
-        """Return posterior-mean summaries from accumulated running sums."""
+        """Return posterior-mean summaries from accumulated running sums.
+
+        Reporting alignment with Lu(25) Section 4:
+          - int_hat: scalar intercept (mean of E_bar_hat across markets), for the table "Int"
+          - E_hat: deviation shocks njt_hat, for the table "xi"
+          - E_full_hat: full shocks E_bar_hat[:, None] + njt_hat (useful for debugging)
+        """
         if self._diag is None:
             raise ValueError("get_results() called before fit().")
 
@@ -234,7 +240,9 @@ class LuShrinkageEstimator:
 
         E_bar_mean = (sum_E_bar / saved_f).numpy()  # (T,)
         njt_mean = (sum_njt / saved_f).numpy()  # (T, J)
-        E_mean = E_bar_mean[:, None] + njt_mean  # (T, J)
+
+        int_hat = float(np.mean(E_bar_mean))
+        E_full_mean = E_bar_mean[:, None] + njt_mean  # (T, J)
 
         phi_mean = (sum_phi / saved_f).numpy()  # (T,)
         gamma_mean = (sum_gamma / saved_f).numpy()  # (T, J)
@@ -243,7 +251,9 @@ class LuShrinkageEstimator:
             "beta_p_hat": float(beta_mean[0]),
             "beta_w_hat": float(beta_mean[1]),
             "sigma_hat": sigma_mean,
-            "E_hat": E_mean,
+            "int_hat": int_hat,
+            "E_hat": njt_mean,
+            "E_full_hat": E_full_mean,
             "E_bar_hat": E_bar_mean,
             "njt_hat": njt_mean,
             "phi_hat": phi_mean,

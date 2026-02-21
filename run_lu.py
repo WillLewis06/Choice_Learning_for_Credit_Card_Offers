@@ -44,7 +44,8 @@ def main() -> None:
     seed = 123
 
     # Number of simulation draws used inside estimators for RC integration.
-    n_draws = 50
+    # (Aligned with Lu(25) Section 4 setting R0=200.)
+    n_draws = 200
 
     # -------------------------------------------------------------------------
     # BLP configuration (validated in orchestration; no defaults)
@@ -123,18 +124,27 @@ def main() -> None:
         # Step 1: Generate market-level primitives and construct prices.
         #
         # generate_market_conditions returns:
-        #   wjt   : exogenous characteristic
-        #   Ejt   : demand shock (E_bar_t + n_jt)
-        #   ujt   : cost shock entering pricing
-        #   alpha : endogeneity shifter (0 for exogenous-price DGPs)
+        #   wjt         : exogenous characteristic
+        #   Ejt         : total demand shock (E_bar_t[:, None] + njt)
+        #   ujt         : cost shock entering pricing
+        #   alpha       : endogeneity shifter (0 for exogenous-price DGPs)
+        #   E_bar_t     : common market component (Lu table "Int")
+        #   njt         : market-product deviations (Lu table "xi")
+        #   support_true: nonzero mask for njt (DGP1/2 only; used for "Prob.")
         #
         # Pricing rule in this codebase:
         #   pjt = alpha + 0.3 * wjt + ujt
         # ---------------------------------------------------------------------
-        wjt, Ejt, ujt, alpha = generate_market_conditions(
+        wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
             T=T, J=J, dgp_type=dgp_type, seed=seed
         )
         pjt = alpha + 0.3 * wjt + ujt
+
+        # Paper-style truth for reporting:
+        #   - int_true corresponds to E_bar_t (scalar in Section 4; constant across t).
+        #   - E_true corresponds to the market-product deviations njt (Lu table "xi").
+        int_true = float(np.mean(E_bar_t))
+        E_true = njt
 
         # ---------------------------------------------------------------------
         # Step 2: Simulate individual utilities and aggregate to market outcomes.
@@ -160,11 +170,13 @@ def main() -> None:
         print("=== Market generated ===")
 
         # ---------------------------------------------------------------------
-        # Step 3: Fit BLP under two instrument sets (strong-IV vs weak-IV).
+        # Step 3: Fit BLP under two instrument sets (with cost IV vs without).
         #
-        # Both BLP estimators use demand regressors (pjt, wjt) and differ only in Zjt:
-        #   - strong IVs: uses wjt and ujt (designed to be informative in the DGP)
-        #   - weak IVs  : uses only wjt (intentionally less informative)
+        # Both BLP estimators use demand regressors Xjt = (1, pjt, wjt) and differ
+        # only in instruments Zjt, aligned with Lu(25) Section 4:
+        #
+        #   - BLP (with cost IV):    Zjt = (1, wjt, wjt^2, ujt, ujt^2)
+        #   - BLP (without cost IV): Zjt = (1, wjt, wjt^2, wjt^3, wjt^4)
         #
         # The sigma search region and optimization controls are provided via the
         # validated BLP config.
@@ -223,13 +235,31 @@ def main() -> None:
         # Step 5: Compare estimates to ground truth.
         # ---------------------------------------------------------------------
         print("=== Strong BLP Estimator Results ===")
-        print_assessment(results=res_strong, E_true=Ejt, sigma_true=sigma_true)
+        print_assessment(
+            results=res_strong,
+            int_true=int_true,
+            xi_true=E_true,
+            sigma_true=sigma_true,
+            support_true=support_true,
+        )
 
         print("=== Weak BLP Estimator Results ===")
-        print_assessment(results=res_weak, E_true=Ejt, sigma_true=sigma_true)
+        print_assessment(
+            results=res_weak,
+            int_true=int_true,
+            xi_true=E_true,
+            sigma_true=sigma_true,
+            support_true=support_true,
+        )
 
         print("=== Shrinkage Estimator Results ===")
-        print_assessment(results=res_shrink, E_true=Ejt, sigma_true=sigma_true)
+        print_assessment(
+            results=res_shrink,
+            int_true=int_true,
+            xi_true=E_true,
+            sigma_true=sigma_true,
+            support_true=support_true,
+        )
 
 
 if __name__ == "__main__":

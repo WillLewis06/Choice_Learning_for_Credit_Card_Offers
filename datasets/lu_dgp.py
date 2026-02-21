@@ -30,9 +30,13 @@ def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
 
     Returns:
         wjt: Exogenous characteristic, shape (T, J), Uniform(1, 2).
-        Ejt: Demand shock, shape (T, J).
+        Ejt: Total demand shock E_bar_t[:, None] + njt, shape (T, J).
         ujt: Cost shock, shape (T, J), Normal(0, 0.7^2).
         alpha: Price endogeneity shifter, shape (T, J).
+        E_bar_t: Common market shock component (Lu table "Int"), shape (T,).
+        njt: Market-product deviation shocks (Lu table "\u03be"), shape (T, J).
+        support_true: For DGP1/2, boolean mask indicating nonzero njt (used for Lu table
+            "Prob."). For DGP3/4, this is None.
     """
     if dgp_type not in (1, 2, 3, 4):
         raise ValueError("dgp_type must be 1, 2, 3, or 4")
@@ -67,7 +71,9 @@ def generate_market_conditions(T: int, J: int, dgp_type: int, seed: int):
         alpha[njt >= thr] = 0.3
         alpha[njt <= -thr] = -0.3
 
-    return wjt, Ejt, ujt, alpha
+    support_true = (njt != 0.0) if dgp_type in (1, 2) else None
+
+    return wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true
 
 
 class BasicLuChoiceModel:
@@ -99,113 +105,51 @@ class BasicLuChoiceModel:
     def utilities(
         self, pjt: np.ndarray, wjt: np.ndarray, Ejt: np.ndarray
     ) -> np.ndarray:
-        """Compute systematic utilities for each market, consumer, and product.
-
-        Utility used here:
-          u_{i,j,t} = beta_{p,i} * p_{j,t} + beta_w * w_{j,t} + E_{j,t}
-
-        Args:
-            pjt: Prices, shape (T, J).
-            wjt: Characteristics, shape (T, J).
-            Ejt: Demand shocks, shape (T, J).
-
-        Returns:
-            uijt: Systematic utilities, shape (T, N, J).
-        """
+        """Compute utilities u[i,t,j] for inside goods (no outside option utility)."""
         pjt = np.asarray(pjt, dtype=float)
         wjt = np.asarray(wjt, dtype=float)
         Ejt = np.asarray(Ejt, dtype=float)
 
-        if pjt.ndim != 2 or wjt.ndim != 2 or Ejt.ndim != 2:
-            raise ValueError("pjt, wjt, Ejt must be 2D arrays of shape (T, J).")
         if pjt.shape != wjt.shape or pjt.shape != Ejt.shape:
-            raise ValueError("pjt, wjt, Ejt must have the same shape (T, J).")
+            raise ValueError("pjt, wjt, and Ejt must have the same shape (T, J)")
 
         T, J = pjt.shape
-        uijt = np.zeros((T, self.N, J), dtype=float)
-
-        # Market loop keeps memory usage predictable and mirrors the model structure.
-        for t in range(T):
-            uijt[t] = (
-                self.beta_p_i[:, None] * pjt[t][None, :]
-                + self.beta_w * wjt[t][None, :]
-                + Ejt[t][None, :]
-            )
-
+        # u[i,t,j] = beta_{p,i} * p[t,j] + beta_w * w[t,j] + E[t,j]
+        uijt = (
+            self.beta_p_i[:, None, None] * pjt[None, :, :]
+            + self.beta_w * wjt[None, :, :]
+            + Ejt[None, :, :]
+        )
         return uijt
 
 
-def _generate_market_shares(uijt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute expected inside and outside shares from simulated utilities.
-
-    This computes, for each market t:
-      s_{j,t} = E_i[ exp(u_{i,j,t}) / (1 + sum_k exp(u_{i,k,t})) ]
-      s_{0,t} = E_i[ 1 / (1 + sum_k exp(u_{i,k,t})) ]
-
-    Args:
-        uijt: Systematic utilities, shape (T, N, J).
-
-    Returns:
-        sjt: Expected inside shares, shape (T, J).
-        s0t: Expected outside shares, shape (T,).
-    """
+def generate_market(uijt: np.ndarray, N: int, seed: int):
+    """Convert utilities into expected shares and realized multinomial counts."""
     uijt = np.asarray(uijt, dtype=float)
     if uijt.ndim != 3:
-        raise ValueError("uijt must have shape (T, N, J).")
+        raise ValueError("uijt must have shape (N, T, J)")
 
-    # Log-sum-exp stabilization per (t, i) to reduce overflow in exp(u).
-    m_inside = np.max(uijt, axis=2, keepdims=True)
-    m = np.maximum(0.0, m_inside)
-
-    exp_u = np.exp(uijt - m)
-    exp_out = np.exp(-m[..., 0])
-    denom = exp_out + np.sum(exp_u, axis=2)
-
-    probs = exp_u / denom[..., None]
-    out_prob = exp_out / denom
-
-    sjt = np.mean(probs, axis=1)
-    s0t = np.mean(out_prob, axis=1)
-    return sjt, s0t
-
-
-def generate_market(
-    uijt: np.ndarray, N: int, seed: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Generate expected shares and realized multinomial counts for each market.
-
-    The counts correspond to N independent consumers choosing among:
-      {outside option} ∪ {J inside goods},
-    where choice probabilities are computed from uijt.
-
-    Args:
-        uijt: Systematic utilities, shape (T, N_sim, J).
-        N: Number of consumers per market for multinomial sampling.
-        seed: RNG seed.
-
-    Returns:
-        sjt: Expected inside shares, shape (T, J).
-        s0t: Expected outside shares, shape (T,).
-        qjt: Realized inside counts, shape (T, J).
-        q0t: Realized outside counts, shape (T,).
-    """
-    uijt = np.asarray(uijt, dtype=float)
-    if uijt.ndim != 3:
-        raise ValueError("uijt must have shape (T, N_sim, J).")
-
+    N = int(N)
     rng = np.random.default_rng(int(seed))
-    sjt, s0t = _generate_market_shares(uijt)
 
+    # Choice probabilities with outside option utility normalized to 0.
+    exp_u = np.exp(uijt)
+    denom = 1.0 + exp_u.sum(axis=2, keepdims=True)
+    pij = exp_u / denom
+    p0 = 1.0 / denom[..., 0]
+
+    # Expected shares.
+    sjt = pij.mean(axis=0)
+    s0t = p0.mean(axis=0)
+
+    # Realized counts per market.
     T, J = sjt.shape
     qjt = np.zeros((T, J), dtype=int)
     q0t = np.zeros(T, dtype=int)
-
-    # Market-by-market multinomial draw of counts given expected shares.
     for t in range(T):
-        probs = np.concatenate([[s0t[t]], sjt[t]])
-        probs = probs / probs.sum()
-        draw = rng.multinomial(int(N), probs)
-        q0t[t] = int(draw[0])
-        qjt[t, :] = draw[1:]
+        probs = np.concatenate([s0t[t : t + 1], sjt[t]], axis=0)
+        draws = rng.multinomial(N, probs)
+        q0t[t] = int(draws[0])
+        qjt[t, :] = draws[1:]
 
     return sjt, s0t, qjt, q0t

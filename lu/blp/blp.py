@@ -2,14 +2,15 @@
 Minimal BLP-style demand estimator for simulation use.
 
 Implements:
-  - Instrument construction helpers.
+  - Instrument construction helpers (fixed to Lu(25) Section 4 benchmarks).
   - Berry inversion to recover mean utilities delta given sigma.
-  - 2SLS regression of delta on X = [pjt, wjt] using instruments Zjt.
-  - Two-step GMM over sigma using moments E[z * E_hat] = 0.
+  - 2SLS regression of delta on X = [1, pjt, wjt] using instruments Zjt.
+  - Two-step GMM over sigma using moments E[z * xi_hat] = 0.
 
 Contract:
   - Data arrays are assumed to be produced internally and already consistent.
   - The `config` mapping is assumed to be validated upstream (no defaults here).
+  - Instrument sets are fixed (no backwards compatibility / alternate IV definitions).
 """
 
 from __future__ import annotations
@@ -20,23 +21,51 @@ from scipy.optimize import minimize
 from lu.blp.inversion import invert_all_markets
 
 
+def _require_2d(name: str, x: np.ndarray) -> None:
+    if x.ndim != 2:
+        raise ValueError(
+            f"{name}: expected 2D array with shape (T, J), got ndim={x.ndim}."
+        )
+
+
 def build_strong_IVs(wjt: np.ndarray, ujt: np.ndarray) -> np.ndarray:
-    """Return strong instruments Z = [1, w, w^2, u, u^2] with shape (T, J, 5)."""
-    w = np.asarray(wjt)
-    u = np.asarray(ujt)
-    ones = np.ones_like(w)
-    return np.stack([ones, w, w**2, u, u**2], axis=2)
+    """
+    Return strong instruments for Lu(25) Section 4 (with cost IV).
+
+    Z = [1, w, w^2, u, u^2] with shape (T, J, 5).
+    """
+    w = np.asarray(wjt, dtype=float)
+    u = np.asarray(ujt, dtype=float)
+    _require_2d("wjt", w)
+    _require_2d("ujt", u)
+    if w.shape != u.shape:
+        raise ValueError(f"wjt vs ujt: shape mismatch {w.shape} vs {u.shape}.")
+
+    ones = np.ones_like(w, dtype=float)
+    Z = np.stack([ones, w, w**2, u, u**2], axis=2)
+    if Z.shape[2] != 5:
+        raise RuntimeError("build_strong_IVs: internal error, expected Kz=5.")
+    return Z
 
 
 def build_weak_IVs(wjt: np.ndarray) -> np.ndarray:
-    """Return weak instruments Z = [1, w, w^2, w^3, w^4] with shape (T, J, 5)."""
-    w = np.asarray(wjt)
-    ones = np.ones_like(w)
-    return np.stack([ones, w, w**2, w**3, w**4], axis=2)
+    """
+    Return weak instruments for Lu(25) Section 4 (without cost IV).
+
+    Z = [1, w, w^2, w^3, w^4] with shape (T, J, 5).
+    """
+    w = np.asarray(wjt, dtype=float)
+    _require_2d("wjt", w)
+
+    ones = np.ones_like(w, dtype=float)
+    Z = np.stack([ones, w, w**2, w**3, w**4], axis=2)
+    if Z.shape[2] != 5:
+        raise RuntimeError("build_weak_IVs: internal error, expected Kz=5.")
+    return Z
 
 
 class BLPEstimator:
-    """Two-step GMM estimator for sigma with IV recovery of (beta_p, beta_w)."""
+    """Two-step GMM estimator for sigma with IV recovery of (Int, beta_p, beta_w)."""
 
     def __init__(
         self,
@@ -68,8 +97,10 @@ class BLPEstimator:
         # Validated config mapping (no validation here by design).
         self.config = config
 
-        # Demand regressors (no constant): X[t, j, :] = [pjt, wjt].
-        self.Xjt = np.stack([self.pjt, self.wjt], axis=2)
+        # Demand regressors include an intercept:
+        # X[t, j, :] = [1, pjt, wjt].
+        ones = np.ones_like(self.pjt, dtype=float)
+        self.Xjt = np.stack([ones, self.pjt, self.wjt], axis=2)
 
         # Fixed simulation draws for integrating the random coefficient on price.
         rng = np.random.default_rng(self.config["seed"])
@@ -86,14 +117,18 @@ class BLPEstimator:
         # Outputs populated after fit().
         self.success = False
         self.sigma_hat: float | None = None
+
+        # 2SLS coefficients: [Int, beta_p, beta_w].
         self.beta_hat: np.ndarray | None = None
+        self.int_hat: float | None = None
         self.beta_p_hat: float | None = None
         self.beta_w_hat: float | None = None
+
+        # Residual demand shocks (post-intercept): xi_hat[t, j].
         self.E_hat: np.ndarray | None = None
 
     def _invert_demand(self, sigma: float) -> np.ndarray:
         """Invert shares to recover delta for all markets at a given sigma."""
-        # Berry contraction mapping (warm-started from the last successful delta).
         delta = invert_all_markets(
             sjt=self.sjt,
             pjt=self.pjt,
@@ -109,10 +144,10 @@ class BLPEstimator:
         return delta
 
     def _estimate_beta(self, delta: np.ndarray) -> np.ndarray:
-        """Compute 2SLS beta for delta = X beta + E using instruments Z."""
+        """Compute 2SLS beta for delta = X beta + xi using instruments Z."""
         # Stack markets/products into a single regression.
         y = delta.reshape(-1, 1)  # (n, 1)
-        X = self.Xjt.reshape(y.shape[0], -1)  # (n, 2)
+        X = self.Xjt.reshape(y.shape[0], -1)  # (n, 3)
         Z = self.Zjt.reshape(y.shape[0], -1)  # (n, Kz)
 
         # Closed-form 2SLS: beta = (X' Pz X)^-1 X' Pz y, with Pz = Z(Z'Z)^-1 Z'.
@@ -121,25 +156,23 @@ class BLPEstimator:
 
         A = XTZ @ ZTZ_inv @ XTZ.T
         B = XTZ @ ZTZ_inv @ (Z.T @ y)
-        return np.linalg.pinv(A) @ B  # (2, 1)
+        return np.linalg.pinv(A) @ B  # (3, 1)
 
     def _compute_E_hat(self, delta: np.ndarray, beta_hat: np.ndarray) -> np.ndarray:
-        """Compute E_hat = delta - X beta_hat with shape (T, J)."""
+        """Compute xi_hat = delta - X beta_hat with shape (T, J)."""
         y = delta.reshape(-1, 1)
         X = self.Xjt.reshape(y.shape[0], -1)
         E = y - X @ beta_hat
         return E.reshape(self.sjt.shape)
 
     def _moments_and_omega(self, E_hat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return g_bar = mean(z * E) and Omega_hat = cov(z * E)."""
+        """Return g_bar = mean(z * xi) and Omega_hat = cov(z * xi)."""
         E = E_hat.reshape(-1, 1)  # (n, 1)
         Z = self.Zjt.reshape(E.shape[0], -1)  # (n, Kz)
 
-        # Moment per observation: m_i = z_i * E_i.
         m = Z * E
         g_bar = m.mean(axis=0)
 
-        # Sample covariance of the moment vector.
         m_centered = m - g_bar
         Omega_hat = (m_centered.T @ m_centered) / float(m.shape[0])
         return g_bar, Omega_hat
@@ -160,7 +193,6 @@ class BLPEstimator:
         if (not np.isfinite(s)) or (s <= 0.0):
             return float(fail)
 
-        # Enforce the sigma bounds during search (set by fit()).
         if (self._sigma_lo is not None) and (s < self._sigma_lo):
             return float(fail)
         if (self._sigma_hi is not None) and (s > self._sigma_hi):
@@ -177,7 +209,7 @@ class BLPEstimator:
 
     def fit(self) -> None:
         """
-        Run two-step GMM for sigma and store final beta and E_hat.
+        Run two-step GMM for sigma and store final beta and xi_hat.
 
         Uses:
           - W1 = (Z'Z)^-1 for step 1.
@@ -188,11 +220,9 @@ class BLPEstimator:
         self._sigma_lo = float(sigma_lo)
         self._sigma_hi = float(sigma_hi)
 
-        # Step-1 weighting matrix: W1 = (Z'Z)^-1 using stacked instruments.
         Z = self.Zjt.reshape(-1, self.Zjt.shape[2])
         W1 = np.linalg.pinv(Z.T @ Z)
 
-        # Step 1a: log-spaced grid search for a feasible starting point.
         sigmas = np.logspace(
             np.log10(self._sigma_lo),
             np.log10(self._sigma_hi),
@@ -215,7 +245,6 @@ class BLPEstimator:
                 "No feasible sigma found in the configured grid search bounds."
             )
 
-        # Step 1b: Nelder–Mead on theta = log(sigma) to enforce positivity.
         def obj1(theta_vec: np.ndarray) -> float:
             return self._safe_gmm_objective(float(np.exp(theta_vec[0])), W1)
 
@@ -235,14 +264,12 @@ class BLPEstimator:
                 "Step-1 optimization ended outside the configured sigma bounds."
             )
 
-        # Build W2 at sigma_hat_1 (Omega_hat^-1).
         delta_1 = self._invert_demand(sigma_hat_1)
         beta_1 = self._estimate_beta(delta_1)
         E_1 = self._compute_E_hat(delta_1, beta_1)
         _, Omega_hat = self._moments_and_omega(E_1)
         W2 = np.linalg.pinv(Omega_hat)
 
-        # Step 2: Nelder–Mead on theta = log(sigma).
         def obj2(theta_vec: np.ndarray) -> float:
             return self._safe_gmm_objective(float(np.exp(theta_vec[0])), W2)
 
@@ -262,13 +289,17 @@ class BLPEstimator:
                 "Step-2 optimization ended outside the configured sigma bounds."
             )
 
-        # Final recomputation at sigma_hat_2 to store outputs used downstream.
         self.sigma_hat = sigma_hat_2
 
         delta_hat = self._invert_demand(self.sigma_hat)
         self.beta_hat = self._estimate_beta(delta_hat)
-        self.beta_p_hat = float(self.beta_hat[0, 0])
-        self.beta_w_hat = float(self.beta_hat[1, 0])
+
+        # Coefficient order matches X = [1, pjt, wjt].
+        self.int_hat = float(self.beta_hat[0, 0])
+        self.beta_p_hat = float(self.beta_hat[1, 0])
+        self.beta_w_hat = float(self.beta_hat[2, 0])
+
+        # Post-intercept demand shocks (Lu table column "xi").
         self.E_hat = self._compute_E_hat(delta_hat, self.beta_hat)
 
         self.success = True
@@ -278,6 +309,7 @@ class BLPEstimator:
         return {
             "success": self.success,
             "sigma_hat": self.sigma_hat,
+            "int_hat": self.int_hat,
             "beta_p_hat": self.beta_p_hat,
             "beta_w_hat": self.beta_w_hat,
             "E_hat": self.E_hat,
