@@ -156,8 +156,8 @@ def main():
         "FeaturelessDeepHalo",
         FeaturelessDeepHalo(
             num_items=dims_raw["J"],
-            depth=2,
-            width=max(8, dims_raw["J"]),
+            depth=8,
+            width=128,
             optimizer="adam",
             lr=lr,
             batch_size=batch_size,
@@ -172,9 +172,9 @@ def main():
         "FeatureBasedDeepHalo",
         FeatureBasedDeepHalo(
             num_items=dims_raw["J"],
-            depth=2,
-            width=16,
-            heads=4,
+            depth=10,
+            width=128,
+            heads=8,
             optimizer="adam",
             lr=lr,
             batch_size=batch_size,

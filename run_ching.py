@@ -119,7 +119,7 @@ CFG_PHASE2: dict[str, Any] = {
         },
     },
     "fit_config": {
-        "n_iter": 50,
+        "n_iter": 200,
         "pilot_length": 20,
         "ridge": 1e-6,
         "target_low": 0.30,
@@ -155,7 +155,7 @@ CFG_PHASE3: dict[str, Any] = {
     "price_noise_sd": 0.02,
     # MCMC
     "mcmc_seed": 0,
-    "mcmc_n_iter": 10,
+    "mcmc_n_iter": 500,
     "init_theta": {
         "beta": 0.5,
         "alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.5, dtype=np.float64),

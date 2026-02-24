@@ -27,25 +27,25 @@ import numpy as np
 # Keep TF logs quiet for downstream modules that import TF internally.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-import tensorflow as tf  # noqa: E402
+import tensorflow as tf
 
-from datasets.bonus2_dgp import simulate_bonus2_dgp  # noqa: E402
+from datasets.bonus2_dgp import simulate_bonus2_dgp
 from run_zhang_with_lu import (
     print_choice_model_diagnostics,
     run_choice_model,
-)  # noqa: E402
+)
 
-from bonus2 import bonus2_model as b2_model  # noqa: E402
+from bonus2 import bonus2_model as b2_model
 from bonus2.bonus2_diagnostics import (
     report_known_summary,
     report_theta_summary,
-)  # noqa: E402
-from bonus2.bonus2_estimator import Bonus2Estimator  # noqa: E402
+)
+from bonus2.bonus2_estimator import Bonus2Estimator
 from bonus2.bonus2_evaluate import (
     evaluate_bonus2,
     format_evaluation_summary,
-)  # noqa: E402
-from bonus2.bonus2_input_validation import validate_phase1_delta_hat  # noqa: E402
+)
+from bonus2.bonus2_input_validation import validate_phase1_delta_hat
 
 # =============================================================================
 # Configuration
@@ -67,9 +67,9 @@ CFG_PHASE1: dict[str, Any] = {
     "p_active": 0.25,
     "sd_u": 0.5,
     "depth": 5,
-    "width": 64,
+    "width": 128,
     "heads": 8,
-    "epochs": 50,
+    "epochs": 500,
     "batch_size": 64,
     "learning_rate": 1e-3,
     "shuffle_buffer": 10_000,
@@ -102,7 +102,7 @@ CFG_BONUS2: dict[str, Any] = {
     },
     # MCMC
     "mcmc_seed": 0,
-    "mcmc_n_iter": 200,
+    "mcmc_n_iter": 2000,
     # estimator init (scalar fills)
     "init_theta": {
         "beta_intercept": 0.0,

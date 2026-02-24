@@ -4,7 +4,7 @@ import numpy as np
 def print_assessment(
     results: dict,
     int_true: float,
-    xi_true: np.ndarray,
+    E_true: np.ndarray,
     sigma_true: float | None = None,
     support_true: np.ndarray | None = None,
 ) -> None:
@@ -13,9 +13,9 @@ def print_assessment(
 
     Conventions (aligned to Lu reporting split):
       - "int_true" is the common/intercept component (Lu table "Int").
-      - "xi_true" is the deviation shock array (Lu table "xi"), shape (T, J).
+      - "E_true" is the deviation shock array (Lu table "xi"), shape (T, J).
       - results["int_hat"] is the estimated intercept (scalar).
-      - results["E_hat"] is interpreted as xi_hat (post-intercept deviations), shape (T, J).
+      - results["E_hat"] is interpreted as E_hat (post-intercept deviations), shape (T, J).
 
     Expected results keys (from estimator.get_results()):
       - "success": bool (optional)
@@ -25,7 +25,7 @@ def print_assessment(
 
     Prints (debug-friendly):
       - Int: hat/true/error
-      - xi: rmse, mae, bias, corr + extras (std_ratio, null_rmse, norms, means)
+      - E: rmse, mae, bias, corr + extras (std_ratio, null_rmse, norms, means)
       - sigma_hat (and abs/rel error if sigma_true is provided)
       - Prob (optional): single-run sparsity agreement if support_true and gamma_hat exist
     """
@@ -60,23 +60,21 @@ def print_assessment(
 
         print(
             f"success={bool(success)} | Int: hat={int_hat_f:.6f} true={int_true_f:.6f} "
-            f"err={int_err:.6f} abs_err={int_abs_err:.6f} | xi: E_hat=None"
+            f"err={int_err:.6f} abs_err={int_abs_err:.6f} | E: E_hat=None"
             f"{sigma_part}"
         )
         return
 
-    # xi diagnostics
-    xi = np.asarray(xi_true, dtype=float)
-    xi_hat = np.asarray(E_hat, dtype=float)
+    # E diagnostics
+    E = np.asarray(E_true, dtype=float)
+    E_hat = np.asarray(E_hat, dtype=float)
 
-    if xi.shape != xi_hat.shape:
-        raise ValueError(
-            f"xi_true vs E_hat: shape mismatch {xi.shape} vs {xi_hat.shape}"
-        )
+    if E.shape != E_hat.shape:
+        raise ValueError(f"E_true vs E_hat: shape mismatch {E.shape} vs {E_hat.shape}")
 
     # Flatten for scalar metrics
-    e = xi.reshape(-1)
-    eh = xi_hat.reshape(-1)
+    e = E.reshape(-1)
+    eh = E_hat.reshape(-1)
     diff = eh - e
 
     rmse = float(np.sqrt(np.mean(diff * diff)))
@@ -97,10 +95,10 @@ def print_assessment(
 
     # Debug extras (cheap + informative)
     diff_std = float(np.std(diff))
-    xi_true_norm = float(np.linalg.norm(e))
-    xi_hat_norm = float(np.linalg.norm(eh))
-    xi_true_mean = float(np.mean(e))
-    xi_hat_mean = float(np.mean(eh))
+    E_true_norm = float(np.linalg.norm(e))
+    E_hat_norm = float(np.linalg.norm(eh))
+    E_true_mean = float(np.mean(e))
+    E_hat_mean = float(np.mean(eh))
     degenerate_E_hat = bool(eh_std < 1e-12)
 
     # Optional single-run sparsity agreement ("Prob.")
@@ -130,11 +128,11 @@ def print_assessment(
     print(
         f"success={bool(success)} | Int: hat={int_hat_f:.6f} true={int_true_f:.6f} "
         f"err={int_err:.6f} abs_err={int_abs_err:.6f} "
-        f"| xi: rmse={rmse:.4f} mae={mae:.4f} bias={bias:.4f} corr={corr:.4f} "
+        f"| E: rmse={rmse:.4f} mae={mae:.4f} bias={bias:.4f} corr={corr:.4f} "
         f"| std_ratio={std_ratio:.4f} diff_sd={diff_std:.4f} "
         f"| null_rmse={rmse_null:.4f} improve={rmse_improvement:.4f} "
-        f"| xi_true_norm={xi_true_norm:.4f} xi_hat_norm={xi_hat_norm:.4f} "
-        f"| mean(xi_true)={xi_true_mean:.4f} mean(xi_hat)={xi_hat_mean:.4f}"
+        f"| E_true_norm={E_true_norm:.4f} E_hat_norm={E_hat_norm:.4f} "
+        f"| mean(E_true)={E_true_mean:.4f} mean(E_hat)={E_hat_mean:.4f}"
         f"{prob_part}"
         f"{sigma_part}" + (" | degenerate_E_hat" if degenerate_E_hat else "")
     )

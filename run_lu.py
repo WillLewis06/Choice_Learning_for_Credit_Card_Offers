@@ -129,7 +129,7 @@ def main() -> None:
         #   ujt         : cost shock entering pricing
         #   alpha       : endogeneity shifter (0 for exogenous-price DGPs)
         #   E_bar_t     : common market component (Lu table "Int")
-        #   njt         : market-product deviations (Lu table "xi")
+        #   njt         : market-product deviations (Lu table "E")
         #   support_true: nonzero mask for njt (DGP1/2 only; used for "Prob.")
         #
         # Pricing rule in this codebase:
@@ -142,7 +142,7 @@ def main() -> None:
 
         # Paper-style truth for reporting:
         #   - int_true corresponds to E_bar_t (scalar in Section 4; constant across t).
-        #   - E_true corresponds to the market-product deviations njt (Lu table "xi").
+        #   - E_true corresponds to the market-product deviations njt (Lu table "E").
         int_true = float(np.mean(E_bar_t))
         E_true = njt
 
@@ -193,7 +193,7 @@ def main() -> None:
         print("=== Strong IVs and Estimator built ===")
         blp_strong.fit()
         res_strong = blp_strong.get_results()
-        print("=== Strong Estimator fitted ===")
+        print("=== Strong BLP Estimator fitted ===")
 
         Zjt_weak = build_weak_IVs(wjt=wjt)
         blp_weak = BLPEstimator(
@@ -207,7 +207,7 @@ def main() -> None:
         print("=== Weak IVs and Estimator built ===")
         blp_weak.fit()
         res_weak = blp_weak.get_results()
-        print("=== Weak Estimator fitted ===")
+        print("=== Weak BLP Estimator fitted ===")
 
         # ---------------------------------------------------------------------
         # Step 4: Fit the Lu shrinkage estimator.
@@ -238,7 +238,7 @@ def main() -> None:
         print_assessment(
             results=res_strong,
             int_true=int_true,
-            xi_true=E_true,
+            E_true=E_true,
             sigma_true=sigma_true,
             support_true=support_true,
         )
@@ -247,7 +247,7 @@ def main() -> None:
         print_assessment(
             results=res_weak,
             int_true=int_true,
-            xi_true=E_true,
+            E_true=E_true,
             sigma_true=sigma_true,
             support_true=support_true,
         )
@@ -256,7 +256,7 @@ def main() -> None:
         print_assessment(
             results=res_shrink,
             int_true=int_true,
-            xi_true=E_true,
+            E_true=E_true,
             sigma_true=sigma_true,
             support_true=support_true,
         )
