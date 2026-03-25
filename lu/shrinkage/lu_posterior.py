@@ -43,8 +43,10 @@ class LuPosteriorTF:
 
         self.beta_p_mean = tf.constant(config.beta_p_mean, dtype=self.dtype)
         self.beta_p_var = tf.constant(config.beta_p_var, dtype=self.dtype)
+
         self.beta_w_mean = tf.constant(config.beta_w_mean, dtype=self.dtype)
         self.beta_w_var = tf.constant(config.beta_w_var, dtype=self.dtype)
+
         self.r_mean = tf.constant(config.r_mean, dtype=self.dtype)
         self.r_var = tf.constant(config.r_var, dtype=self.dtype)
 
@@ -60,19 +62,32 @@ class LuPosteriorTF:
         self._log_two_pi = tf.math.log(
             tf.constant(2.0 * 3.141592653589793, dtype=self.dtype)
         )
-        self._log_T0_sq = tf.math.log(self.T0_sq)
-        self._log_T1_sq = tf.math.log(self.T1_sq)
-
         self._log_beta_ab = (
             tf.math.lgamma(self.a_phi)
             + tf.math.lgamma(self.b_phi)
             - tf.math.lgamma(self.a_phi + self.b_phi)
         )
 
-        self._lp0_beta_p = -0.5 * (self._log_two_pi + tf.math.log(self.beta_p_var))
-        self._lp0_beta_w = -0.5 * (self._log_two_pi + tf.math.log(self.beta_w_var))
-        self._lp0_r = -0.5 * (self._log_two_pi + tf.math.log(self.r_var))
-        self._lp0_E_bar = -0.5 * (self._log_two_pi + tf.math.log(self.E_bar_var))
+        self._log_beta_p_var = tf.math.log(self.beta_p_var)
+        self._log_beta_w_var = tf.math.log(self.beta_w_var)
+        self._log_r_var = tf.math.log(self.r_var)
+        self._log_E_bar_var = tf.math.log(self.E_bar_var)
+        self._log_T0_sq = tf.math.log(self.T0_sq)
+        self._log_T1_sq = tf.math.log(self.T1_sq)
+
+        self._lp0_beta_p = -0.5 * (self._log_two_pi + self._log_beta_p_var)
+        self._lp0_beta_w = -0.5 * (self._log_two_pi + self._log_beta_w_var)
+        self._lp0_r = -0.5 * (self._log_two_pi + self._log_r_var)
+        self._lp0_E_bar = -0.5 * (self._log_two_pi + self._log_E_bar_var)
+
+    def _gaussian_logpdf(
+        self,
+        x: tf.Tensor,
+        mean: tf.Tensor,
+        var: tf.Tensor,
+        log_var: tf.Tensor,
+    ) -> tf.Tensor:
+        return -0.5 * (self._log_two_pi + log_var + tf.square(x - mean) / var)
 
     def _mean_utility_jt(
         self,
@@ -105,7 +120,7 @@ class LuPosteriorTF:
         s0t = tf.reduce_mean(exp0[0] / denom[0])
         return sjt_t, s0t
 
-    def _market_loglik(
+    def _market_loglik_impl(
         self,
         qjt_t: tf.Tensor,
         q0t_t: tf.Tensor,
@@ -136,8 +151,51 @@ class LuPosteriorTF:
 
         return tf.reduce_sum(qjt_t * tf.math.log(sjt_t)) + q0t_t * tf.math.log(s0t)
 
+    def _logprior_E_bar_t(self, E_bar_t: tf.Tensor) -> tf.Tensor:
+        return (
+            self._lp0_E_bar
+            - 0.5 * tf.square(E_bar_t - self.E_bar_mean) / self.E_bar_var
+        )
+
+    def _logprior_njt_t_given_gamma_t(
+        self,
+        njt_t: tf.Tensor,
+        gamma_t: tf.Tensor,
+    ) -> tf.Tensor:
+        gamma_t = tf.cast(gamma_t, self.dtype)
+        one_minus_gamma_t = 1.0 - gamma_t
+        var_t = gamma_t * self.T1_sq + one_minus_gamma_t * self.T0_sq
+        log_var_t = gamma_t * self._log_T1_sq + one_minus_gamma_t * self._log_T0_sq
+        lp_n_t = -0.5 * (self._log_two_pi + log_var_t + tf.square(njt_t) / var_t)
+        return tf.reduce_sum(lp_n_t)
+
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def loglik(
+    def market_loglik(
+        self,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+    ) -> tf.Tensor:
+        return self._market_loglik_impl(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_t,
+            njt_t=njt_t,
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def loglik_vec(
         self,
         qjt: tf.Tensor,
         q0t: tf.Tensor,
@@ -152,7 +210,7 @@ class LuPosteriorTF:
         T = tf.shape(pjt)[0]
 
         def _market_ll(t: tf.Tensor) -> tf.Tensor:
-            return self._market_loglik(
+            return self._market_loglik_impl(
                 qjt_t=qjt[t],
                 q0t_t=q0t[t],
                 pjt_t=pjt[t],
@@ -164,11 +222,37 @@ class LuPosteriorTF:
                 njt_t=njt[t],
             )
 
+        return tf.map_fn(_market_ll, tf.range(T), fn_output_signature=self.dtype)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def loglik(
+        self,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+    ) -> tf.Tensor:
         return tf.reduce_sum(
-            tf.map_fn(_market_ll, tf.range(T), fn_output_signature=self.dtype)
+            self.loglik_vec(
+                qjt=qjt,
+                q0t=q0t,
+                pjt=pjt,
+                wjt=wjt,
+                beta_p=beta_p,
+                beta_w=beta_w,
+                r=r,
+                E_bar=E_bar,
+                njt=njt,
+            )
         )
 
-    def global_prior(
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_global(
         self,
         beta_p: tf.Tensor,
         beta_w: tf.Tensor,
@@ -185,50 +269,199 @@ class LuPosteriorTF:
         lp_r = self._lp0_r - 0.5 * tf.square(r - self.r_mean) / self.r_var
         return lp_beta_p + lp_beta_w + lp_r
 
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_E_bar_vec(
+        self,
+        E_bar: tf.Tensor,
+    ) -> tf.Tensor:
+        return (
+            self._lp0_E_bar - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_E_bar(
+        self,
+        E_bar: tf.Tensor,
+    ) -> tf.Tensor:
+        return tf.reduce_sum(self.logprior_E_bar_vec(E_bar=E_bar))
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_njt_given_gamma_vec(
+        self,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        gamma = tf.cast(gamma, self.dtype)
+        one_minus_gamma = 1.0 - gamma
+        var = gamma * self.T1_sq + one_minus_gamma * self.T0_sq
+        log_var = gamma * self._log_T1_sq + one_minus_gamma * self._log_T0_sq
+        lp_n = -0.5 * (self._log_two_pi + log_var + tf.square(njt) / var)
+        return tf.reduce_sum(lp_n, axis=1)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_njt_given_gamma(
+        self,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        return tf.reduce_sum(self.logprior_njt_given_gamma_vec(njt=njt, gamma=gamma))
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def continuous_prior_vec(
+        self,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        return self.logprior_E_bar_vec(E_bar=E_bar) + self.logprior_njt_given_gamma_vec(
+            njt=njt, gamma=gamma
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
     def continuous_prior(
         self,
         E_bar: tf.Tensor,
         njt: tf.Tensor,
         gamma: tf.Tensor,
     ) -> tf.Tensor:
-        lp_E = (
-            self._lp0_E_bar - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
+        return tf.reduce_sum(
+            self.continuous_prior_vec(E_bar=E_bar, njt=njt, gamma=gamma)
         )
 
-        one_minus_gamma = 1.0 - gamma
-        var = gamma * self.T1_sq + one_minus_gamma * self.T0_sq
-        log_var = gamma * self._log_T1_sq + one_minus_gamma * self._log_T0_sq
-
-        lp_n = -0.5 * (self._log_two_pi + log_var + tf.square(njt) / var)
-
-        return tf.reduce_sum(lp_E) + tf.reduce_sum(lp_n)
-
-    def full_prior(
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def collapsed_gamma_prior_vec(
         self,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        gamma = tf.cast(gamma, self.dtype)
+        s = tf.reduce_sum(gamma, axis=1)
+        J = tf.cast(tf.shape(gamma)[1], self.dtype)
+
+        log_beta_post = (
+            tf.math.lgamma(self.a_phi + s)
+            + tf.math.lgamma(self.b_phi + (J - s))
+            - tf.math.lgamma(self.a_phi + self.b_phi + J)
+        )
+        return log_beta_post - self._log_beta_ab
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def collapsed_gamma_prior(
+        self,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        return tf.reduce_sum(self.collapsed_gamma_prior_vec(gamma=gamma))
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def beta_block_logpost(
+        self,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
         E_bar: tf.Tensor,
         njt: tf.Tensor,
-        gamma: tf.Tensor,
-        phi: tf.Tensor,
     ) -> tf.Tensor:
-        lp_cont = self.continuous_prior(
+        ll = self.loglik(
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
             E_bar=E_bar,
             njt=njt,
-            gamma=gamma,
         )
-
-        phi = tf.clip_by_value(phi, self.eps, 1.0 - self.eps)
-        one_minus_gamma = 1.0 - gamma
-
-        lp_g = gamma * tf.math.log(phi[:, None]) + one_minus_gamma * tf.math.log(
-            1.0 - phi[:, None]
+        lp_beta_p = (
+            self._lp0_beta_p
+            - 0.5 * tf.square(beta_p - self.beta_p_mean) / self.beta_p_var
         )
-        lp_phi = (
-            (self.a_phi - 1.0) * tf.math.log(phi)
-            + (self.b_phi - 1.0) * tf.math.log(1.0 - phi)
-            - self._log_beta_ab
+        lp_beta_w = (
+            self._lp0_beta_w
+            - 0.5 * tf.square(beta_w - self.beta_w_mean) / self.beta_w_var
         )
+        return ll + lp_beta_p + lp_beta_w
 
-        return lp_cont + tf.reduce_sum(lp_g) + tf.reduce_sum(lp_phi)
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def r_block_logpost(
+        self,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+    ) -> tf.Tensor:
+        ll = self.loglik(
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar=E_bar,
+            njt=njt,
+        )
+        lp_r = self._lp0_r - 0.5 * tf.square(r - self.r_mean) / self.r_var
+        return ll + lp_r
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def E_bar_block_logpost(
+        self,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+    ) -> tf.Tensor:
+        return self.market_loglik(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_t,
+            njt_t=njt_t,
+        ) + self._logprior_E_bar_t(E_bar_t=E_bar_t)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def njt_block_logpost(
+        self,
+        qjt_t: tf.Tensor,
+        q0t_t: tf.Tensor,
+        pjt_t: tf.Tensor,
+        wjt_t: tf.Tensor,
+        beta_p: tf.Tensor,
+        beta_w: tf.Tensor,
+        r: tf.Tensor,
+        E_bar_t: tf.Tensor,
+        njt_t: tf.Tensor,
+        gamma_t: tf.Tensor,
+    ) -> tf.Tensor:
+        return self.market_loglik(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_t,
+            njt_t=njt_t,
+        ) + self._logprior_njt_t_given_gamma_t(njt_t=njt_t, gamma_t=gamma_t)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def conditional_continuous_logpost(
@@ -256,7 +489,7 @@ class LuPosteriorTF:
                 E_bar=E_bar,
                 njt=njt,
             )
-            + self.global_prior(beta_p=beta_p, beta_w=beta_w, r=r)
+            + self.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r)
             + self.continuous_prior(E_bar=E_bar, njt=njt, gamma=gamma)
         )
 
@@ -273,7 +506,6 @@ class LuPosteriorTF:
         E_bar: tf.Tensor,
         njt: tf.Tensor,
         gamma: tf.Tensor,
-        phi: tf.Tensor,
     ) -> tf.Tensor:
         return (
             self.loglik(
@@ -287,6 +519,7 @@ class LuPosteriorTF:
                 E_bar=E_bar,
                 njt=njt,
             )
-            + self.global_prior(beta_p=beta_p, beta_w=beta_w, r=r)
-            + self.full_prior(E_bar=E_bar, njt=njt, gamma=gamma, phi=phi)
+            + self.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r)
+            + self.continuous_prior(E_bar=E_bar, njt=njt, gamma=gamma)
+            + self.collapsed_gamma_prior(gamma=gamma)
         )

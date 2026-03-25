@@ -1,27 +1,43 @@
-"""
-Block-wise MCMC updates for the Lu shrinkage estimator.
-
-Each function updates one parameter block conditional on the rest:
-- TMH for dense blocks with strong local curvature,
-- RW-MH for scalar/vector random-walk proposals,
-- Gibbs for conjugate conditional distributions.
-
-All tensors are expected to be tf.float64. Input validation is handled upstream
-(on external configs); these update functions assume shapes and dtypes are
-already consistent.
-"""
-
 from __future__ import annotations
 
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from toolbox.mcmc_kernels import gibbs_gamma, gibbs_phi, rw_mh_step, tmh_step
+from lu.shrinkage.lu_posterior import LuPosteriorTF
+
+tfmcmc = tfp.mcmc
 
 
-@tf.function(reduce_retracing=True)
-def update_beta(
-    posterior,
-    rng: tf.random.Generator,
+def _normalize_seed(seed: tf.Tensor | None) -> tf.Tensor:
+    if seed is None:
+        return tf.constant([0, 0], dtype=tf.int32)
+
+    seed_t = tf.convert_to_tensor(seed, dtype=tf.int32)
+    if seed_t.shape.rank == 0:
+        return tf.stack([seed_t, tf.constant(0, dtype=tf.int32)])
+    return seed_t
+
+
+def _make_rw_kernel(
+    target_log_prob_fn,
+    scale: tf.Tensor,
+) -> tfmcmc.RandomWalkMetropolis:
+    return tfmcmc.RandomWalkMetropolis(
+        target_log_prob_fn=target_log_prob_fn,
+        new_state_fn=tfmcmc.random_walk_normal_fn(scale=scale),
+    )
+
+
+def _accepted_float(
+    kernel_results,
+    dtype: tf.dtypes.DType,
+) -> tf.Tensor:
+    return tf.cast(kernel_results.is_accepted, dtype)
+
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def beta_one_step(
+    posterior: LuPosteriorTF,
     qjt: tf.Tensor,
     q0t: tf.Tensor,
     pjt: tf.Tensor,
@@ -32,56 +48,40 @@ def update_beta(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     k_beta: tf.Tensor,
-    ridge: tf.Tensor,
-):
-    """TMH update for (beta_p, beta_w).
+    seed: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    seed = _normalize_seed(seed)
+    k_beta = tf.convert_to_tensor(k_beta, dtype=posterior.dtype)
 
-    Returns:
-        beta_p_new: Scalar tf.float64.
-        beta_w_new: Scalar tf.float64.
-        accepted: Scalar boolean.
-    """
-    # Pack the two scalars into a length-2 vector for a joint proposal.
-    beta0 = tf.stack([beta_p, beta_w], axis=0)
-
-    def logp_beta(theta_vec: tf.Tensor) -> tf.Tensor:
-        # Unpack proposal.
-        bp = theta_vec[0]
-        bw = theta_vec[1]
-
-        # Conditional log-likelihood: sum over markets.
-        ll = tf.reduce_sum(
-            posterior.loglik_vec(
-                qjt=qjt,
-                q0t=q0t,
-                pjt=pjt,
-                wjt=wjt,
-                beta_p=bp,
-                beta_w=bw,
-                r=r,
-                E_bar=E_bar,
-                njt=njt,
-            )
+    def target_log_prob_fn(beta: tf.Tensor) -> tf.Tensor:
+        return posterior.beta_block_logpost(
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=beta[0],
+            beta_w=beta[1],
+            r=r,
+            E_bar=E_bar,
+            njt=njt,
         )
 
-        # Global prior for (beta_p, beta_w, r); r is held fixed in this block update.
-        lp = posterior.logprior_global(beta_p=bp, beta_w=bw, r=r)
-        return ll + lp
-
-    beta_new, accepted = tmh_step(
-        theta0=beta0,
-        logp_fn=logp_beta,
-        ridge=ridge,
-        rng=rng,
-        k=k_beta,
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta)
+    beta0 = tf.stack([beta_p, beta_w])
+    kernel_results = kernel.bootstrap_results(beta0)
+    beta_new, kernel_results = kernel.one_step(
+        current_state=beta0,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
+
+    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
     return beta_new[0], beta_new[1], accepted
 
 
-@tf.function(reduce_retracing=True)
-def update_r(
-    posterior,
-    rng: tf.random.Generator,
+@tf.function(jit_compile=True, reduce_retracing=True)
+def r_one_step(
+    posterior: LuPosteriorTF,
     qjt: tf.Tensor,
     q0t: tf.Tensor,
     pjt: tf.Tensor,
@@ -92,88 +92,190 @@ def update_r(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     k_r: tf.Tensor,
-):
-    """RW-MH update for r = log(sigma).
+    seed: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    seed = _normalize_seed(seed)
+    k_r = tf.convert_to_tensor(k_r, dtype=posterior.dtype)
 
-    Returns:
-        r_new: Scalar tf.float64.
-        accepted: Scalar boolean.
-    """
-
-    def logp_r(r_val: tf.Tensor) -> tf.Tensor:
-        ll = tf.reduce_sum(
-            posterior.loglik_vec(
-                qjt=qjt,
-                q0t=q0t,
-                pjt=pjt,
-                wjt=wjt,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r_val,
-                E_bar=E_bar,
-                njt=njt,
-            )
-        )
-        lp = posterior.logprior_global(beta_p=beta_p, beta_w=beta_w, r=r_val)
-        return ll + lp
-
-    r_new, accepted = rw_mh_step(theta0=r, logp_fn=logp_r, k=k_r, rng=rng)
-    return r_new, accepted
-
-
-@tf.function(reduce_retracing=True)
-def update_E_bar(
-    posterior,
-    rng: tf.random.Generator,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    pjt: tf.Tensor,
-    wjt: tf.Tensor,
-    beta_p: tf.Tensor,
-    beta_w: tf.Tensor,
-    r: tf.Tensor,
-    E_bar: tf.Tensor,
-    njt: tf.Tensor,
-    gamma: tf.Tensor,
-    phi: tf.Tensor,
-    k_E_bar: tf.Tensor,
-):
-    """Elementwise RW-MH update for E_bar (shape (T,)).
-
-    Returns:
-        E_bar_new: tf.float64 tensor, shape (T,).
-        accepted: Boolean tensor, shape (T,).
-    """
-
-    def logp_E_bar_vec(E_bar_val: tf.Tensor) -> tf.Tensor:
-        # posterior.logpost_vec returns per-market log posterior contributions.
-        return posterior.logpost_vec(
+    def target_log_prob_fn(r_val: tf.Tensor) -> tf.Tensor:
+        return posterior.r_block_logpost(
             qjt=qjt,
             q0t=q0t,
             pjt=pjt,
             wjt=wjt,
             beta_p=beta_p,
             beta_w=beta_w,
-            r=r,
-            E_bar=E_bar_val,
+            r=r_val,
+            E_bar=E_bar,
             njt=njt,
-            gamma=gamma,
-            phi=phi,
         )
 
-    E_bar_new, accepted = rw_mh_step(
-        theta0=E_bar,
-        logp_fn=logp_E_bar_vec,
-        k=k_E_bar,
-        rng=rng,
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_r)
+    kernel_results = kernel.bootstrap_results(r)
+    r_new, kernel_results = kernel.one_step(
+        current_state=r,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
-    return E_bar_new, accepted
+
+    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    return r_new, accepted
 
 
-@tf.function(reduce_retracing=True)
-def update_njt(
-    posterior,
-    rng: tf.random.Generator,
+@tf.function(jit_compile=True, reduce_retracing=True)
+def _E_bar_market_one_step(
+    posterior: LuPosteriorTF,
+    qjt_t: tf.Tensor,
+    q0t_t: tf.Tensor,
+    pjt_t: tf.Tensor,
+    wjt_t: tf.Tensor,
+    beta_p: tf.Tensor,
+    beta_w: tf.Tensor,
+    r: tf.Tensor,
+    E_bar_t: tf.Tensor,
+    njt_t: tf.Tensor,
+    k_E_bar: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    def target_log_prob_fn(E_bar_val: tf.Tensor) -> tf.Tensor:
+        return posterior.E_bar_block_logpost(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_val,
+            njt_t=njt_t,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_E_bar)
+    kernel_results = kernel.bootstrap_results(E_bar_t)
+    E_bar_t_new, kernel_results = kernel.one_step(
+        current_state=E_bar_t,
+        previous_kernel_results=kernel_results,
+        seed=seed,
+    )
+
+    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    return E_bar_t_new, accepted
+
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def E_bar_one_step(
+    posterior: LuPosteriorTF,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    pjt: tf.Tensor,
+    wjt: tf.Tensor,
+    beta_p: tf.Tensor,
+    beta_w: tf.Tensor,
+    r: tf.Tensor,
+    E_bar: tf.Tensor,
+    njt: tf.Tensor,
+    k_E_bar: tf.Tensor,
+    seed: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    seed = _normalize_seed(seed)
+    k_E_bar = tf.convert_to_tensor(k_E_bar, dtype=posterior.dtype)
+
+    T_t = tf.shape(E_bar)[0]
+    seeds = tf.random.experimental.stateless_split(seed, num=T_t)
+
+    ta_E_bar = tf.TensorArray(
+        dtype=posterior.dtype,
+        size=T_t,
+        element_shape=(),
+    ).unstack(E_bar)
+    accepted0 = tf.constant(0.0, dtype=posterior.dtype)
+
+    def cond(t, ta_in, accepted_sum):
+        del ta_in, accepted_sum
+        return t < T_t
+
+    def body(t, ta_in, accepted_sum):
+        E_bar_t_old = ta_in.read(t)
+
+        E_bar_t_new, accepted_t = _E_bar_market_one_step(
+            posterior=posterior,
+            qjt_t=qjt[t],
+            q0t_t=q0t[t],
+            pjt_t=pjt[t],
+            wjt_t=wjt[t],
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_t_old,
+            njt_t=njt[t],
+            k_E_bar=k_E_bar,
+            seed=seeds[t],
+        )
+
+        ta_out = ta_in.write(t, E_bar_t_new)
+        return t + 1, ta_out, accepted_sum + accepted_t
+
+    _, ta_E_bar, accepted_sum = tf.while_loop(
+        cond=cond,
+        body=body,
+        loop_vars=(
+            tf.constant(0, dtype=tf.int32),
+            ta_E_bar,
+            accepted0,
+        ),
+    )
+
+    E_bar_new = ta_E_bar.stack()
+    E_bar_new = tf.ensure_shape(E_bar_new, E_bar.shape)
+    accept_rate = accepted_sum / tf.cast(T_t, posterior.dtype)
+    return E_bar_new, accept_rate
+
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def _njt_market_one_step(
+    posterior: LuPosteriorTF,
+    qjt_t: tf.Tensor,
+    q0t_t: tf.Tensor,
+    pjt_t: tf.Tensor,
+    wjt_t: tf.Tensor,
+    beta_p: tf.Tensor,
+    beta_w: tf.Tensor,
+    r: tf.Tensor,
+    E_bar_t: tf.Tensor,
+    njt_t: tf.Tensor,
+    gamma_t: tf.Tensor,
+    k_njt: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    def target_log_prob_fn(njt_val: tf.Tensor) -> tf.Tensor:
+        return posterior.njt_block_logpost(
+            qjt_t=qjt_t,
+            q0t_t=q0t_t,
+            pjt_t=pjt_t,
+            wjt_t=wjt_t,
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar_t,
+            njt_t=njt_val,
+            gamma_t=gamma_t,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_njt)
+    kernel_results = kernel.bootstrap_results(njt_t)
+    njt_t_new, kernel_results = kernel.one_step(
+        current_state=njt_t,
+        previous_kernel_results=kernel_results,
+        seed=seed,
+    )
+
+    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    return njt_t_new, accepted
+
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def njt_one_step(
+    posterior: LuPosteriorTF,
     qjt: tf.Tensor,
     q0t: tf.Tensor,
     pjt: tf.Tensor,
@@ -184,125 +286,59 @@ def update_njt(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     gamma: tf.Tensor,
-    phi: tf.Tensor,
     k_njt: tf.Tensor,
-    ridge: tf.Tensor,
-):
-    """Sequential TMH sweep updating njt market-by-market.
-
-    The conditional density of njt given the rest depends on gamma (spike/slab
-    selection) but not on phi. `phi` is kept in the signature for call-site
-    uniformity.
-
-    Returns:
-        njt_new: tf.float64 tensor, shape (T, J).
-        accepted_count: tf.float64 scalar count of accepted market updates.
-    """
-    # Constants for the Normal prior terms on n_{t,j}.
-    two_pi = tf.constant(6.283185307179586, tf.float64)
-    log_two_pi = tf.math.log(two_pi)
-    log_T0_sq = tf.math.log(posterior.T0_sq)
-    log_T1_sq = tf.math.log(posterior.T1_sq)
+    seed: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    seed = _normalize_seed(seed)
+    k_njt = tf.convert_to_tensor(k_njt, dtype=posterior.dtype)
 
     T_t = tf.shape(njt)[0]
-    ta_n = tf.TensorArray(tf.float64, size=T_t).unstack(njt)
+    seeds = tf.random.experimental.stateless_split(seed, num=T_t)
 
-    def cond(t, ta_in, accepted_count):
+    ta_njt = tf.TensorArray(
+        dtype=posterior.dtype,
+        size=T_t,
+        element_shape=njt.shape[1:],
+    ).unstack(njt)
+    accepted0 = tf.constant(0.0, dtype=posterior.dtype)
+
+    def cond(t, ta_in, accepted_sum):
+        del ta_in, accepted_sum
         return t < T_t
 
-    def body(t, ta_in, accepted_count):
-        # Market-specific observed data.
-        qjt_t = qjt[t]
-        q0t_t = q0t[t]
-        pjt_t = pjt[t]
-        wjt_t = wjt[t]
+    def body(t, ta_in, accepted_sum):
+        njt_t_old = ta_in.read(t)
 
-        # Market-specific latent state.
-        E_bar_t = E_bar[t]
-        gamma_t = gamma[t]
-        njt_t = ta_in.read(t)
-
-        def logp_njt_t(njt_t_val: tf.Tensor) -> tf.Tensor:
-            # Market-t likelihood contribution.
-            ll = posterior.market_loglik(
-                qjt_t=qjt_t,
-                q0t_t=q0t_t,
-                pjt_t=pjt_t,
-                wjt_t=wjt_t,
-                beta_p=beta_p,
-                beta_w=beta_w,
-                r=r,
-                E_bar_t=E_bar_t,
-                njt_t=njt_t_val,
-            )
-
-            # Conditional prior for njt_t given gamma_t (independent across products).
-            var = gamma_t * posterior.T1_sq + (1.0 - gamma_t) * posterior.T0_sq
-            log_var = gamma_t * log_T1_sq + (1.0 - gamma_t) * log_T0_sq
-            lp_n = tf.reduce_sum(
-                -0.5 * (log_two_pi + log_var + tf.square(njt_t_val) / var)
-            )
-
-            return ll + lp_n
-
-        # One TMH update for the J-dimensional vector njt_t.
-        njt_new_t, accepted = tmh_step(
-            theta0=njt_t,
-            logp_fn=logp_njt_t,
-            ridge=ridge,
-            rng=rng,
-            k=k_njt,
+        njt_t_new, accepted_t = _njt_market_one_step(
+            posterior=posterior,
+            qjt_t=qjt[t],
+            q0t_t=q0t[t],
+            pjt_t=pjt[t],
+            wjt_t=wjt[t],
+            beta_p=beta_p,
+            beta_w=beta_w,
+            r=r,
+            E_bar_t=E_bar[t],
+            njt_t=njt_t_old,
+            gamma_t=gamma[t],
+            k_njt=k_njt,
+            seed=seeds[t],
         )
 
-        ta_out = ta_in.write(t, njt_new_t)
-        accepted_count = accepted_count + tf.cast(accepted, tf.float64)
-        return t + 1, ta_out, accepted_count
+        ta_out = ta_in.write(t, njt_t_new)
+        return t + 1, ta_out, accepted_sum + accepted_t
 
-    t0 = tf.constant(0, tf.int32)
-    accepted0 = tf.constant(0.0, tf.float64)
-
-    _, ta_out, accepted_count = tf.while_loop(
-        cond,
-        body,
-        loop_vars=(t0, ta_n, accepted0),
-        parallel_iterations=1,
+    _, ta_njt, accepted_sum = tf.while_loop(
+        cond=cond,
+        body=body,
+        loop_vars=(
+            tf.constant(0, dtype=tf.int32),
+            ta_njt,
+            accepted0,
+        ),
     )
 
-    return ta_out.stack(), accepted_count
-
-
-@tf.function(reduce_retracing=True)
-def update_gamma(
-    posterior,
-    rng: tf.random.Generator,
-    njt: tf.Tensor,
-    phi: tf.Tensor,
-):
-    """Gibbs update for gamma (shape (T, J)) given njt and phi."""
-    log_T0_sq = tf.math.log(posterior.T0_sq)
-    log_T1_sq = tf.math.log(posterior.T1_sq)
-
-    return gibbs_gamma(
-        njt_t=njt,
-        phi_t=phi[:, None],
-        T0_sq=posterior.T0_sq,
-        T1_sq=posterior.T1_sq,
-        log_T0_sq=log_T0_sq,
-        log_T1_sq=log_T1_sq,
-        rng=rng,
-    )
-
-
-@tf.function(reduce_retracing=True)
-def update_phi(
-    posterior,
-    rng: tf.random.Generator,
-    gamma: tf.Tensor,
-):
-    """Gibbs update for phi (shape (T,)) given gamma."""
-    return gibbs_phi(
-        gamma=gamma,
-        a_phi=posterior.a_phi,
-        b_phi=posterior.b_phi,
-        rng=rng,
-    )
+    njt_new = ta_njt.stack()
+    njt_new = tf.ensure_shape(njt_new, njt.shape)
+    accept_rate = accepted_sum / tf.cast(T_t, posterior.dtype)
+    return njt_new, accept_rate

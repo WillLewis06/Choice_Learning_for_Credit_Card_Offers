@@ -1,51 +1,28 @@
-"""
-Proposal-scale tuning for the Lu shrinkage sampler.
-
-This module tunes the scalar proposal scales (k_*) used by the MCMC kernels.
-Tuning is performed once before sampling and then frozen.
-
-Tuning objective:
-  - Run a short pilot chain of length `pilot_length`.
-  - Compute the average per-iteration acceptance rate.
-  - Adapt k multiplicatively until the acceptance rate lies in
-    [target_low, target_high], or until `max_rounds` is reached.
-
-Accepted conventions:
-  - step_fn(theta, k) -> (theta_new, acc_inc)
-  - acc_inc is a float64 scalar in [0,1]
-      * scalar proposals: 0/1
-      * batched proposals: mean acceptance across the batch for that step
-      * sweep proposals: mean acceptance across the sweep for that step
-
-The tuning code avoids mutating the sampler state. Each tuning run operates on
-local copies of the relevant parameter block with all other blocks held fixed.
-"""
-
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from dataclasses import replace
+from typing import Callable
 
 import tensorflow as tf
 
 from lu.shrinkage.lu_updates import (
-    update_E_bar,
-    update_beta,
-    update_njt,
-    update_r,
+    E_bar_one_step,
+    beta_one_step,
+    njt_one_step,
+    r_one_step,
 )
 
 
 def _lu_k0(d: tf.Tensor) -> tf.Tensor:
-    """Return the Lu default initialization k0 = 2.38 / sqrt(d)."""
     d = tf.cast(d, tf.float64)
     return tf.constant(2.38, tf.float64) / tf.sqrt(
         tf.maximum(d, tf.constant(1.0, tf.float64))
     )
 
 
-def tune_k(
+def _tune_block(
     theta0: tf.Tensor,
-    step_fn: Callable[[tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]],
+    step_fn: Callable[[tf.Tensor, tf.Tensor, tf.Tensor], tuple[tf.Tensor, tf.Tensor]],
     k0: tf.Tensor,
     pilot_length: int,
     target_low: float,
@@ -53,56 +30,68 @@ def tune_k(
     max_rounds: int,
     factor: float,
     name: str,
-) -> tf.Tensor:
-    """Tune a scalar proposal scale k for a single parameter block."""
-    k = tf.convert_to_tensor(k0)
+    seed: tf.Tensor | int | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
     theta = tf.convert_to_tensor(theta0)
+    k = tf.convert_to_tensor(k0, dtype=theta.dtype)
+
+    if seed is None:
+        seed = tf.random.uniform(
+            shape=(2,),
+            minval=0,
+            maxval=2**31 - 1,
+            dtype=tf.int32,
+        )
+    else:
+        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+        if seed.shape.rank == 0:
+            seed = tf.stack([seed, tf.constant(0, dtype=tf.int32)])
 
     pilot_length_t = tf.constant(pilot_length, dtype=tf.int32)
-    factor_t = tf.constant(factor, dtype=tf.float64)
+    factor_t = tf.constant(factor, dtype=theta.dtype)
+    target_low_t = tf.constant(target_low, dtype=theta.dtype)
+    target_high_t = tf.constant(target_high, dtype=theta.dtype)
 
     @tf.function(reduce_retracing=True)
-    def _pilot(theta_in: tf.Tensor, k_in: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        # Run `pilot_length` steps of step_fn and return (theta_end, acc_sum).
-        i0 = tf.constant(0, tf.int32)
-        acc0 = tf.constant(0.0, tf.float64)
+    def _pilot(
+        theta_in: tf.Tensor,
+        k_in: tf.Tensor,
+        seed_in: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        i0 = tf.constant(0, dtype=tf.int32)
+        acc0 = tf.constant(0.0, dtype=theta_in.dtype)
 
-        def cond(i, _theta_cur, _acc_sum):
+        def cond(i, _theta_cur, _acc_sum, _seed_cur):
+            del _theta_cur, _acc_sum, _seed_cur
             return i < pilot_length_t
 
-        def body(i, theta_cur, acc_sum):
-            theta_new, acc_inc = step_fn(theta_cur, k_in)
-            acc_sum = acc_sum + tf.cast(acc_inc, tf.float64)
-            return i + 1, theta_new, acc_sum
+        def body(i, theta_cur, acc_sum, seed_cur):
+            seeds = tf.random.experimental.stateless_split(seed_cur, num=2)
+            next_seed = seeds[0]
+            step_seed = seeds[1]
+            theta_new, acc_inc = step_fn(theta_cur, k_in, step_seed)
+            acc_sum = acc_sum + tf.cast(acc_inc, theta_in.dtype)
+            return i + 1, theta_new, acc_sum, next_seed
 
-        theta_inv_shape = theta_in.shape
-        if theta_inv_shape.rank is None:
-            theta_inv_shape = tf.TensorShape(None)
-        elif theta_inv_shape.rank > 0:
-            dims = theta_inv_shape.as_list()
-            dims[0] = None
-            theta_inv_shape = tf.TensorShape(dims)
-
-        _, theta_out, acc_sum = tf.while_loop(
-            cond,
-            body,
-            loop_vars=(i0, theta_in, acc0),
-            shape_invariants=(i0.shape, theta_inv_shape, acc0.shape),
+        _, theta_out, acc_sum, seed_out = tf.while_loop(
+            cond=cond,
+            body=body,
+            loop_vars=(i0, theta_in, acc0, seed_in),
             parallel_iterations=1,
         )
-
-        return theta_out, acc_sum
+        return theta_out, acc_sum, seed_out
 
     for round_id in range(max_rounds):
-        theta_end, acc_sum = _pilot(theta, k)
-        acc_rate = float((acc_sum / tf.cast(pilot_length_t, tf.float64)).numpy())
+        theta_end, acc_sum, seed = _pilot(theta, k, seed)
+        acc_rate = acc_sum / tf.cast(pilot_length_t, theta.dtype)
 
         k_before = float(k.numpy())
+        acc_rate_py = float(acc_rate.numpy())
 
-        if acc_rate < target_low:
+        if acc_rate < target_low_t:
             action = "shrink"
             k = k / factor_t
-        elif acc_rate > target_high:
+        elif acc_rate > target_high_t:
             action = "grow"
             k = k * factor_t
         else:
@@ -114,126 +103,94 @@ def tune_k(
             f"[LuShrinkage:Tune:{name}] "
             f"round={round_id} | "
             f"k={k_before:.4f}->{k_after:.4f} | "
-            f"acc={acc_rate:.3f} | "
+            f"acc={acc_rate_py:.3f} | "
             f"action={action}"
         )
 
-        # Continue from the pilot endpoint for more representative tuning rounds.
         theta = theta_end
 
         if action == "ok":
             break
 
-    return k
+    return k, theta
 
 
-def tune_shrinkage(shrink):
-    """Tune proposal scales for the Lu shrinkage sampler.
+def tune_shrinkage(
+    posterior,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    pjt: tf.Tensor,
+    wjt: tf.Tensor,
+    initial_state,
+    shrinkage_config,
+    pilot_length: int,
+    target_low: float,
+    target_high: float,
+    max_rounds: int,
+    factor: float,
+    seed: tf.Tensor | int | None = None,
+):
+    local_state = initial_state
 
-    Returns:
-        (k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned)
-    """
-    # Read tuning configuration from the estimator instance.
-    pilot_length = shrink.pilot_length
-    ridge_t = tf.constant(shrink.ridge, dtype=tf.float64)
-    target_low = shrink.target_low
-    target_high = shrink.target_high
-    max_rounds = shrink.max_rounds
-    factor_rw = shrink.factor_rw
-    factor_tmh = shrink.factor_tmh
-
-    # Derive a separate tuning RNG from the sampler RNG state, without advancing it.
-    state_sum = tf.reduce_sum(tf.cast(shrink.rng.state, tf.int64))
-    tune_seed_t = tf.math.floormod(
-        state_sum + tf.constant(104729, tf.int64),
-        tf.constant(2147483647, tf.int64),
-    )
-    tune_seed = int(tune_seed_t.numpy())
-    rng = tf.random.Generator.from_seed(tune_seed)
-
-    # Initial k's use Lu's dimension scaling heuristic.
-    k_r0 = _lu_k0(tf.constant(1.0, tf.float64))  # scalar
-    k_beta0 = _lu_k0(tf.constant(2.0, tf.float64))  # (beta_p, beta_w)
-    k_E_bar0 = _lu_k0(tf.constant(1.0, tf.float64))  # elementwise (T,)
-    k_njt0 = _lu_k0(tf.constant(shrink.J, tf.float64))  # one market's njt_t dimension
-
-    # Fixed data tensors.
-    qjt = shrink.qjt
-    q0t = shrink.q0t
-    pjt = shrink.pjt
-    wjt = shrink.wjt
-
-    # Snapshot current state. Non-target blocks are held fixed during each block's tuning.
-    beta_p0 = shrink.beta_p.read_value()
-    beta_w0 = shrink.beta_w.read_value()
-    r0 = shrink.r.read_value()
-    E_bar0 = shrink.E_bar.read_value()
-    njt0 = shrink.njt.read_value()
-    gamma0 = shrink.gamma.read_value()
-    phi0 = shrink.phi.read_value()
-
-    posterior = shrink.posterior
-
-    # ------------------------------------------------------------
-    # r: scalar RW-MH (acc_inc is 0/1)
-    # ------------------------------------------------------------
-    def step_r(theta_r: tf.Tensor, k_r: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        r_new, accepted = update_r(
-            posterior=posterior,
-            rng=rng,
-            qjt=qjt,
-            q0t=q0t,
-            pjt=pjt,
-            wjt=wjt,
-            beta_p=beta_p0,
-            beta_w=beta_w0,
-            r=theta_r,
-            E_bar=E_bar0,
-            njt=njt0,
-            k_r=k_r,
+    if seed is None:
+        seed = tf.random.uniform(
+            shape=(2,),
+            minval=0,
+            maxval=2**31 - 1,
+            dtype=tf.int32,
         )
-        return r_new, tf.cast(accepted, tf.float64)
+    else:
+        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+        if seed.shape.rank == 0:
+            seed = tf.stack([seed, tf.constant(0, dtype=tf.int32)])
 
-    k_r_tuned = tune_k(
-        theta0=r0,
-        step_fn=step_r,
-        k0=k_r0,
-        pilot_length=pilot_length,
-        target_low=target_low,
-        target_high=target_high,
-        max_rounds=max_rounds,
-        factor=factor_rw,
-        name="r",
+    block_seeds = tf.random.experimental.stateless_split(seed, num=4)
+
+    k_beta0 = (
+        tf.constant(shrinkage_config.k_beta, dtype=posterior.dtype)
+        if float(shrinkage_config.k_beta) > 0.0
+        else tf.cast(_lu_k0(tf.constant(2.0, dtype=tf.float64)), posterior.dtype)
+    )
+    k_r0 = (
+        tf.constant(shrinkage_config.k_r, dtype=posterior.dtype)
+        if float(shrinkage_config.k_r) > 0.0
+        else tf.cast(_lu_k0(tf.constant(1.0, dtype=tf.float64)), posterior.dtype)
+    )
+    k_E_bar0 = (
+        tf.constant(shrinkage_config.k_E_bar, dtype=posterior.dtype)
+        if float(shrinkage_config.k_E_bar) > 0.0
+        else tf.cast(_lu_k0(tf.constant(1.0, dtype=tf.float64)), posterior.dtype)
+    )
+    k_njt0 = (
+        tf.constant(shrinkage_config.k_njt, dtype=posterior.dtype)
+        if float(shrinkage_config.k_njt) > 0.0
+        else tf.cast(_lu_k0(tf.cast(tf.shape(pjt)[1], tf.float64)), posterior.dtype)
     )
 
-    # ------------------------------------------------------------
-    # beta: 2D TMH (acc_inc is 0/1)
-    # ------------------------------------------------------------
+    beta_vec0 = tf.stack([local_state.beta_p, local_state.beta_w], axis=0)
+
     def step_beta(
-        theta_beta: tf.Tensor, k_beta: tf.Tensor
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
-        bp0 = theta_beta[0]
-        bw0 = theta_beta[1]
-        bp_new, bw_new, accepted = update_beta(
+        theta_beta: tf.Tensor,
+        k_beta: tf.Tensor,
+        step_seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        beta_p_new, beta_w_new, accepted = beta_one_step(
             posterior=posterior,
-            rng=rng,
             qjt=qjt,
             q0t=q0t,
             pjt=pjt,
             wjt=wjt,
-            beta_p=bp0,
-            beta_w=bw0,
-            r=r0,
-            E_bar=E_bar0,
-            njt=njt0,
+            beta_p=theta_beta[0],
+            beta_w=theta_beta[1],
+            r=local_state.r,
+            E_bar=local_state.E_bar,
+            njt=local_state.njt,
             k_beta=k_beta,
-            ridge=ridge_t,
+            seed=step_seed,
         )
-        theta_new = tf.stack([bp_new, bw_new], axis=0)
-        return theta_new, tf.cast(accepted, tf.float64)
+        return tf.stack([beta_p_new, beta_w_new], axis=0), accepted
 
-    beta_vec0 = tf.stack([beta_p0, beta_w0], axis=0)
-    k_beta_tuned = tune_k(
+    k_beta_tuned, beta_vec_end = _tune_block(
         theta0=beta_vec0,
         step_fn=step_beta,
         k0=k_beta0,
@@ -241,82 +198,124 @@ def tune_shrinkage(shrink):
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_tmh,
+        factor=factor,
         name="beta",
+        seed=block_seeds[0],
+    )
+    local_state = local_state._replace(
+        beta_p=beta_vec_end[0],
+        beta_w=beta_vec_end[1],
     )
 
-    # ------------------------------------------------------------
-    # E_bar: batched RW-MH over (T,) (acc_inc is mean accepted across markets)
-    # ------------------------------------------------------------
-    def step_E_bar(
-        theta_E_bar: tf.Tensor, k_E_bar: tf.Tensor
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
-        E_bar_new, accepted_vec = update_E_bar(
+    def step_r(
+        theta_r: tf.Tensor,
+        k_r: tf.Tensor,
+        step_seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        r_new, accepted = r_one_step(
             posterior=posterior,
-            rng=rng,
             qjt=qjt,
             q0t=q0t,
             pjt=pjt,
             wjt=wjt,
-            beta_p=beta_p0,
-            beta_w=beta_w0,
-            r=r0,
-            E_bar=theta_E_bar,
-            njt=njt0,
-            gamma=gamma0,
-            phi=phi0,
-            k_E_bar=k_E_bar,
+            beta_p=local_state.beta_p,
+            beta_w=local_state.beta_w,
+            r=theta_r,
+            E_bar=local_state.E_bar,
+            njt=local_state.njt,
+            k_r=k_r,
+            seed=step_seed,
         )
-        acc_inc = tf.reduce_mean(tf.cast(accepted_vec, tf.float64))
-        return E_bar_new, acc_inc
+        return r_new, accepted
 
-    k_E_bar_tuned = tune_k(
-        theta0=E_bar0,
+    k_r_tuned, r_end = _tune_block(
+        theta0=local_state.r,
+        step_fn=step_r,
+        k0=k_r0,
+        pilot_length=pilot_length,
+        target_low=target_low,
+        target_high=target_high,
+        max_rounds=max_rounds,
+        factor=factor,
+        name="r",
+        seed=block_seeds[1],
+    )
+    local_state = local_state._replace(r=r_end)
+
+    def step_E_bar(
+        theta_E_bar: tf.Tensor,
+        k_E_bar: tf.Tensor,
+        step_seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        E_bar_new, accepted = E_bar_one_step(
+            posterior=posterior,
+            qjt=qjt,
+            q0t=q0t,
+            pjt=pjt,
+            wjt=wjt,
+            beta_p=local_state.beta_p,
+            beta_w=local_state.beta_w,
+            r=local_state.r,
+            E_bar=theta_E_bar,
+            njt=local_state.njt,
+            k_E_bar=k_E_bar,
+            seed=step_seed,
+        )
+        return E_bar_new, accepted
+
+    k_E_bar_tuned, E_bar_end = _tune_block(
+        theta0=local_state.E_bar,
         step_fn=step_E_bar,
         k0=k_E_bar0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_rw,
+        factor=factor,
         name="E_bar",
+        seed=block_seeds[2],
     )
+    local_state = local_state._replace(E_bar=E_bar_end)
 
-    # ------------------------------------------------------------
-    # njt: TMH sweep across markets (acc_inc is mean accepted across markets)
-    # ------------------------------------------------------------
-    def step_njt(theta_njt: tf.Tensor, k_njt: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        njt_new, acc_sum = update_njt(
+    def step_njt(
+        theta_njt: tf.Tensor,
+        k_njt: tf.Tensor,
+        step_seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        njt_new, accepted = njt_one_step(
             posterior=posterior,
-            rng=rng,
             qjt=qjt,
             q0t=q0t,
             pjt=pjt,
             wjt=wjt,
-            beta_p=beta_p0,
-            beta_w=beta_w0,
-            r=r0,
-            E_bar=E_bar0,
+            beta_p=local_state.beta_p,
+            beta_w=local_state.beta_w,
+            r=local_state.r,
+            E_bar=local_state.E_bar,
             njt=theta_njt,
-            gamma=gamma0,
-            phi=phi0,
+            gamma=local_state.gamma,
             k_njt=k_njt,
-            ridge=ridge_t,
+            seed=step_seed,
         )
-        T_f = tf.cast(tf.shape(theta_njt)[0], tf.float64)
-        acc_inc = acc_sum / tf.maximum(T_f, tf.constant(1.0, tf.float64))
-        return njt_new, acc_inc
+        return njt_new, accepted
 
-    k_njt_tuned = tune_k(
-        theta0=njt0,
+    k_njt_tuned, _ = _tune_block(
+        theta0=local_state.njt,
         step_fn=step_njt,
         k0=k_njt0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_tmh,
+        factor=factor,
         name="njt",
+        seed=block_seeds[3],
     )
 
-    return k_r_tuned, k_E_bar_tuned, k_beta_tuned, k_njt_tuned
+    return replace(
+        shrinkage_config,
+        k_beta=float(k_beta_tuned.numpy()),
+        k_r=float(k_r_tuned.numpy()),
+        k_E_bar=float(k_E_bar_tuned.numpy()),
+        k_njt=float(k_njt_tuned.numpy()),
+    )

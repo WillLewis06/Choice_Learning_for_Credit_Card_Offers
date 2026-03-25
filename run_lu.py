@@ -1,17 +1,3 @@
-"""
-End-to-end simulation harness for comparing BLP vs Lu shrinkage on synthetic markets.
-
-This script:
-  1) Generates synthetic market data under multiple DGP variants.
-  2) Fits two BLP estimators (strong-IV and weak-IV).
-  3) Runs the Lu shrinkage sampler using tfp.mcmc.
-  4) Compares recovered shocks and sigma against ground truth.
-
-All estimator configuration is set in this orchestration layer and passed down as
-config objects. The shrinkage sampler is treated as a pure run_chain(...) +
-summarize_samples(...) pipeline.
-"""
-
 from __future__ import annotations
 
 import os
@@ -48,16 +34,12 @@ def _to_numpy_results(results: dict) -> dict:
 
 
 def main() -> None:
-    """Run synthetic Lu-style markets and compare estimators across DGP variants."""
     # -------------------------------------------------------------------------
-    # Experiment dimensions and true structural parameters used in the simulator
+    # Experiment dimensions and true structural parameters
     # -------------------------------------------------------------------------
     T, J, N = 25, 15, 1000
     beta_p_true, beta_w_true, sigma_true = -1.0, 0.5, 1.5
     seed = 123
-
-    # Number of simulation draws used inside estimators for RC integration.
-    # (Aligned with Lu(25) Section 4 setting R0=200.)
     n_draws = 200
 
     # -------------------------------------------------------------------------
@@ -82,6 +64,9 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # Lu shrinkage posterior configuration
+    #
+    # a_phi and b_phi define the collapsed Beta-Binomial sparsity prior over
+    # gamma. phi itself is integrated out and is not sampled.
     # -------------------------------------------------------------------------
     posterior_config = LuPosteriorConfig(
         n_draws=n_draws,
@@ -104,21 +89,39 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # Lu shrinkage chain configuration
+    #
+    # run_chain(...) now owns the full shrinkage workflow:
+    #   - validate external inputs
+    #   - build the posterior and initial state
+    #   - run a pilot tuning phase for the four continuous proposal scales
+    #   - build the hybrid kernel using the tuned scales
+    #   - run the main jit-compiled chunked MCMC chain
+    #
+    # The k_* values below are the initial proposal scales supplied to tuning.
     # -------------------------------------------------------------------------
     shrinkage_config = LuShrinkageConfig(
-        num_results=500,
+        num_results=2000,
         num_burnin_steps=0,
-        rw_scale=0.1,
+        chunk_size=250,
+        k_beta=0.05,
+        k_r=0.05,
+        k_E_bar=0.05,
+        k_njt=0.02,
+        pilot_length=50,
+        target_low=0.2,
+        target_high=0.4,
+        max_rounds=10,
+        factor=1.5,
     )
 
     # -------------------------------------------------------------------------
-    # Loop over DGP variants. Each variant changes sparsity and endogeneity.
+    # Loop over DGP variants
     # -------------------------------------------------------------------------
     for dgp_type in (1, 2, 3, 4):
         print(f"=== DGP {dgp_type} ===")
 
         # ---------------------------------------------------------------------
-        # Step 1: Generate market-level primitives and construct prices.
+        # Step 1: Generate market-level primitives and construct prices
         # ---------------------------------------------------------------------
         wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
             T=T,
@@ -132,7 +135,7 @@ def main() -> None:
         E_true = njt
 
         # ---------------------------------------------------------------------
-        # Step 2: Simulate utilities and aggregate to market outcomes.
+        # Step 2: Simulate utilities and aggregate to market outcomes
         # ---------------------------------------------------------------------
         model = BasicLuChoiceModel(
             N=N,
@@ -148,7 +151,7 @@ def main() -> None:
         print("=== Market generated ===")
 
         # ---------------------------------------------------------------------
-        # Step 3: Fit BLP under strong and weak instrument sets.
+        # Step 3: Fit BLP under strong and weak instrument sets
         # ---------------------------------------------------------------------
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
@@ -159,11 +162,10 @@ def main() -> None:
             Zjt=Zjt_strong,
             config=blp_config,
         )
-        """
-        print("=== Strong IVs and Estimator built ===")
+        print("=== Strong IVs and estimator built ===")
         blp_strong.fit()
         res_strong = blp_strong.get_results()
-        print("=== Strong BLP Estimator fitted ===")
+        print("=== Strong BLP estimator fitted ===")
 
         Zjt_weak = build_weak_IVs(wjt=wjt)
         blp_weak = BLPEstimator(
@@ -174,18 +176,15 @@ def main() -> None:
             Zjt=Zjt_weak,
             config=blp_config,
         )
-        print("=== Weak IVs and Estimator built ===")
+        print("=== Weak IVs and estimator built ===")
         blp_weak.fit()
         res_weak = blp_weak.get_results()
-        print("=== Weak BLP Estimator fitted ===")
-        """
+        print("=== Weak BLP estimator fitted ===")
+
         # ---------------------------------------------------------------------
-        # Step 4: Run the Lu shrinkage sampler.
+        # Step 4: Run the Lu shrinkage workflow
         #
-        # The sampler uses:
-        #   - a built-in TFP kernel for the continuous block
-        #   - Gibbs updates for gamma and phi
-        #   - tfp.mcmc.sample_chain as the top-level driver
+        # run_chain(...) now performs validation -> tuning -> MCMC internally.
         # ---------------------------------------------------------------------
         shrinkage_samples = run_chain(
             pjt=tf.convert_to_tensor(pjt, dtype=tf.float64),
@@ -198,9 +197,9 @@ def main() -> None:
         )
         res_shrink = _to_numpy_results(summarize_samples(shrinkage_samples))
         print("=== Shrinkage sampler run ===")
-        """
+
         # ---------------------------------------------------------------------
-        # Step 5: Compare estimates to ground truth.
+        # Step 5: Compare estimates to ground truth
         # ---------------------------------------------------------------------
         print("=== Strong BLP Estimator Results ===")
         print_assessment(
@@ -219,7 +218,17 @@ def main() -> None:
             sigma_true=sigma_true,
             support_true=support_true,
         )
-        """
+
+        # ---------------------------------------------------------------------
+        # Step 6: Compare shrinkage estimates to ground truth
+        #
+        # This assessment is currently against:
+        #   - int_true = mean(E_bar_t)
+        #   - E_true = njt
+        #
+        # So the shock comparison here is against the product-level deviation njt,
+        # not the full shock Ejt = E_bar_t + njt.
+        # ---------------------------------------------------------------------
         print("=== Shrinkage Estimator Results ===")
         print_assessment(
             results=res_shrink,

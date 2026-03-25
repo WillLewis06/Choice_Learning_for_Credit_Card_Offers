@@ -6,59 +6,74 @@ import tensorflow as tf
 @tf.function(jit_compile=True, reduce_retracing=True)
 def gibbs_gamma(
     njt: tf.Tensor,
-    phi: tf.Tensor,
-    T0_sq: tf.Tensor,
-    T1_sq: tf.Tensor,
-    eps: tf.Tensor,
-    seed: tf.Tensor,
-) -> tf.Tensor:
-    phi = tf.clip_by_value(phi, eps, tf.cast(1.0, phi.dtype) - eps)
-    phi_b = phi[:, None]
-
-    logp0 = -0.5 * tf.square(njt) / T0_sq - 0.5 * tf.math.log(T0_sq)
-    logp1 = -0.5 * tf.square(njt) / T1_sq - 0.5 * tf.math.log(T1_sq)
-
-    logit_prob1 = tf.math.log(phi_b) - tf.math.log1p(-phi_b) + (logp1 - logp0)
-    prob1 = tf.math.sigmoid(logit_prob1)
-
-    u = tf.random.stateless_uniform(
-        shape=tf.shape(prob1),
-        seed=seed,
-        dtype=njt.dtype,
-    )
-    return tf.cast(u < prob1, njt.dtype)
-
-
-@tf.function(jit_compile=True, reduce_retracing=True)
-def gibbs_phi(
     gamma: tf.Tensor,
     a_phi: tf.Tensor,
     b_phi: tf.Tensor,
-    eps: tf.Tensor,
+    T0_sq: tf.Tensor,
+    T1_sq: tf.Tensor,
     seed: tf.Tensor,
 ) -> tf.Tensor:
-    s = tf.reduce_sum(gamma, axis=-1)
-    J = tf.cast(tf.shape(gamma)[-1], gamma.dtype)
+    J_int = tf.shape(gamma)[-1]
+    J = tf.cast(J_int, gamma.dtype)
 
-    a_post = a_phi + s
-    b_post = b_phi + (J - s)
+    log_T0_sq = tf.math.log(T0_sq)
+    log_T1_sq = tf.math.log(T1_sq)
 
-    seeds = tf.random.experimental.stateless_split(seed, num=2)
-    seed_x = seeds[0]
-    seed_y = seeds[1]
+    gamma_curr = gamma
+    s_curr = tf.reduce_sum(gamma_curr, axis=-1)
 
-    x = tf.random.stateless_gamma(
-        shape=tf.shape(s),
-        seed=seed_x,
-        alpha=a_post,
-        dtype=gamma.dtype,
+    def cond(j, seed_curr, gamma_curr, s_curr):
+        del seed_curr, gamma_curr, s_curr
+        return j < J_int
+
+    def body(j, seed_curr, gamma_curr, s_curr):
+        seeds = tf.random.experimental.stateless_split(seed_curr, num=2)
+        next_seed = seeds[0]
+        draw_seed = seeds[1]
+
+        gamma_j = gamma_curr[:, j]
+        njt_j = njt[:, j]
+
+        s_minus_j = s_curr - gamma_j
+
+        logp0 = (
+            tf.math.log(b_phi + (J - 1.0 - s_minus_j))
+            - 0.5 * tf.square(njt_j) / T0_sq
+            - 0.5 * log_T0_sq
+        )
+        logp1 = (
+            tf.math.log(a_phi + s_minus_j)
+            - 0.5 * tf.square(njt_j) / T1_sq
+            - 0.5 * log_T1_sq
+        )
+
+        m = tf.maximum(logp0, logp1)
+        prob1 = tf.exp(logp1 - m) / (tf.exp(logp0 - m) + tf.exp(logp1 - m))
+
+        u = tf.random.stateless_uniform(
+            shape=tf.shape(prob1),
+            seed=draw_seed,
+            dtype=gamma.dtype,
+        )
+        new_gamma_j = tf.cast(u < prob1, gamma.dtype)
+
+        one_hot_j = tf.one_hot(j, depth=J_int, dtype=gamma.dtype)
+        gamma_next = (
+            gamma_curr * (1.0 - one_hot_j[None, :])
+            + new_gamma_j[:, None] * one_hot_j[None, :]
+        )
+        s_next = s_minus_j + new_gamma_j
+
+        return j + 1, next_seed, gamma_next, s_next
+
+    _, _, gamma_out, _ = tf.while_loop(
+        cond,
+        body,
+        loop_vars=(
+            tf.constant(0, dtype=J_int.dtype),
+            seed,
+            gamma_curr,
+            s_curr,
+        ),
     )
-    y = tf.random.stateless_gamma(
-        shape=tf.shape(s),
-        seed=seed_y,
-        alpha=b_post,
-        dtype=gamma.dtype,
-    )
-
-    phi = x / (x + y)
-    return tf.clip_by_value(phi, eps, tf.cast(1.0, phi.dtype) - eps)
+    return gamma_out

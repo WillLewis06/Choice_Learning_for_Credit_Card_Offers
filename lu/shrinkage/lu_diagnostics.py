@@ -1,128 +1,194 @@
-"""
-Diagnostics and reporting for the Lu shrinkage sampler.
-
-Responsibilities:
-  - Maintain running sums used to compute posterior means after sampling.
-  - Print a compact, TF-compatible progress line at the end of each iteration.
-
-Every iteration is accumulated by design. Burn-in and thinning are not implemented.
-"""
-
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Sequence
 
 import tensorflow as tf
 
 
-class _ShrinkageState(Protocol):
-    """Minimal sampler interface required by diagnostics/reporting."""
-
+@dataclass(frozen=True)
+class LuChunkTrace:
     beta_p: tf.Tensor
     beta_w: tf.Tensor
-    r: tf.Tensor
-    E_bar: tf.Tensor
-    njt: tf.Tensor
-    phi: tf.Tensor
-    gamma: tf.Tensor
+    sigma: tf.Tensor
+    mean_E_bar: tf.Tensor
+    norm_E_bar: tf.Tensor
+    norm_njt: tf.Tensor
+    gamma_active_share: tf.Tensor
+    joint_logpost: tf.Tensor
+    beta_accept: tf.Tensor
+    r_accept: tf.Tensor
+    E_bar_accept: tf.Tensor
+    njt_accept: tf.Tensor
 
 
-def format4(x: tf.Tensor) -> tf.Tensor:
-    """Format tensor values as strings with 4 decimal places (no scientific notation)."""
-    return tf.strings.as_string(x, precision=4, scientific=False)
+@dataclass(frozen=True)
+class LuChunkSummary:
+    chunk_idx: int
+    total_chunks: int | None
+
+    beta_p_last: float
+    beta_w_last: float
+    sigma_last: float
+    mean_E_bar_last: float
+    norm_E_bar_last: float
+    norm_njt_last: float
+    gamma_active_share_last: float
+    joint_logpost_last: float
+
+    beta_accept_mean: float
+    r_accept_mean: float
+    E_bar_accept_mean: float
+    njt_accept_mean: float
 
 
-def report_iteration_progress(shrink: _ShrinkageState, it: tf.Tensor) -> None:
-    """Print a one-line summary of the current MCMC state via tf.print."""
-    sigma = tf.exp(shrink.r)
+@dataclass(frozen=True)
+class LuRunSummary:
+    n_chunks: int
 
-    # Dimension-stable scale summaries (RMS).
-    E_bar_rms = tf.sqrt(tf.reduce_mean(tf.square(shrink.E_bar)))
-    njt_rms = tf.sqrt(tf.reduce_mean(tf.square(shrink.njt)))
+    beta_p_last: float
+    beta_w_last: float
+    sigma_last: float
+    mean_E_bar_last: float
+    norm_E_bar_last: float
+    norm_njt_last: float
+    gamma_active_share_last: float
+    joint_logpost_last: float
 
-    gamma_mean = tf.reduce_mean(shrink.gamma)
-    phi_mean = tf.reduce_mean(shrink.phi)
+    beta_accept_mean: float
+    r_accept_mean: float
+    E_bar_accept_mean: float
+    njt_accept_mean: float
 
-    tf.print(
-        "[LuShrinkage] it=",
-        it,
-        " | beta_p=",
-        format4(shrink.beta_p),
-        ", beta_w=",
-        format4(shrink.beta_w),
-        ", sigma=",
-        format4(sigma),
-        " | E_bar_rms=",
-        format4(E_bar_rms),
-        ", njt_rms=",
-        format4(njt_rms),
-        " | mean(gamma)=",
-        format4(gamma_mean),
-        ", mean(phi)=",
-        format4(phi_mean),
+
+def _scalar_last(x: tf.Tensor) -> float:
+    x_t = tf.convert_to_tensor(x)
+    x_flat = tf.reshape(tf.cast(x_t, tf.float64), [-1])
+    return float(x_flat[-1].numpy())
+
+
+def _scalar_mean(x: tf.Tensor) -> float:
+    x_t = tf.convert_to_tensor(x)
+    x_t = tf.cast(x_t, tf.float64)
+    return float(tf.reduce_mean(x_t).numpy())
+
+
+def format_scalar(x: float, precision: int = 4) -> str:
+    return f"{x:.{precision}f}"
+
+
+def summarize_chunk_trace(
+    trace: LuChunkTrace,
+    chunk_idx: int,
+    total_chunks: int | None = None,
+) -> LuChunkSummary:
+    return LuChunkSummary(
+        chunk_idx=chunk_idx,
+        total_chunks=total_chunks,
+        beta_p_last=_scalar_last(trace.beta_p),
+        beta_w_last=_scalar_last(trace.beta_w),
+        sigma_last=_scalar_last(trace.sigma),
+        mean_E_bar_last=_scalar_last(trace.mean_E_bar),
+        norm_E_bar_last=_scalar_last(trace.norm_E_bar),
+        norm_njt_last=_scalar_last(trace.norm_njt),
+        gamma_active_share_last=_scalar_last(trace.gamma_active_share),
+        joint_logpost_last=_scalar_last(trace.joint_logpost),
+        beta_accept_mean=_scalar_mean(trace.beta_accept),
+        r_accept_mean=_scalar_mean(trace.r_accept),
+        E_bar_accept_mean=_scalar_mean(trace.E_bar_accept),
+        njt_accept_mean=_scalar_mean(trace.njt_accept),
     )
 
 
-class LuShrinkageDiagnostics:
-    """Running-sum diagnostics for posterior means and iteration reporting."""
+def format_chunk_progress_line(summary: LuChunkSummary) -> str:
+    if summary.total_chunks is None:
+        chunk_label = f"chunk={summary.chunk_idx}"
+    else:
+        chunk_label = f"chunk={summary.chunk_idx}/{summary.total_chunks}"
 
-    def __init__(self, T: int, J: int):
-        """Create zero-initialized running sums for a (T, J) problem."""
-        self.T = T
-        self.J = J
+    return (
+        f"[LuShrinkage] {chunk_label}"
+        f" | beta_p={format_scalar(summary.beta_p_last)}"
+        f" beta_w={format_scalar(summary.beta_w_last)}"
+        f" sigma={format_scalar(summary.sigma_last)}"
+        f" | mean_E_bar={format_scalar(summary.mean_E_bar_last)}"
+        f" norm_E_bar={format_scalar(summary.norm_E_bar_last)}"
+        f" norm_njt={format_scalar(summary.norm_njt_last)}"
+        f" gamma_share={format_scalar(summary.gamma_active_share_last)}"
+        f" | logpost={format_scalar(summary.joint_logpost_last)}"
+        f" | acc_beta={format_scalar(summary.beta_accept_mean)}"
+        f" acc_r={format_scalar(summary.r_accept_mean)}"
+        f" acc_E_bar={format_scalar(summary.E_bar_accept_mean)}"
+        f" acc_njt={format_scalar(summary.njt_accept_mean)}"
+    )
 
-        # Mutable TF state so accumulation works inside tf.function.
-        self.saved = tf.Variable(0, dtype=tf.int64, trainable=False)
 
-        self.sum_beta = tf.Variable(tf.zeros([2], dtype=tf.float64), trainable=False)
-        self.sum_sigma = tf.Variable(tf.constant(0.0, tf.float64), trainable=False)
+def report_chunk_progress(
+    trace: LuChunkTrace,
+    chunk_idx: int,
+    total_chunks: int | None = None,
+) -> LuChunkSummary:
+    summary = summarize_chunk_trace(
+        trace=trace,
+        chunk_idx=chunk_idx,
+        total_chunks=total_chunks,
+    )
+    print(format_chunk_progress_line(summary))
+    return summary
 
-        self.sum_E_bar = tf.Variable(tf.zeros([self.T], tf.float64), trainable=False)
-        self.sum_njt = tf.Variable(
-            tf.zeros([self.T, self.J], tf.float64), trainable=False
-        )
 
-        self.sum_phi = tf.Variable(tf.zeros([self.T], tf.float64), trainable=False)
-        self.sum_gamma = tf.Variable(
-            tf.zeros([self.T, self.J], tf.float64), trainable=False
-        )
+def summarize_all_chunks(
+    summaries: Sequence[LuChunkSummary],
+) -> LuRunSummary:
+    if len(summaries) == 0:
+        raise ValueError("summaries must be non-empty.")
 
-    def _accumulate_draw(self, shrink: _ShrinkageState) -> None:
-        """Add the current sampler state to the running sums."""
-        self.saved.assign_add(1)
-        self.sum_beta.assign_add(tf.stack([shrink.beta_p, shrink.beta_w], axis=0))
-        self.sum_sigma.assign_add(tf.exp(shrink.r))
+    last = summaries[-1]
 
-        self.sum_E_bar.assign_add(shrink.E_bar)
-        self.sum_njt.assign_add(shrink.njt)
+    beta_accept_mean = sum(s.beta_accept_mean for s in summaries) / len(summaries)
+    r_accept_mean = sum(s.r_accept_mean for s in summaries) / len(summaries)
+    E_bar_accept_mean = sum(s.E_bar_accept_mean for s in summaries) / len(summaries)
+    njt_accept_mean = sum(s.njt_accept_mean for s in summaries) / len(summaries)
 
-        self.sum_phi.assign_add(shrink.phi)
-        self.sum_gamma.assign_add(shrink.gamma)
+    return LuRunSummary(
+        n_chunks=len(summaries),
+        beta_p_last=last.beta_p_last,
+        beta_w_last=last.beta_w_last,
+        sigma_last=last.sigma_last,
+        mean_E_bar_last=last.mean_E_bar_last,
+        norm_E_bar_last=last.norm_E_bar_last,
+        norm_njt_last=last.norm_njt_last,
+        gamma_active_share_last=last.gamma_active_share_last,
+        joint_logpost_last=last.joint_logpost_last,
+        beta_accept_mean=beta_accept_mean,
+        r_accept_mean=r_accept_mean,
+        E_bar_accept_mean=E_bar_accept_mean,
+        njt_accept_mean=njt_accept_mean,
+    )
 
-    @tf.function(reduce_retracing=True)
-    def step(self, shrink: _ShrinkageState, it: tf.Tensor) -> None:
-        """Accumulate one draw and print a progress line."""
-        self._accumulate_draw(shrink)
-        report_iteration_progress(shrink, it)
 
-    def get_sums(
-        self,
-    ) -> tuple[
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-    ]:
-        """Return raw running sums as tensors for downstream aggregation."""
-        return (
-            self.saved.read_value(),
-            self.sum_beta.read_value(),
-            self.sum_sigma.read_value(),
-            self.sum_E_bar.read_value(),
-            self.sum_njt.read_value(),
-            self.sum_phi.read_value(),
-            self.sum_gamma.read_value(),
-        )
+def format_run_summary_line(summary: LuRunSummary) -> str:
+    return (
+        f"[LuShrinkage] final"
+        f" | chunks={summary.n_chunks}"
+        f" | beta_p={format_scalar(summary.beta_p_last)}"
+        f" beta_w={format_scalar(summary.beta_w_last)}"
+        f" sigma={format_scalar(summary.sigma_last)}"
+        f" | mean_E_bar={format_scalar(summary.mean_E_bar_last)}"
+        f" norm_E_bar={format_scalar(summary.norm_E_bar_last)}"
+        f" norm_njt={format_scalar(summary.norm_njt_last)}"
+        f" gamma_share={format_scalar(summary.gamma_active_share_last)}"
+        f" | logpost={format_scalar(summary.joint_logpost_last)}"
+        f" | mean_acc_beta={format_scalar(summary.beta_accept_mean)}"
+        f" mean_acc_r={format_scalar(summary.r_accept_mean)}"
+        f" mean_acc_E_bar={format_scalar(summary.E_bar_accept_mean)}"
+        f" mean_acc_njt={format_scalar(summary.njt_accept_mean)}"
+    )
+
+
+def report_run_summary(
+    summaries: Sequence[LuChunkSummary],
+) -> LuRunSummary:
+    summary = summarize_all_chunks(summaries=summaries)
+    print(format_run_summary_line(summary))
+    return summary
