@@ -1,3 +1,5 @@
+"""One-step MCMC updates for the Lu shrinkage sampler."""
+
 from __future__ import annotations
 
 import tensorflow as tf
@@ -5,34 +7,17 @@ import tensorflow_probability as tfp
 
 from lu.shrinkage.lu_posterior import LuPosteriorTF
 
-tfmcmc = tfp.mcmc
-
-
-def _normalize_seed(seed: tf.Tensor | None) -> tf.Tensor:
-    if seed is None:
-        return tf.constant([0, 0], dtype=tf.int32)
-
-    seed_t = tf.convert_to_tensor(seed, dtype=tf.int32)
-    if seed_t.shape.rank == 0:
-        return tf.stack([seed_t, tf.constant(0, dtype=tf.int32)])
-    return seed_t
-
 
 def _make_rw_kernel(
     target_log_prob_fn,
     scale: tf.Tensor,
-) -> tfmcmc.RandomWalkMetropolis:
-    return tfmcmc.RandomWalkMetropolis(
+) -> tfp.mcmc.RandomWalkMetropolis:
+    """Construct a random-walk Metropolis kernel with Gaussian proposals."""
+
+    return tfp.mcmc.RandomWalkMetropolis(
         target_log_prob_fn=target_log_prob_fn,
-        new_state_fn=tfmcmc.random_walk_normal_fn(scale=scale),
+        new_state_fn=tfp.mcmc.random_walk_normal_fn(scale=scale),
     )
-
-
-def _accepted_float(
-    kernel_results,
-    dtype: tf.dtypes.DType,
-) -> tf.Tensor:
-    return tf.cast(kernel_results.is_accepted, dtype)
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -48,12 +33,13 @@ def beta_one_step(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     k_beta: tf.Tensor,
-    seed: tf.Tensor | None = None,
+    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    seed = _normalize_seed(seed)
-    k_beta = tf.convert_to_tensor(k_beta, dtype=posterior.dtype)
+    """Perform one Metropolis update for the joint beta block."""
 
     def target_log_prob_fn(beta: tf.Tensor) -> tf.Tensor:
+        """Evaluate the beta-block log posterior at the proposed value."""
+
         return posterior.beta_block_logpost(
             qjt=qjt,
             q0t=q0t,
@@ -66,6 +52,7 @@ def beta_one_step(
             njt=njt,
         )
 
+    # Build the joint beta update and apply one proposal step.
     kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta)
     beta0 = tf.stack([beta_p, beta_w])
     kernel_results = kernel.bootstrap_results(beta0)
@@ -75,7 +62,8 @@ def beta_one_step(
         seed=seed,
     )
 
-    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    # Record whether the block proposal was accepted.
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
     return beta_new[0], beta_new[1], accepted
 
 
@@ -92,12 +80,13 @@ def r_one_step(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     k_r: tf.Tensor,
-    seed: tf.Tensor | None = None,
+    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    seed = _normalize_seed(seed)
-    k_r = tf.convert_to_tensor(k_r, dtype=posterior.dtype)
+    """Perform one Metropolis update for r."""
 
     def target_log_prob_fn(r_val: tf.Tensor) -> tf.Tensor:
+        """Evaluate the r-block log posterior at the proposed value."""
+
         return posterior.r_block_logpost(
             qjt=qjt,
             q0t=q0t,
@@ -110,6 +99,7 @@ def r_one_step(
             njt=njt,
         )
 
+    # Build the r update and apply one proposal step.
     kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_r)
     kernel_results = kernel.bootstrap_results(r)
     r_new, kernel_results = kernel.one_step(
@@ -118,7 +108,8 @@ def r_one_step(
         seed=seed,
     )
 
-    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    # Record whether the proposal was accepted.
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
     return r_new, accepted
 
 
@@ -137,7 +128,11 @@ def _E_bar_market_one_step(
     k_E_bar: tf.Tensor,
     seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for a single market's E_bar_t."""
+
     def target_log_prob_fn(E_bar_val: tf.Tensor) -> tf.Tensor:
+        """Evaluate the one-market log posterior for E_bar_t."""
+
         return posterior.E_bar_block_logpost(
             qjt_t=qjt_t,
             q0t_t=q0t_t,
@@ -150,6 +145,7 @@ def _E_bar_market_one_step(
             njt_t=njt_t,
         )
 
+    # Apply the one-market proposal step for E_bar_t.
     kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_E_bar)
     kernel_results = kernel.bootstrap_results(E_bar_t)
     E_bar_t_new, kernel_results = kernel.one_step(
@@ -158,7 +154,8 @@ def _E_bar_market_one_step(
         seed=seed,
     )
 
-    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    # Record whether the proposal was accepted.
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
     return E_bar_t_new, accepted
 
 
@@ -175,28 +172,33 @@ def E_bar_one_step(
     E_bar: tf.Tensor,
     njt: tf.Tensor,
     k_E_bar: tf.Tensor,
-    seed: tf.Tensor | None = None,
+    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    seed = _normalize_seed(seed)
-    k_E_bar = tf.convert_to_tensor(k_E_bar, dtype=posterior.dtype)
+    """Perform one full sweep of Metropolis updates over E_bar."""
 
+    # Decompose the E_bar update into separate market-level proposals.
     T_t = tf.shape(E_bar)[0]
     seeds = tf.random.experimental.stateless_split(seed, num=T_t)
 
+    # Carry the current market states and the running acceptance total.
     ta_E_bar = tf.TensorArray(
-        dtype=posterior.dtype,
+        dtype=tf.float64,
         size=T_t,
         element_shape=(),
     ).unstack(E_bar)
-    accepted0 = tf.constant(0.0, dtype=posterior.dtype)
+    accepted0 = tf.constant(0.0, dtype=tf.float64)
 
     def cond(t, ta_in, accepted_sum):
-        del ta_in, accepted_sum
+        """Continue until all markets have been updated."""
+
         return t < T_t
 
     def body(t, ta_in, accepted_sum):
+        """Update one market's E_bar_t and accumulate acceptance."""
+
         E_bar_t_old = ta_in.read(t)
 
+        # Update the current market conditional on the remaining parameter blocks.
         E_bar_t_new, accepted_t = _E_bar_market_one_step(
             posterior=posterior,
             qjt_t=qjt[t],
@@ -215,6 +217,7 @@ def E_bar_one_step(
         ta_out = ta_in.write(t, E_bar_t_new)
         return t + 1, ta_out, accepted_sum + accepted_t
 
+    # Run a full market-by-market sweep for E_bar.
     _, ta_E_bar, accepted_sum = tf.while_loop(
         cond=cond,
         body=body,
@@ -227,7 +230,9 @@ def E_bar_one_step(
 
     E_bar_new = ta_E_bar.stack()
     E_bar_new = tf.ensure_shape(E_bar_new, E_bar.shape)
-    accept_rate = accepted_sum / tf.cast(T_t, posterior.dtype)
+
+    # Report the average acceptance rate across markets.
+    accept_rate = accepted_sum / tf.cast(T_t, tf.float64)
     return E_bar_new, accept_rate
 
 
@@ -247,7 +252,11 @@ def _njt_market_one_step(
     k_njt: tf.Tensor,
     seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for a single market's njt_t."""
+
     def target_log_prob_fn(njt_val: tf.Tensor) -> tf.Tensor:
+        """Evaluate the one-market log posterior for njt_t."""
+
         return posterior.njt_block_logpost(
             qjt_t=qjt_t,
             q0t_t=q0t_t,
@@ -261,6 +270,7 @@ def _njt_market_one_step(
             gamma_t=gamma_t,
         )
 
+    # Apply the one-market proposal step for njt_t.
     kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_njt)
     kernel_results = kernel.bootstrap_results(njt_t)
     njt_t_new, kernel_results = kernel.one_step(
@@ -269,7 +279,8 @@ def _njt_market_one_step(
         seed=seed,
     )
 
-    accepted = _accepted_float(kernel_results=kernel_results, dtype=posterior.dtype)
+    # Record whether the proposal was accepted.
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
     return njt_t_new, accepted
 
 
@@ -287,28 +298,33 @@ def njt_one_step(
     njt: tf.Tensor,
     gamma: tf.Tensor,
     k_njt: tf.Tensor,
-    seed: tf.Tensor | None = None,
+    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    seed = _normalize_seed(seed)
-    k_njt = tf.convert_to_tensor(k_njt, dtype=posterior.dtype)
+    """Perform one full sweep of Metropolis updates over njt."""
 
+    # Decompose the njt update into separate market-level proposals.
     T_t = tf.shape(njt)[0]
     seeds = tf.random.experimental.stateless_split(seed, num=T_t)
 
+    # Carry the current market shock vectors and the running acceptance total.
     ta_njt = tf.TensorArray(
-        dtype=posterior.dtype,
+        dtype=tf.float64,
         size=T_t,
         element_shape=njt.shape[1:],
     ).unstack(njt)
-    accepted0 = tf.constant(0.0, dtype=posterior.dtype)
+    accepted0 = tf.constant(0.0, dtype=tf.float64)
 
     def cond(t, ta_in, accepted_sum):
-        del ta_in, accepted_sum
+        """Continue until all markets have been updated."""
+
         return t < T_t
 
     def body(t, ta_in, accepted_sum):
+        """Update one market's njt_t and accumulate acceptance."""
+
         njt_t_old = ta_in.read(t)
 
+        # Update the current market conditional on gamma_t and the remaining blocks.
         njt_t_new, accepted_t = _njt_market_one_step(
             posterior=posterior,
             qjt_t=qjt[t],
@@ -328,6 +344,7 @@ def njt_one_step(
         ta_out = ta_in.write(t, njt_t_new)
         return t + 1, ta_out, accepted_sum + accepted_t
 
+    # Run a full market-by-market sweep for njt.
     _, ta_njt, accepted_sum = tf.while_loop(
         cond=cond,
         body=body,
@@ -340,5 +357,7 @@ def njt_one_step(
 
     njt_new = ta_njt.stack()
     njt_new = tf.ensure_shape(njt_new, njt.shape)
-    accept_rate = accepted_sum / tf.cast(T_t, posterior.dtype)
+
+    # Report the average acceptance rate across markets.
+    accept_rate = accepted_sum / tf.cast(T_t, tf.float64)
     return njt_new, accept_rate

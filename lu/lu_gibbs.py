@@ -1,3 +1,5 @@
+"""Gibbs updates for the Lu shrinkage inclusion indicators."""
+
 from __future__ import annotations
 
 import tensorflow as tf
@@ -13,29 +15,36 @@ def gibbs_gamma(
     T1_sq: tf.Tensor,
     seed: tf.Tensor,
 ) -> tf.Tensor:
+    """Run one Gibbs sweep for the market-product inclusion indicators.
+
+    Update each product column of ``gamma`` conditional on the current values
+    of all other columns.
+    """
+
     J_int = tf.shape(gamma)[-1]
     J = tf.cast(J_int, gamma.dtype)
 
+    # Precompute the log variances used in each conditional update.
     log_T0_sq = tf.math.log(T0_sq)
     log_T1_sq = tf.math.log(T1_sq)
 
-    gamma_curr = gamma
-    s_curr = tf.reduce_sum(gamma_curr, axis=-1)
+    # Track the current number of active indicators in each market.
+    s_init = tf.reduce_sum(gamma, axis=-1)
 
     def cond(j, seed_curr, gamma_curr, s_curr):
-        del seed_curr, gamma_curr, s_curr
+        """Continue until all product indices have been updated."""
         return j < J_int
 
     def body(j, seed_curr, gamma_curr, s_curr):
-        seeds = tf.random.experimental.stateless_split(seed_curr, num=2)
-        next_seed = seeds[0]
-        draw_seed = seeds[1]
+        """Update ``gamma[:, j]`` conditional on the remaining columns."""
 
         gamma_j = gamma_curr[:, j]
         njt_j = njt[:, j]
 
+        # Form the leave-one-out count needed for the collapsed prior term.
         s_minus_j = s_curr - gamma_j
 
+        # Compute the conditional log posterior kernels for gamma_j = 0 and 1.
         logp0 = (
             tf.math.log(b_phi + (J - 1.0 - s_minus_j))
             - 0.5 * tf.square(njt_j) / T0_sq
@@ -47,9 +56,13 @@ def gibbs_gamma(
             - 0.5 * log_T1_sq
         )
 
-        m = tf.maximum(logp0, logp1)
-        prob1 = tf.exp(logp1 - m) / (tf.exp(logp0 - m) + tf.exp(logp1 - m))
+        # Convert log odds into the conditional probability of the slab state.
+        prob1 = tf.math.sigmoid(logp1 - logp0)
 
+        # Draw the updated inclusion indicator for each market.
+        seeds = tf.random.experimental.stateless_split(seed_curr, num=2)
+        next_seed = seeds[0]
+        draw_seed = seeds[1]
         u = tf.random.stateless_uniform(
             shape=tf.shape(prob1),
             seed=draw_seed,
@@ -57,6 +70,7 @@ def gibbs_gamma(
         )
         new_gamma_j = tf.cast(u < prob1, gamma.dtype)
 
+        # Write the updated column back into gamma and refresh the count summary.
         one_hot_j = tf.one_hot(j, depth=J_int, dtype=gamma.dtype)
         gamma_next = (
             gamma_curr * (1.0 - one_hot_j[None, :])
@@ -66,14 +80,15 @@ def gibbs_gamma(
 
         return j + 1, next_seed, gamma_next, s_next
 
+    # Sweep once across all product indices.
     _, _, gamma_out, _ = tf.while_loop(
         cond,
         body,
         loop_vars=(
             tf.constant(0, dtype=J_int.dtype),
             seed,
-            gamma_curr,
-            s_curr,
+            gamma,
+            s_init,
         ),
     )
     return gamma_out

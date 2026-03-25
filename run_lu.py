@@ -1,3 +1,5 @@
+"""Run the Lu simulation experiment and compare the fitted estimators."""
+
 from __future__ import annotations
 
 import os
@@ -24,6 +26,9 @@ from toolbox.assess_estimator import print_assessment
 
 
 def _to_numpy_results(results: dict) -> dict:
+    """Convert tensor-valued result entries into NumPy-backed output."""
+
+    # Normalize mixed TensorFlow and Python result dictionaries for downstream assessment.
     converted = {}
     for key, value in results.items():
         if isinstance(value, tf.Tensor):
@@ -33,18 +38,73 @@ def _to_numpy_results(results: dict) -> dict:
     return converted
 
 
+def _normalize_results_for_assessment(results: dict) -> dict:
+    """Standardize estimator outputs into the assessment result format."""
+
+    # Start by converting any tensor outputs into NumPy form.
+    out = _to_numpy_results(results)
+
+    # Read whichever shock representation the estimator returned.
+    E_bar_hat = out.get("E_bar_hat")
+    njt_hat = out.get("njt_hat")
+    E_full_hat = out.get("E_full_hat")
+    E_hat = out.get("E_hat")
+
+    # When a full shock matrix is available, reconstruct the missing decomposition if needed.
+    if E_full_hat is not None:
+        E_full_hat = np.asarray(E_full_hat, dtype=float)
+        out["E_full_hat"] = E_full_hat
+
+        if E_bar_hat is None:
+            if E_hat is not None:
+                E_bar_hat = np.asarray(E_hat, dtype=float)
+            else:
+                E_bar_hat = np.mean(E_full_hat, axis=1)
+        else:
+            E_bar_hat = np.asarray(E_bar_hat, dtype=float)
+
+        if njt_hat is None:
+            njt_hat = E_full_hat - E_bar_hat[:, None]
+        else:
+            njt_hat = np.asarray(njt_hat, dtype=float)
+
+        out["E_bar_hat"] = E_bar_hat
+        out["njt_hat"] = njt_hat
+        return out
+
+    # When the decomposed representation is already available, rebuild the full shock matrix.
+    if E_bar_hat is not None and njt_hat is not None:
+        E_bar_hat = np.asarray(E_bar_hat, dtype=float)
+        njt_hat = np.asarray(njt_hat, dtype=float)
+        out["E_bar_hat"] = E_bar_hat
+        out["njt_hat"] = njt_hat
+        out["E_full_hat"] = E_bar_hat[:, None] + njt_hat
+        return out
+
+    # When only the combined shock estimate is available, recover its row decomposition.
+    if E_hat is not None:
+        E_full_hat = np.asarray(E_hat, dtype=float)
+        E_bar_hat = np.mean(E_full_hat, axis=1)
+        njt_hat = E_full_hat - E_bar_hat[:, None]
+        out["E_bar_hat"] = E_bar_hat
+        out["njt_hat"] = njt_hat
+        out["E_full_hat"] = E_full_hat
+        return out
+
+    return out
+
+
 def main() -> None:
-    # -------------------------------------------------------------------------
-    # Experiment dimensions and true structural parameters
-    # -------------------------------------------------------------------------
+    """Run the Lu synthetic-market comparison across the four DGP settings."""
+
+    # Set the shared simulation and estimation controls used across all DGP runs.
     T, J, N = 25, 15, 1000
     beta_p_true, beta_w_true, sigma_true = -1.0, 0.5, 1.5
     seed = 123
+    chain_seed = tf.constant([seed, 0], dtype=tf.int32)
     n_draws = 200
 
-    # -------------------------------------------------------------------------
-    # BLP configuration
-    # -------------------------------------------------------------------------
+    # Configure the BLP benchmark used for both the strong-IV and weak-IV comparisons.
     blp_config_raw = {
         "n_draws": n_draws,
         "seed": seed,
@@ -62,16 +122,10 @@ def main() -> None:
     }
     blp_config = validate_blp_config(blp_config_raw)
 
-    # -------------------------------------------------------------------------
-    # Lu shrinkage posterior configuration
-    #
-    # a_phi and b_phi define the collapsed Beta-Binomial sparsity prior over
-    # gamma. phi itself is integrated out and is not sampled.
-    # -------------------------------------------------------------------------
+    # Set the prior and numerical controls for the shrinkage posterior.
     posterior_config = LuPosteriorConfig(
         n_draws=n_draws,
         seed=seed,
-        dtype=tf.float64,
         eps=1e-15,
         beta_p_mean=0.0,
         beta_p_var=10.0,
@@ -87,42 +141,27 @@ def main() -> None:
         b_phi=1.0,
     )
 
-    # -------------------------------------------------------------------------
-    # Lu shrinkage chain configuration
-    #
-    # run_chain(...) now owns the full shrinkage workflow:
-    #   - validate external inputs
-    #   - build the posterior and initial state
-    #   - run a pilot tuning phase for the four continuous proposal scales
-    #   - build the hybrid kernel using the tuned scales
-    #   - run the main jit-compiled chunked MCMC chain
-    #
-    # The k_* values below are the initial proposal scales supplied to tuning.
-    # -------------------------------------------------------------------------
+    # Set the chain length, proposal scales, and tuning controls for the shrinkage sampler.
     shrinkage_config = LuShrinkageConfig(
-        num_results=2000,
+        num_results=5000,
         num_burnin_steps=0,
-        chunk_size=250,
+        chunk_size=1000,
         k_beta=0.05,
         k_r=0.05,
         k_E_bar=0.05,
         k_njt=0.02,
-        pilot_length=50,
+        pilot_length=100,
         target_low=0.2,
         target_high=0.4,
-        max_rounds=10,
+        max_rounds=8,
         factor=1.5,
     )
 
-    # -------------------------------------------------------------------------
-    # Loop over DGP variants
-    # -------------------------------------------------------------------------
+    # Repeat the experiment across the four Lu DGP variants.
     for dgp_type in (1, 2, 3, 4):
         print(f"=== DGP {dgp_type} ===")
 
-        # ---------------------------------------------------------------------
-        # Step 1: Generate market-level primitives and construct prices
-        # ---------------------------------------------------------------------
+        # Generate the market conditions and implied prices for the chosen DGP.
         wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
             T=T,
             J=J,
@@ -131,12 +170,12 @@ def main() -> None:
         )
         pjt = alpha + 0.3 * wjt + ujt
 
-        int_true = float(np.mean(E_bar_t))
-        E_true = njt
+        # Record the true shock decomposition for later assessment.
+        E_bar_true = E_bar_t
+        njt_true = njt
+        E_full_true = Ejt
 
-        # ---------------------------------------------------------------------
-        # Step 2: Simulate utilities and aggregate to market outcomes
-        # ---------------------------------------------------------------------
+        # Instantiate the synthetic choice model at the true parameter values.
         model = BasicLuChoiceModel(
             N=N,
             beta_p=beta_p_true,
@@ -146,13 +185,12 @@ def main() -> None:
         )
         print("=== Linear model built ===")
 
+        # Simulate utilities and observed market counts from the true DGP.
         uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
         sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=seed)
         print("=== Market generated ===")
 
-        # ---------------------------------------------------------------------
-        # Step 3: Fit BLP under strong and weak instrument sets
-        # ---------------------------------------------------------------------
+        # Fit the first benchmark using the strong instrument construction.
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
             sjt=sjt,
@@ -164,9 +202,10 @@ def main() -> None:
         )
         print("=== Strong IVs and estimator built ===")
         blp_strong.fit()
-        res_strong = blp_strong.get_results()
+        res_strong = _normalize_results_for_assessment(blp_strong.get_results())
         print("=== Strong BLP estimator fitted ===")
 
+        # Fit the second benchmark using the weak instrument construction.
         Zjt_weak = build_weak_IVs(wjt=wjt)
         blp_weak = BLPEstimator(
             sjt=sjt,
@@ -178,14 +217,10 @@ def main() -> None:
         )
         print("=== Weak IVs and estimator built ===")
         blp_weak.fit()
-        res_weak = blp_weak.get_results()
+        res_weak = _normalize_results_for_assessment(blp_weak.get_results())
         print("=== Weak BLP estimator fitted ===")
 
-        # ---------------------------------------------------------------------
-        # Step 4: Run the Lu shrinkage workflow
-        #
-        # run_chain(...) now performs validation -> tuning -> MCMC internally.
-        # ---------------------------------------------------------------------
+        # Run the shrinkage chain on the same simulated market data.
         shrinkage_samples = run_chain(
             pjt=tf.convert_to_tensor(pjt, dtype=tf.float64),
             wjt=tf.convert_to_tensor(wjt, dtype=tf.float64),
@@ -193,48 +228,49 @@ def main() -> None:
             q0t=tf.convert_to_tensor(q0t, dtype=tf.float64),
             posterior_config=posterior_config,
             shrinkage_config=shrinkage_config,
-            seed=seed,
+            seed=chain_seed,
         )
-        res_shrink = _to_numpy_results(summarize_samples(shrinkage_samples))
+
+        # Convert posterior sample summaries into the common assessment format.
+        res_shrink = _normalize_results_for_assessment(
+            summarize_samples(shrinkage_samples)
+        )
         print("=== Shrinkage sampler run ===")
 
-        # ---------------------------------------------------------------------
-        # Step 5: Compare estimates to ground truth
-        # ---------------------------------------------------------------------
+        # Evaluate all three estimators against the same true parameter and shock targets.
         print("=== Strong BLP Estimator Results ===")
         print_assessment(
             results=res_strong,
-            int_true=int_true,
-            E_true=E_true,
+            beta_p_true=beta_p_true,
+            beta_w_true=beta_w_true,
             sigma_true=sigma_true,
+            E_bar_true=E_bar_true,
+            njt_true=njt_true,
+            E_full_true=E_full_true,
             support_true=support_true,
         )
 
         print("=== Weak BLP Estimator Results ===")
         print_assessment(
             results=res_weak,
-            int_true=int_true,
-            E_true=E_true,
+            beta_p_true=beta_p_true,
+            beta_w_true=beta_w_true,
             sigma_true=sigma_true,
+            E_bar_true=E_bar_true,
+            njt_true=njt_true,
+            E_full_true=E_full_true,
             support_true=support_true,
         )
 
-        # ---------------------------------------------------------------------
-        # Step 6: Compare shrinkage estimates to ground truth
-        #
-        # This assessment is currently against:
-        #   - int_true = mean(E_bar_t)
-        #   - E_true = njt
-        #
-        # So the shock comparison here is against the product-level deviation njt,
-        # not the full shock Ejt = E_bar_t + njt.
-        # ---------------------------------------------------------------------
         print("=== Shrinkage Estimator Results ===")
         print_assessment(
             results=res_shrink,
-            int_true=int_true,
-            E_true=E_true,
+            beta_p_true=beta_p_true,
+            beta_w_true=beta_w_true,
             sigma_true=sigma_true,
+            E_bar_true=E_bar_true,
+            njt_true=njt_true,
+            E_full_true=E_full_true,
             support_true=support_true,
         )
 

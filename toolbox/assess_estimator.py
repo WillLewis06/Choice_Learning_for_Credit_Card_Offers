@@ -1,138 +1,172 @@
 import numpy as np
 
 
-def print_assessment(
-    results: dict,
-    int_true: float,
-    E_true: np.ndarray,
-    sigma_true: float | None = None,
-    support_true: np.ndarray | None = None,
-) -> None:
-    """
-    Estimator-agnostic assessment for Lu Section 4 simulations (single-run diagnostics).
+def _fmt(x: float) -> str:
+    return "nan" if not np.isfinite(x) else f"{float(x):.6f}"
 
-    Conventions (aligned to Lu reporting split):
-      - "int_true" is the common/intercept component (Lu table "Int").
-      - "E_true" is the deviation shock array (Lu table "xi"), shape (T, J).
-      - results["int_hat"] is the estimated intercept (scalar).
-      - results["E_hat"] is interpreted as E_hat (post-intercept deviations), shape (T, J).
 
-    Expected results keys (from estimator.get_results()):
-      - "success": bool (optional)
-      - "int_hat": float or None (optional for some estimators)
-      - "E_hat": np.ndarray or None, shape (T, J)
-      - "sigma_hat": float or None
+def _scalar_metrics(true_value: float, hat_value: float) -> dict[str, float]:
+    true_f = float(true_value)
+    hat_f = float(hat_value)
+    return {
+        "hat": hat_f,
+        "true": true_f,
+        "abs_err": abs(hat_f - true_f),
+    }
 
-    Prints (debug-friendly):
-      - Int: hat/true/error
-      - E: rmse, mae, bias, corr + extras (std_ratio, null_rmse, norms, means)
-      - sigma_hat (and abs/rel error if sigma_true is provided)
-      - Prob (optional): single-run sparsity agreement if support_true and gamma_hat exist
-    """
-    success = results.get("success", True)
 
-    int_hat = results.get("int_hat", None)
-    E_hat = results.get("E_hat", None)
-    sigma_hat = results.get("sigma_hat", None)
+def _array_metrics(true_value: np.ndarray, hat_value: np.ndarray) -> dict[str, float]:
+    true_arr = np.asarray(true_value, dtype=float)
+    hat_arr = np.asarray(hat_value, dtype=float)
 
-    # Intercept diagnostics
-    int_hat_f = (
-        float(int_hat) if (int_hat is not None and np.isfinite(int_hat)) else np.nan
-    )
-    int_true_f = float(int_true)
-    int_err = float(int_hat_f - int_true_f) if np.isfinite(int_hat_f) else np.nan
-    int_abs_err = float(abs(int_err)) if np.isfinite(int_err) else np.nan
-
-    if E_hat is None:
-        sigma_part = ""
-        if (sigma_hat is not None) and np.isfinite(sigma_hat):
-            sigma_part = f" | sigma_hat={float(sigma_hat):.6f}"
-            if sigma_true is not None:
-                sigma_abs_err = float(abs(float(sigma_hat) - float(sigma_true)))
-                sigma_rel_err = (
-                    float(sigma_abs_err / float(sigma_true))
-                    if sigma_true != 0
-                    else np.nan
-                )
-                sigma_part += (
-                    f" (abs_err={sigma_abs_err:.3f}, rel_err={sigma_rel_err:.3f})"
-                )
-
-        print(
-            f"success={bool(success)} | Int: hat={int_hat_f:.6f} true={int_true_f:.6f} "
-            f"err={int_err:.6f} abs_err={int_abs_err:.6f} | E: E_hat=None"
-            f"{sigma_part}"
+    if true_arr.shape != hat_arr.shape:
+        raise ValueError(
+            f"shape mismatch for array assessment: {true_arr.shape} vs {hat_arr.shape}"
         )
-        return
 
-    # E diagnostics
-    E = np.asarray(E_true, dtype=float)
-    E_hat = np.asarray(E_hat, dtype=float)
-
-    if E.shape != E_hat.shape:
-        raise ValueError(f"E_true vs E_hat: shape mismatch {E.shape} vs {E_hat.shape}")
-
-    # Flatten for scalar metrics
-    e = E.reshape(-1)
-    eh = E_hat.reshape(-1)
-    diff = eh - e
+    true_flat = true_arr.reshape(-1)
+    hat_flat = hat_arr.reshape(-1)
+    diff = hat_flat - true_flat
 
     rmse = float(np.sqrt(np.mean(diff * diff)))
-    mae = float(np.mean(np.abs(diff)))
     bias = float(np.mean(diff))
 
-    e_std = float(np.std(e))
-    eh_std = float(np.std(eh))
-    std_ratio = float(eh_std / e_std) if e_std > 0 else np.nan
-
-    if (e_std > 0) and (eh_std > 0):
-        corr = float(np.corrcoef(eh, e)[0, 1])
+    true_std = float(np.std(true_flat))
+    hat_std = float(np.std(hat_flat))
+    if true_std > 0.0 and hat_std > 0.0:
+        corr = float(np.corrcoef(hat_flat, true_flat)[0, 1])
     else:
         corr = np.nan
 
-    rmse_null = float(np.sqrt(np.mean(e * e)))
-    rmse_improvement = float(rmse_null - rmse)
+    return {
+        "rmse": rmse,
+        "bias": bias,
+        "corr": corr,
+    }
 
-    # Debug extras (cheap + informative)
-    diff_std = float(np.std(diff))
-    E_true_norm = float(np.linalg.norm(e))
-    E_hat_norm = float(np.linalg.norm(eh))
-    E_true_mean = float(np.mean(e))
-    E_hat_mean = float(np.mean(eh))
-    degenerate_E_hat = bool(eh_std < 1e-12)
 
-    # Optional single-run sparsity agreement ("Prob.")
-    prob_part = ""
-    gamma_hat = results.get("gamma_hat", None)
-    if (support_true is not None) and (gamma_hat is not None):
-        support = np.asarray(support_true, dtype=bool)
-        gamma = np.asarray(gamma_hat, dtype=float)
-        if support.shape != gamma.shape:
-            raise ValueError(
-                f"support_true vs gamma_hat: shape mismatch {support.shape} vs {gamma.shape}"
-            )
-        support_hat = gamma >= 0.5
-        prob = float(np.mean(support_hat == support))
-        prob_part = f" | Prob={prob:.4f}"
+def _support_metrics(
+    support_true: np.ndarray,
+    gamma_hat: np.ndarray,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    support = np.asarray(support_true, dtype=bool)
+    gamma = np.asarray(gamma_hat, dtype=float)
 
-    sigma_part = ""
-    if (sigma_hat is not None) and np.isfinite(sigma_hat):
-        sigma_part = f" | sigma_hat={float(sigma_hat):.6f}"
-        if sigma_true is not None:
-            sigma_abs_err = float(abs(float(sigma_hat) - float(sigma_true)))
-            sigma_rel_err = (
-                float(sigma_abs_err / float(sigma_true)) if sigma_true != 0 else np.nan
-            )
-            sigma_part += f" (abs_err={sigma_abs_err:.3f}, rel_err={sigma_rel_err:.3f})"
+    if support.shape != gamma.shape:
+        raise ValueError(
+            f"support_true vs gamma_hat: shape mismatch {support.shape} vs {gamma.shape}"
+        )
 
+    support_hat = gamma >= threshold
+
+    tp = int(np.sum(support_hat & support))
+    fp = int(np.sum(support_hat & (~support)))
+    fn = int(np.sum((~support_hat) & support))
+
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else np.nan
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else np.nan
+    if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0.0:
+        f1 = float(2.0 * precision * recall / (precision + recall))
+    else:
+        f1 = np.nan
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def _print_scalar_block(name: str, true_value: float, hat_value: float) -> None:
+    metrics = _scalar_metrics(true_value=true_value, hat_value=hat_value)
     print(
-        f"success={bool(success)} | Int: hat={int_hat_f:.6f} true={int_true_f:.6f} "
-        f"err={int_err:.6f} abs_err={int_abs_err:.6f} "
-        f"| E: rmse={rmse:.4f} mae={mae:.4f} bias={bias:.4f} corr={corr:.4f} "
-        f"| std_ratio={std_ratio:.4f} diff_sd={diff_std:.4f} "
-        f"| null_rmse={rmse_null:.4f} improve={rmse_improvement:.4f} "
-        f"| E_true_norm={E_true_norm:.4f} E_hat_norm={E_hat_norm:.4f} "
-        f"| mean(E_true)={E_true_mean:.4f} mean(E_hat)={E_hat_mean:.4f}"
-        f"{prob_part}"
-        f"{sigma_part}" + (" | degenerate_E_hat" if degenerate_E_hat else "")
+        f"  {name}: hat={_fmt(metrics['hat'])} "
+        f"true={_fmt(metrics['true'])} "
+        f"abs_err={_fmt(metrics['abs_err'])}"
     )
+
+
+def _print_array_block(
+    name: str, true_value: np.ndarray, hat_value: np.ndarray
+) -> None:
+    metrics = _array_metrics(true_value=true_value, hat_value=hat_value)
+    print(
+        f"  {name}: rmse={_fmt(metrics['rmse'])} "
+        f"bias={_fmt(metrics['bias'])} "
+        f"corr={_fmt(metrics['corr'])}"
+    )
+
+
+def _print_support_block(support_true: np.ndarray, gamma_hat: np.ndarray) -> None:
+    metrics = _support_metrics(support_true=support_true, gamma_hat=gamma_hat)
+    print(
+        f"  support: precision={_fmt(metrics['precision'])} "
+        f"recall={_fmt(metrics['recall'])} "
+        f"f1={_fmt(metrics['f1'])}"
+    )
+
+
+def print_assessment(
+    results: dict,
+    beta_p_true: float,
+    beta_w_true: float,
+    sigma_true: float,
+    E_bar_true: np.ndarray,
+    njt_true: np.ndarray,
+    E_full_true: np.ndarray,
+    support_true: np.ndarray | None = None,
+) -> None:
+    """
+    Estimator-agnostic assessment for Lu simulations.
+
+    Required true inputs:
+      - beta_p_true
+      - beta_w_true
+      - sigma_true
+      - E_bar_true
+      - njt_true
+      - E_full_true
+
+    Expected estimator outputs when available:
+      - success
+      - beta_p_hat
+      - beta_w_hat
+      - sigma_hat
+      - E_bar_hat
+      - njt_hat
+      - E_full_hat
+      - gamma_hat
+
+    Printed metrics:
+      - scalar parameters: estimate, true value, absolute error
+      - shock targets: RMSE, bias, correlation
+      - support: precision, recall, F1
+    """
+    success = bool(results.get("success", True))
+    print(f"success={success}")
+
+    beta_p_hat = results.get("beta_p_hat")
+    beta_w_hat = results.get("beta_w_hat")
+    sigma_hat = results.get("sigma_hat")
+    E_bar_hat = results.get("E_bar_hat")
+    njt_hat = results.get("njt_hat")
+    E_full_hat = results.get("E_full_hat")
+    gamma_hat = results.get("gamma_hat")
+
+    if beta_p_hat is not None:
+        _print_scalar_block("beta_p", true_value=beta_p_true, hat_value=beta_p_hat)
+    if beta_w_hat is not None:
+        _print_scalar_block("beta_w", true_value=beta_w_true, hat_value=beta_w_hat)
+    if sigma_hat is not None:
+        _print_scalar_block("sigma", true_value=sigma_true, hat_value=sigma_hat)
+
+    if E_bar_hat is not None:
+        _print_array_block("E_bar", true_value=E_bar_true, hat_value=E_bar_hat)
+    if njt_hat is not None:
+        _print_array_block("n", true_value=njt_true, hat_value=njt_hat)
+    if E_full_hat is not None:
+        _print_array_block("E_full", true_value=E_full_true, hat_value=E_full_hat)
+
+    if support_true is not None and gamma_hat is not None:
+        _print_support_block(support_true=support_true, gamma_hat=gamma_hat)

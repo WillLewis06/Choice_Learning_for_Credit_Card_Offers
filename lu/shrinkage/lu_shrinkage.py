@@ -1,3 +1,5 @@
+"""Run the Lu shrinkage MCMC chain and summarize retained samples."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,11 +25,11 @@ from lu.shrinkage.lu_updates import (
 )
 from lu.shrinkage.lu_validate_input import run_chain_validate_input
 
-tfmcmc = tfp.mcmc
-
 
 @dataclass(frozen=True)
 class LuShrinkageConfig:
+    """Store sampler controls, proposal scales, and tuning parameters."""
+
     num_results: int
     num_burnin_steps: int
     chunk_size: int
@@ -43,6 +45,8 @@ class LuShrinkageConfig:
 
 
 class LuShrinkageState(NamedTuple):
+    """Store the current state of the Lu shrinkage chain."""
+
     beta_p: tf.Tensor
     beta_w: tf.Tensor
     r: tf.Tensor
@@ -52,50 +56,25 @@ class LuShrinkageState(NamedTuple):
 
 
 class LuHybridKernelResults(NamedTuple):
+    """Store the acceptance diagnostics for one hybrid transition step."""
+
     beta_accept: tf.Tensor
     r_accept: tf.Tensor
     E_bar_accept: tf.Tensor
     njt_accept: tf.Tensor
 
 
-def _normalize_seed(seed: tf.Tensor | int | None) -> tf.Tensor | None:
-    if seed is None:
-        return None
-
-    seed_t = tf.convert_to_tensor(seed, dtype=tf.int32)
-    if seed_t.shape.rank == 0:
-        return tf.stack([seed_t, tf.constant(0, dtype=tf.int32)])
-    return seed_t
-
-
-def _fallback_seed(dtype: tf.dtypes.DType = tf.int32) -> tf.Tensor:
-    maxval = tf.constant(2**31 - 1, dtype=dtype)
-    return tf.random.uniform(
-        shape=(2,),
-        minval=0,
-        maxval=maxval,
-        dtype=dtype,
-    )
-
-
-def _split_seed(seed: tf.Tensor | None, num: int) -> list[tf.Tensor | None]:
-    if num <= 0:
-        return []
-
-    if seed is None:
-        return [None] * num
-
-    seeds = tf.random.experimental.stateless_split(seed, num=num)
-    return [seeds[i] for i in range(num)]
-
-
 def _num_chunks(n_steps: int, chunk_size: int) -> int:
+    """Return the number of chunks needed for a given step count."""
+
     if n_steps <= 0:
         return 0
     return (n_steps + chunk_size - 1) // chunk_size
 
 
 def _last_state(samples: LuShrinkageState) -> LuShrinkageState:
+    """Extract the terminal state from a chunk of sampled states."""
+
     return LuShrinkageState(
         beta_p=samples.beta_p[-1],
         beta_w=samples.beta_w[-1],
@@ -107,9 +86,12 @@ def _last_state(samples: LuShrinkageState) -> LuShrinkageState:
 
 
 def _concat_sample_chunks(chunks: list[LuShrinkageState]) -> LuShrinkageState:
+    """Concatenate retained sample chunks into one state trace."""
+
     if len(chunks) == 0:
         raise ValueError("No retained sample chunks were produced.")
 
+    # Concatenate retained chunks along the draw dimension.
     return LuShrinkageState(
         beta_p=tf.concat([chunk.beta_p for chunk in chunks], axis=0),
         beta_w=tf.concat([chunk.beta_w for chunk in chunks], axis=0),
@@ -121,6 +103,8 @@ def _concat_sample_chunks(chunks: list[LuShrinkageState]) -> LuShrinkageState:
 
 
 def _raw_trace_to_dataclass(raw_trace: dict[str, tf.Tensor]) -> LuChunkTrace:
+    """Convert the raw trace dictionary into a LuChunkTrace."""
+
     return LuChunkTrace(
         beta_p=raw_trace["beta_p"],
         beta_w=raw_trace["beta_w"],
@@ -141,20 +125,25 @@ def build_initial_state(
     pjt: tf.Tensor,
     posterior: LuPosteriorTF,
 ) -> LuShrinkageState:
+    """Construct the default initial state for the shrinkage chain."""
+
     T = tf.shape(pjt)[0]
     J = tf.shape(pjt)[1]
 
+    # Start from zero coefficients, zero product shocks, zero inclusions, and a flat market effect.
     return LuShrinkageState(
-        beta_p=tf.constant(0.0, dtype=posterior.dtype),
-        beta_w=tf.constant(0.0, dtype=posterior.dtype),
-        r=tf.constant(0.0, dtype=posterior.dtype),
+        beta_p=tf.constant(0.0, dtype=tf.float64),
+        beta_w=tf.constant(0.0, dtype=tf.float64),
+        r=tf.constant(0.0, dtype=tf.float64),
         E_bar=tf.fill([T], posterior.E_bar_mean),
-        njt=tf.zeros([T, J], dtype=posterior.dtype),
-        gamma=tf.zeros([T, J], dtype=posterior.dtype),
+        njt=tf.zeros([T, J], dtype=tf.float64),
+        gamma=tf.zeros([T, J], dtype=tf.float64),
     )
 
 
-class LuHybridKernel(tfmcmc.TransitionKernel):
+class LuHybridKernel(tfp.mcmc.TransitionKernel):
+    """Implement one hybrid transition of the Lu shrinkage sampler."""
+
     def __init__(
         self,
         posterior: LuPosteriorTF,
@@ -164,12 +153,21 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
         wjt: tf.Tensor,
         config: LuShrinkageConfig,
     ):
+        """Store the posterior object, observed data, and proposal scales."""
+
         self._posterior = posterior
         self._qjt = qjt
         self._q0t = q0t
         self._pjt = pjt
         self._wjt = wjt
         self._config = config
+
+        # Cache the proposal scales used by the continuous update blocks.
+        self._k_beta = tf.constant(config.k_beta, dtype=tf.float64)
+        self._k_r = tf.constant(config.k_r, dtype=tf.float64)
+        self._k_E_bar = tf.constant(config.k_E_bar, dtype=tf.float64)
+        self._k_njt = tf.constant(config.k_njt, dtype=tf.float64)
+
         self._parameters = {
             "posterior": posterior,
             "qjt": qjt,
@@ -181,18 +179,26 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
 
     @property
     def parameters(self):
+        """Return the kernel parameters required by the TFP interface."""
+
         return self._parameters
 
     @property
     def is_calibrated(self) -> bool:
+        """Return whether the kernel is treated as calibrated."""
+
         return True
 
     def bootstrap_results(
         self,
         current_state: LuShrinkageState,
     ) -> LuHybridKernelResults:
-        zero = tf.constant(0.0, dtype=self._posterior.dtype)
+        """Initialize the acceptance diagnostics for the first step."""
+
         del current_state
+        zero = tf.constant(0.0, dtype=tf.float64)
+
+        # Start all acceptance summaries at zero.
         return LuHybridKernelResults(
             beta_accept=zero,
             r_accept=zero,
@@ -204,15 +210,16 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
         self,
         current_state: LuShrinkageState,
         previous_kernel_results: LuHybridKernelResults,
-        seed: tf.Tensor | None = None,
+        seed: tf.Tensor,
     ) -> tuple[LuShrinkageState, LuHybridKernelResults]:
+        """Apply one full hybrid transition of the shrinkage chain."""
+
         del previous_kernel_results
 
-        if seed is None:
-            seed = _fallback_seed(dtype=tf.int32)
-
+        # Allocate one seed to each sub-update in the hybrid step.
         seeds = tf.random.experimental.stateless_split(seed, num=5)
 
+        # Update the joint beta block conditional on the current remaining state.
         beta_p_new, beta_w_new, beta_accept = beta_one_step(
             posterior=self._posterior,
             qjt=self._qjt,
@@ -224,10 +231,11 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
             r=current_state.r,
             E_bar=current_state.E_bar,
             njt=current_state.njt,
-            k_beta=tf.constant(self._config.k_beta, dtype=self._posterior.dtype),
+            k_beta=self._k_beta,
             seed=seeds[0],
         )
 
+        # Update the random-coefficient scale given the new beta block.
         r_new, r_accept = r_one_step(
             posterior=self._posterior,
             qjt=self._qjt,
@@ -239,10 +247,11 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
             r=current_state.r,
             E_bar=current_state.E_bar,
             njt=current_state.njt,
-            k_r=tf.constant(self._config.k_r, dtype=self._posterior.dtype),
+            k_r=self._k_r,
             seed=seeds[1],
         )
 
+        # Sweep across market effects given the updated global parameters.
         E_bar_new, E_bar_accept = E_bar_one_step(
             posterior=self._posterior,
             qjt=self._qjt,
@@ -254,10 +263,11 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
             r=r_new,
             E_bar=current_state.E_bar,
             njt=current_state.njt,
-            k_E_bar=tf.constant(self._config.k_E_bar, dtype=self._posterior.dtype),
+            k_E_bar=self._k_E_bar,
             seed=seeds[2],
         )
 
+        # Sweep across market-product shocks conditional on the current inclusion indicators.
         njt_new, njt_accept = njt_one_step(
             posterior=self._posterior,
             qjt=self._qjt,
@@ -270,10 +280,11 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
             E_bar=E_bar_new,
             njt=current_state.njt,
             gamma=current_state.gamma,
-            k_njt=tf.constant(self._config.k_njt, dtype=self._posterior.dtype),
+            k_njt=self._k_njt,
             seed=seeds[3],
         )
 
+        # Run the Gibbs sweep for the inclusion indicators conditional on the updated shocks.
         gamma_new = gibbs_gamma(
             njt=njt_new,
             gamma=current_state.gamma,
@@ -284,6 +295,7 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
             seed=seeds[4],
         )
 
+        # Package the updated chain state and acceptance diagnostics for the next iteration.
         new_state = LuShrinkageState(
             beta_p=beta_p_new,
             beta_w=beta_w_new,
@@ -301,6 +313,8 @@ class LuHybridKernel(tfmcmc.TransitionKernel):
         return new_state, new_results
 
     def copy(self, **kwargs):
+        """Return a copy of the kernel with updated parameters."""
+
         parameters = dict(self.parameters)
         parameters.update(kwargs)
         return type(self)(**parameters)
@@ -315,6 +329,9 @@ def _make_trace(
     current_state: LuShrinkageState,
     kernel_results: LuHybridKernelResults,
 ) -> dict[str, tf.Tensor]:
+    """Build the per-draw diagnostics recorded during sampling."""
+
+    # Record the current joint log posterior together with state summaries and acceptance indicators.
     joint_lp = posterior.joint_logpost(
         qjt=qjt,
         q0t=q0t,
@@ -351,8 +368,11 @@ def run_chain(
     q0t: tf.Tensor,
     posterior_config: LuPosteriorConfig,
     shrinkage_config: LuShrinkageConfig,
-    seed: tf.Tensor | int | None = None,
+    seed: tf.Tensor,
 ) -> LuShrinkageState:
+    """Validate inputs, tune scales, run the chain, and return retained draws."""
+
+    # Validate all external inputs before constructing posterior or sampler objects.
     run_chain_validate_input(
         pjt=pjt,
         wjt=wjt,
@@ -363,15 +383,16 @@ def run_chain(
         seed=seed,
     )
 
+    # Initialize the posterior object and the default starting state.
     posterior = LuPosteriorTF(posterior_config)
     initial_state = build_initial_state(pjt=pjt, posterior=posterior)
 
-    base_seed = _normalize_seed(seed)
-    tuning_seed = None
-    sampling_seed = None
-    if base_seed is not None:
-        tuning_seed, sampling_seed = _split_seed(base_seed, 2)
+    # Use separate seed streams for tuning and retained sampling.
+    seeds = tf.random.experimental.stateless_split(seed, num=2)
+    tuning_seed = seeds[0]
+    sampling_seed = seeds[1]
 
+    # Tune the proposal scales for the continuous blocks before the main run.
     tuned_config = tune_shrinkage(
         posterior=posterior,
         qjt=qjt,
@@ -388,6 +409,7 @@ def run_chain(
         seed=tuning_seed,
     )
 
+    # Build the transition kernel for the main run using the tuned config.
     kernel = LuHybridKernel(
         posterior=posterior,
         qjt=qjt,
@@ -401,6 +423,8 @@ def run_chain(
         current_state: LuShrinkageState,
         kernel_results: LuHybridKernelResults,
     ) -> dict[str, tf.Tensor]:
+        """Record the per-draw diagnostics reported at chunk boundaries."""
+
         return _make_trace(
             posterior=posterior,
             qjt=qjt,
@@ -411,14 +435,17 @@ def run_chain(
             kernel_results=kernel_results,
         )
 
+    # Run one compiled chunk of the chain at a time.
     @tf.function(jit_compile=True, reduce_retracing=True)
     def _run_chunk(
         current_state: LuShrinkageState,
         previous_kernel_results: LuHybridKernelResults,
         num_steps: tf.Tensor,
-        chunk_seed: tf.Tensor | None,
+        chunk_seed: tf.Tensor,
     ):
-        return tfmcmc.sample_chain(
+        """Run one chunk of the chain and return samples, trace, and kernel results."""
+
+        return tfp.mcmc.sample_chain(
             num_results=num_steps,
             num_burnin_steps=0,
             current_state=current_state,
@@ -429,77 +456,79 @@ def run_chain(
             seed=chunk_seed,
         )
 
+    # Start the main run from the default initial state and empty acceptance diagnostics.
     state = initial_state
     kernel_results = kernel.bootstrap_results(initial_state)
 
+    # Execute burn-in and retained draws in chunked form.
     burnin_chunks = _num_chunks(tuned_config.num_burnin_steps, tuned_config.chunk_size)
     result_chunks = _num_chunks(tuned_config.num_results, tuned_config.chunk_size)
     total_chunks = burnin_chunks + result_chunks
 
-    chunk_seeds = _split_seed(sampling_seed, total_chunks)
+    chunk_seeds = tf.random.experimental.stateless_split(
+        sampling_seed, num=total_chunks
+    )
 
+    # Store reported chunk summaries separately from retained posterior draws.
     chunk_idx = 0
     chunk_summaries: list[LuChunkSummary] = []
     retained_chunks: list[LuShrinkageState] = []
 
-    burnin_remaining = tuned_config.num_burnin_steps
-    while burnin_remaining > 0:
-        this_chunk = min(tuned_config.chunk_size, burnin_remaining)
-        chunk_seed = chunk_seeds[chunk_idx] if total_chunks > 0 else None
+    def run_phase(remaining_steps: int, retain: bool) -> int:
+        """Execute one chunked phase of the chain."""
 
-        chunk_samples, raw_trace, kernel_results = _run_chunk(
-            current_state=state,
-            previous_kernel_results=kernel_results,
-            num_steps=tf.constant(this_chunk, dtype=tf.int32),
-            chunk_seed=chunk_seed,
-        )
-        state = _last_state(chunk_samples)
+        nonlocal chunk_idx, state, kernel_results
 
-        trace = _raw_trace_to_dataclass(raw_trace)
-        summary = report_chunk_progress(
-            trace=trace,
-            chunk_idx=chunk_idx + 1,
-            total_chunks=total_chunks,
-        )
-        chunk_summaries.append(summary)
+        while remaining_steps > 0:
+            this_chunk = min(tuned_config.chunk_size, remaining_steps)
 
-        burnin_remaining -= this_chunk
-        chunk_idx += 1
+            # Advance the chain by one chunk.
+            chunk_samples, raw_trace, kernel_results = _run_chunk(
+                current_state=state,
+                previous_kernel_results=kernel_results,
+                num_steps=tf.constant(this_chunk, dtype=tf.int32),
+                chunk_seed=chunk_seeds[chunk_idx],
+            )
 
-    results_remaining = tuned_config.num_results
-    while results_remaining > 0:
-        this_chunk = min(tuned_config.chunk_size, results_remaining)
-        chunk_seed = chunk_seeds[chunk_idx] if total_chunks > 0 else None
+            # Start the next chunk from the terminal state of the current chunk.
+            state = _last_state(chunk_samples)
 
-        chunk_samples, raw_trace, kernel_results = _run_chunk(
-            current_state=state,
-            previous_kernel_results=kernel_results,
-            num_steps=tf.constant(this_chunk, dtype=tf.int32),
-            chunk_seed=chunk_seed,
-        )
-        state = _last_state(chunk_samples)
-        retained_chunks.append(chunk_samples)
+            # Append only retained-phase chunks to posterior output.
+            if retain:
+                retained_chunks.append(chunk_samples)
 
-        trace = _raw_trace_to_dataclass(raw_trace)
-        summary = report_chunk_progress(
-            trace=trace,
-            chunk_idx=chunk_idx + 1,
-            total_chunks=total_chunks,
-        )
-        chunk_summaries.append(summary)
+            # Convert and report the chunk diagnostics after each chunk.
+            trace = _raw_trace_to_dataclass(raw_trace)
+            summary = report_chunk_progress(
+                trace=trace,
+                chunk_idx=chunk_idx + 1,
+                total_chunks=total_chunks,
+            )
+            chunk_summaries.append(summary)
 
-        results_remaining -= this_chunk
-        chunk_idx += 1
+            remaining_steps -= this_chunk
+            chunk_idx += 1
 
+        return remaining_steps
+
+    # Run the chain in two stages: burn-in first, then retained sampling.
+    run_phase(tuned_config.num_burnin_steps, retain=False)
+    run_phase(tuned_config.num_results, retain=True)
+
+    # Report the final run-level summary once chunk processing is complete.
     if len(chunk_summaries) > 0:
         report_run_summary(chunk_summaries)
 
+    # Concatenate all retained sample chunks into one state trace.
     return _concat_sample_chunks(retained_chunks)
 
 
 def summarize_samples(
     samples: LuShrinkageState,
 ) -> dict[str, tf.Tensor]:
+    """Compute posterior mean summaries from retained chain output."""
+
+    # Compute posterior means of the sampled parameter blocks.
     beta_p_hat = tf.reduce_mean(samples.beta_p, axis=0)
     beta_w_hat = tf.reduce_mean(samples.beta_w, axis=0)
     sigma_hat = tf.reduce_mean(tf.exp(samples.r), axis=0)
@@ -508,16 +537,16 @@ def summarize_samples(
     njt_hat = tf.reduce_mean(samples.njt, axis=0)
     gamma_hat = tf.reduce_mean(samples.gamma, axis=0)
 
+    # Derive the reported intercept and the full shock estimate from posterior means.
     int_hat = tf.reduce_mean(E_bar_hat)
-    E_full_hat = E_bar_hat[:, None] + njt_hat
+    E_hat = E_bar_hat[:, None] + njt_hat
 
     return {
         "beta_p_hat": beta_p_hat,
         "beta_w_hat": beta_w_hat,
         "sigma_hat": sigma_hat,
         "int_hat": int_hat,
-        "E_hat": njt_hat,
-        "E_full_hat": E_full_hat,
+        "E_hat": E_hat,
         "E_bar_hat": E_bar_hat,
         "njt_hat": njt_hat,
         "gamma_hat": gamma_hat,
