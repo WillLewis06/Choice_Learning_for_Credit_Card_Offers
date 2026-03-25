@@ -1,388 +1,274 @@
-"""
-Lu shrinkage estimator (MCMC sampler).
-
-This module defines `LuShrinkageEstimator`, which:
-- stores observed market data (pjt, wjt, qjt, q0t),
-- owns the current MCMC state (tf.Variables),
-- tunes proposal scales once using a pilot run,
-- runs an MCMC loop and accumulates posterior means via diagnostics.
-
-All computation is performed in tf.float64.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple
 
-import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from lu.shrinkage.lu_diagnostics import LuShrinkageDiagnostics
+from lu.lu_gibbs import gibbs_gamma, gibbs_phi
 from lu.shrinkage.lu_posterior import LuPosteriorConfig, LuPosteriorTF
-from lu.shrinkage.lu_tuning import tune_shrinkage
-from lu.shrinkage.lu_updates import (
-    update_E_bar,
-    update_beta,
-    update_gamma,
-    update_njt,
-    update_phi,
-    update_r,
-)
-from lu.shrinkage.lu_validate_input import fit_validate_input, init_validate_input
+
+tfmcmc = tfp.mcmc
+tfprandom = tfp.random
 
 
 @dataclass(frozen=True)
-class LuShrinkageFitConfig:
-    """Controls for proposal tuning and sampling.
-
-    There is no burn-in or thinning: every iteration is accumulated.
-    """
-
-    n_iter: int
-    pilot_length: int
-    ridge: float
-    target_low: float
-    target_high: float
-    max_rounds: int
-    factor_rw: float
-    factor_tmh: float
+class LuShrinkageConfig:
+    num_results: int
+    num_burnin_steps: int
+    rw_scale: float
 
 
-class LuShrinkageEstimator:
-    """MCMC sampler for the Lu shrinkage model.
+class LuShrinkageState(NamedTuple):
+    beta_p: tf.Tensor
+    beta_w: tf.Tensor
+    r: tf.Tensor
+    E_bar: tf.Tensor
+    njt: tf.Tensor
+    gamma: tf.Tensor
+    phi: tf.Tensor
 
-    Observed data (fixed):
-      - pjt, wjt, qjt, q0t
 
-    Latent state (sampled):
-      - Global: beta_p, beta_w, r
-      - Market-level: E_bar[t]
-      - Market-product: njt[t, j]
-      - Sparsity: gamma[t, j] in {0,1}, phi[t] in (0,1)
-    """
+class LuHybridKernelResults(NamedTuple):
+    continuous_kernel_results: object
 
+
+def build_initial_state(
+    pjt: tf.Tensor,
+    posterior: LuPosteriorTF,
+) -> LuShrinkageState:
+    T = tf.shape(pjt)[0]
+    J = tf.shape(pjt)[1]
+    phi0 = posterior.a_phi / (posterior.a_phi + posterior.b_phi)
+
+    return LuShrinkageState(
+        beta_p=tf.constant(0.0, dtype=posterior.dtype),
+        beta_w=tf.constant(0.0, dtype=posterior.dtype),
+        r=tf.constant(0.0, dtype=posterior.dtype),
+        E_bar=tf.fill(tf.stack([T]), posterior.E_bar_mean),
+        njt=tf.zeros(tf.stack([T, J]), dtype=posterior.dtype),
+        gamma=tf.zeros(tf.stack([T, J]), dtype=posterior.dtype),
+        phi=tf.fill(tf.stack([T]), phi0),
+    )
+
+
+class LuHybridKernel(tfmcmc.TransitionKernel):
     def __init__(
         self,
-        pjt: np.ndarray,
-        wjt: np.ndarray,
-        qjt: np.ndarray,
-        q0t: np.ndarray,
-        posterior_config: LuPosteriorConfig,
+        posterior: LuPosteriorTF,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        pjt: tf.Tensor,
+        wjt: tf.Tensor,
+        config: LuShrinkageConfig,
     ):
-        """Construct the estimator and initialize sampler state.
-
-        Args:
-            pjt, wjt: Observed product attributes, shape (T, J).
-            qjt: Observed inside-good counts, shape (T, J).
-            q0t: Observed outside-good counts, shape (T,).
-            posterior_config: Fully-specified posterior configuration (no defaults).
-        """
-        if posterior_config.dtype != tf.float64:
-            raise ValueError("posterior_config.dtype must be tf.float64.")
-
-        # -----------------------------
-        # Observed market data (fixed)
-        # -----------------------------
-        self.pjt = tf.convert_to_tensor(pjt, dtype=tf.float64)  # (T, J)
-        self.wjt = tf.convert_to_tensor(wjt, dtype=tf.float64)  # (T, J)
-        self.qjt = tf.convert_to_tensor(qjt, dtype=tf.float64)  # (T, J)
-        self.q0t = tf.convert_to_tensor(q0t, dtype=tf.float64)  # (T,)
-
-        init_validate_input(
-            pjt=self.pjt,
-            wjt=self.wjt,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            n_draws=posterior_config.n_draws,
-            seed=posterior_config.seed,
-        )
-
-        self.T = int(self.pjt.shape[0])
-        self.J = int(self.pjt.shape[1])
-
-        # -----------------------------
-        # Posterior helper (likelihood + priors)
-        # -----------------------------
-        self.posterior = LuPosteriorTF(config=posterior_config)
-
-        # -----------------------------
-        # RNG owned by the sampler
-        # -----------------------------
-        self.rng = tf.random.Generator.from_seed(posterior_config.seed)
-
-        # -----------------------------
-        # Latent state (tf.Variables mutated in-place)
-        # -----------------------------
-        self.beta_p = tf.Variable(0.0, dtype=tf.float64, trainable=False)
-        self.beta_w = tf.Variable(0.0, dtype=tf.float64, trainable=False)
-        self.r = tf.Variable(0.0, dtype=tf.float64, trainable=False)  # log(sigma)
-
-        # E_bar initialized at its prior mean.
-        self.E_bar = tf.Variable(
-            tf.fill([self.T], self.posterior.E_bar_mean),
-            dtype=tf.float64,
-            trainable=False,
-        )
-
-        # njt and gamma initialized at zero.
-        self.njt = tf.Variable(
-            tf.zeros([self.T, self.J], dtype=tf.float64),
-            trainable=False,
-        )
-        self.gamma = tf.Variable(
-            tf.zeros([self.T, self.J], dtype=tf.float64),
-            trainable=False,
-        )
-
-        # phi initialized at the Beta prior mean a/(a+b).
-        phi0 = self.posterior.a_phi / (self.posterior.a_phi + self.posterior.b_phi)
-        self.phi = tf.Variable(
-            tf.fill([self.T], phi0), dtype=tf.float64, trainable=False
-        )
-
-        # Diagnostics handle is created at fit-time.
-        self._diag: Optional[LuShrinkageDiagnostics] = None
-
-        # Fit controls are stored as a single config object (used by tuning).
-        self._fit_config: Optional[LuShrinkageFitConfig] = None
-
-    # ------------------------------------------------------------------
-    # Tuning controls (read by tune_shrinkage)
-    # ------------------------------------------------------------------
-
-    def _require_fit_config(self) -> LuShrinkageFitConfig:
-        if self._fit_config is None:
-            raise ValueError(
-                "fit() must be called before proposal tuning is available."
-            )
-        return self._fit_config
-
-    @property
-    def pilot_length(self) -> int:
-        return self._require_fit_config().pilot_length
-
-    @property
-    def ridge(self) -> float:
-        return self._require_fit_config().ridge
-
-    @property
-    def target_low(self) -> float:
-        return self._require_fit_config().target_low
-
-    @property
-    def target_high(self) -> float:
-        return self._require_fit_config().target_high
-
-    @property
-    def max_rounds(self) -> int:
-        return self._require_fit_config().max_rounds
-
-    @property
-    def factor_rw(self) -> float:
-        return self._require_fit_config().factor_rw
-
-    @property
-    def factor_tmh(self) -> float:
-        return self._require_fit_config().factor_tmh
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def fit(self, config: LuShrinkageFitConfig) -> None:
-        """Tune proposal scales, run MCMC, and accumulate posterior means."""
-        fit_validate_input(
-            n_iter=config.n_iter,
-            pilot_length=config.pilot_length,
-            ridge=config.ridge,
-            target_low=config.target_low,
-            target_high=config.target_high,
-            max_rounds=config.max_rounds,
-            factor_rw=config.factor_rw,
-            factor_tmh=config.factor_tmh,
-        )
-        self._fit_config = config
-
-        # Tune proposal scales (k_*) using a short pilot run.
-        k_r, k_E_bar, k_beta, k_njt = tune_shrinkage(self)
-
-        # Accumulate posterior means over all iterations.
-        diag = LuShrinkageDiagnostics(T=self.T, J=self.J)
-        self._run_mcmc_loop(
-            n_iter=config.n_iter,
-            k_beta=k_beta,
-            k_njt=k_njt,
-            k_r=k_r,
-            k_E_bar=k_E_bar,
-            ridge=config.ridge,
-            diag=diag,
-        )
-
-    def get_results(self) -> dict:
-        """Return posterior-mean summaries from accumulated running sums.
-
-        Reporting alignment with Lu(25) Section 4:
-          - int_hat: scalar intercept (mean of E_bar_hat across markets), for the table "Int"
-          - E_hat: deviation shocks njt_hat, for the table "xi"
-          - E_full_hat: full shocks E_bar_hat[:, None] + njt_hat (useful for debugging)
-        """
-        if self._diag is None:
-            raise ValueError("get_results() called before fit().")
-
-        saved, sum_beta, sum_sigma, sum_E_bar, sum_njt, sum_phi, sum_gamma = (
-            self._diag.get_sums()
-        )
-        saved_f = tf.cast(saved, tf.float64)
-
-        beta_mean = (sum_beta / saved_f).numpy()  # (2,)
-        sigma_mean = float((sum_sigma / saved_f).numpy())
-
-        E_bar_mean = (sum_E_bar / saved_f).numpy()  # (T,)
-        njt_mean = (sum_njt / saved_f).numpy()  # (T, J)
-
-        int_hat = float(np.mean(E_bar_mean))
-        E_full_mean = E_bar_mean[:, None] + njt_mean  # (T, J)
-
-        phi_mean = (sum_phi / saved_f).numpy()  # (T,)
-        gamma_mean = (sum_gamma / saved_f).numpy()  # (T, J)
-
-        return {
-            "beta_p_hat": float(beta_mean[0]),
-            "beta_w_hat": float(beta_mean[1]),
-            "sigma_hat": sigma_mean,
-            "int_hat": int_hat,
-            "E_hat": njt_mean,
-            "E_full_hat": E_full_mean,
-            "E_bar_hat": E_bar_mean,
-            "njt_hat": njt_mean,
-            "phi_hat": phi_mean,
-            "gamma_hat": gamma_mean,
-            "n_saved": int(saved.numpy()),
+        self._posterior = posterior
+        self._qjt = qjt
+        self._q0t = q0t
+        self._pjt = pjt
+        self._wjt = wjt
+        self._config = config
+        self._parameters = {
+            "posterior": posterior,
+            "qjt": qjt,
+            "q0t": q0t,
+            "pjt": pjt,
+            "wjt": wjt,
+            "config": config,
         }
 
-    # ------------------------------------------------------------------
-    # MCMC orchestration
-    # ------------------------------------------------------------------
+    @property
+    def parameters(self):
+        return self._parameters
 
-    def _run_mcmc_loop(
+    @property
+    def is_calibrated(self) -> bool:
+        return True
+
+    def _continuous_state(
         self,
-        n_iter: int,
-        k_beta: tf.Tensor,
-        k_njt: tf.Tensor,
-        k_r: tf.Tensor,
-        k_E_bar: tf.Tensor,
-        ridge: float,
-        diag: LuShrinkageDiagnostics,
-    ) -> None:
-        """Run the iteration loop and mutate sampler state."""
-        self._diag = diag
-        ridge_t = tf.convert_to_tensor(ridge, dtype=tf.float64)
+        state: LuShrinkageState,
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        return (
+            state.beta_p,
+            state.beta_w,
+            state.r,
+            state.E_bar,
+            state.njt,
+        )
 
-        for it in range(n_iter):
-            self._mcmc_iteration_step(
-                it=tf.convert_to_tensor(it, dtype=tf.int32),
-                k_beta=k_beta,
-                k_njt=k_njt,
-                k_r=k_r,
-                k_E_bar=k_E_bar,
-                ridge=ridge_t,
+    def _target_log_prob_fn(
+        self,
+        gamma: tf.Tensor,
+    ):
+        def target_log_prob_fn(
+            beta_p: tf.Tensor,
+            beta_w: tf.Tensor,
+            r: tf.Tensor,
+            E_bar: tf.Tensor,
+            njt: tf.Tensor,
+        ) -> tf.Tensor:
+            return self._posterior.conditional_continuous_logpost(
+                qjt=self._qjt,
+                q0t=self._q0t,
+                pjt=self._pjt,
+                wjt=self._wjt,
+                beta_p=beta_p,
+                beta_w=beta_w,
+                r=r,
+                E_bar=E_bar,
+                njt=njt,
+                gamma=gamma,
             )
 
-    @tf.function(reduce_retracing=True)
-    def _mcmc_iteration_step(self, it, k_beta, k_njt, k_r, k_E_bar, ridge):
-        """Run one MCMC iteration and record diagnostics."""
-        # (beta_p, beta_w): TMH.
-        beta_p_new, beta_w_new, _ = update_beta(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            pjt=self.pjt,
-            wjt=self.wjt,
-            beta_p=self.beta_p,
-            beta_w=self.beta_w,
-            r=self.r,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            k_beta=k_beta,
-            ridge=ridge,
-        )
-        self.beta_p.assign(beta_p_new)
-        self.beta_w.assign(beta_w_new)
+        return target_log_prob_fn
 
-        # r: RW-MH.
-        r_new, _ = update_r(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            pjt=self.pjt,
-            wjt=self.wjt,
-            beta_p=self.beta_p,
-            beta_w=self.beta_w,
-            r=self.r,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            k_r=k_r,
+    def _continuous_kernel(
+        self,
+        gamma: tf.Tensor,
+    ) -> tfmcmc.RandomWalkMetropolis:
+        return tfmcmc.RandomWalkMetropolis(
+            target_log_prob_fn=self._target_log_prob_fn(gamma),
+            new_state_fn=tfmcmc.random_walk_normal_fn(scale=self._config.rw_scale),
         )
-        self.r.assign(r_new)
 
-        # E_bar: elementwise RW-MH.
-        E_bar_new, _ = update_E_bar(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            pjt=self.pjt,
-            wjt=self.wjt,
-            beta_p=self.beta_p,
-            beta_w=self.beta_w,
-            r=self.r,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            gamma=self.gamma,
-            phi=self.phi,
-            k_E_bar=k_E_bar,
+    def bootstrap_results(
+        self,
+        current_state: LuShrinkageState,
+    ) -> LuHybridKernelResults:
+        continuous_kernel = self._continuous_kernel(current_state.gamma)
+        continuous_kernel_results = continuous_kernel.bootstrap_results(
+            self._continuous_state(current_state)
         )
-        self.E_bar.assign(E_bar_new)
-
-        # njt: TMH sweep across markets.
-        njt_new, _accepted_count = update_njt(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            pjt=self.pjt,
-            wjt=self.wjt,
-            beta_p=self.beta_p,
-            beta_w=self.beta_w,
-            r=self.r,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            gamma=self.gamma,
-            phi=self.phi,
-            k_njt=k_njt,
-            ridge=ridge,
+        return LuHybridKernelResults(
+            continuous_kernel_results=continuous_kernel_results,
         )
-        self.njt.assign(njt_new)
 
-        # gamma: Gibbs.
-        gamma_new = update_gamma(
-            posterior=self.posterior,
-            rng=self.rng,
-            njt=self.njt,
-            phi=self.phi,
+    def one_step(
+        self,
+        current_state: LuShrinkageState,
+        previous_kernel_results: LuHybridKernelResults,
+        seed: tf.Tensor | None = None,
+    ) -> tuple[LuShrinkageState, LuHybridKernelResults]:
+        seed = tfprandom.sanitize_seed(seed, salt="lu_hybrid_kernel")
+        seeds = tfprandom.split_seed(seed, n=3)
+        continuous_seed = seeds[0]
+        gamma_seed = seeds[1]
+        phi_seed = seeds[2]
+
+        continuous_kernel = self._continuous_kernel(current_state.gamma)
+        new_continuous_state, _ = continuous_kernel.one_step(
+            current_state=self._continuous_state(current_state),
+            previous_kernel_results=previous_kernel_results.continuous_kernel_results,
+            seed=continuous_seed,
         )
-        self.gamma.assign(gamma_new)
 
-        # phi: Gibbs.
-        phi_new = update_phi(
-            posterior=self.posterior,
-            rng=self.rng,
-            gamma=self.gamma,
+        new_beta_p = new_continuous_state[0]
+        new_beta_w = new_continuous_state[1]
+        new_r = new_continuous_state[2]
+        new_E_bar = new_continuous_state[3]
+        new_njt = new_continuous_state[4]
+
+        new_gamma = gibbs_gamma(
+            njt=new_njt,
+            phi=current_state.phi,
+            T0_sq=self._posterior.T0_sq,
+            T1_sq=self._posterior.T1_sq,
+            eps=self._posterior.eps,
+            seed=gamma_seed,
         )
-        self.phi.assign(phi_new)
+        new_phi = gibbs_phi(
+            gamma=new_gamma,
+            a_phi=self._posterior.a_phi,
+            b_phi=self._posterior.b_phi,
+            eps=self._posterior.eps,
+            seed=phi_seed,
+        )
 
-        # Running sums + progress line.
-        self._diag.step(self, it)
+        new_state = LuShrinkageState(
+            beta_p=new_beta_p,
+            beta_w=new_beta_w,
+            r=new_r,
+            E_bar=new_E_bar,
+            njt=new_njt,
+            gamma=new_gamma,
+            phi=new_phi,
+        )
+
+        next_continuous_kernel = self._continuous_kernel(new_state.gamma)
+        next_continuous_kernel_results = next_continuous_kernel.bootstrap_results(
+            self._continuous_state(new_state)
+        )
+
+        return new_state, LuHybridKernelResults(
+            continuous_kernel_results=next_continuous_kernel_results,
+        )
+
+    def copy(self, **kwargs):
+        parameters = dict(self.parameters)
+        parameters.update(kwargs)
+        return type(self)(**parameters)
+
+
+def run_chain(
+    pjt: tf.Tensor,
+    wjt: tf.Tensor,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    posterior_config: LuPosteriorConfig,
+    shrinkage_config: LuShrinkageConfig,
+    seed: tf.Tensor | int | None = None,
+) -> LuShrinkageState:
+    posterior = LuPosteriorTF(posterior_config)
+    initial_state = build_initial_state(pjt=pjt, posterior=posterior)
+    kernel = LuHybridKernel(
+        posterior=posterior,
+        qjt=qjt,
+        q0t=q0t,
+        pjt=pjt,
+        wjt=wjt,
+        config=shrinkage_config,
+    )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _run():
+        return tfmcmc.sample_chain(
+            num_results=shrinkage_config.num_results,
+            num_burnin_steps=shrinkage_config.num_burnin_steps,
+            current_state=initial_state,
+            kernel=kernel,
+            trace_fn=None,
+            seed=seed,
+        )
+
+    return _run()
+
+
+def summarize_samples(
+    samples: LuShrinkageState,
+) -> dict[str, tf.Tensor]:
+    beta_p_hat = tf.reduce_mean(samples.beta_p, axis=0)
+    beta_w_hat = tf.reduce_mean(samples.beta_w, axis=0)
+    sigma_hat = tf.reduce_mean(tf.exp(samples.r), axis=0)
+
+    E_bar_hat = tf.reduce_mean(samples.E_bar, axis=0)
+    njt_hat = tf.reduce_mean(samples.njt, axis=0)
+    gamma_hat = tf.reduce_mean(samples.gamma, axis=0)
+    phi_hat = tf.reduce_mean(samples.phi, axis=0)
+
+    int_hat = tf.reduce_mean(E_bar_hat)
+    E_full_hat = E_bar_hat[:, None] + njt_hat
+
+    return {
+        "beta_p_hat": beta_p_hat,
+        "beta_w_hat": beta_w_hat,
+        "sigma_hat": sigma_hat,
+        "int_hat": int_hat,
+        "E_hat": njt_hat,
+        "E_full_hat": E_full_hat,
+        "E_bar_hat": E_bar_hat,
+        "njt_hat": njt_hat,
+        "gamma_hat": gamma_hat,
+        "phi_hat": phi_hat,
+    }

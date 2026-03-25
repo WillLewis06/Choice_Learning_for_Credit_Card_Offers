@@ -4,18 +4,18 @@ End-to-end simulation harness for comparing BLP vs Lu shrinkage on synthetic mar
 This script:
   1) Generates synthetic market data under multiple DGP variants.
   2) Fits two BLP estimators (strong-IV and weak-IV).
-  3) Fits the Lu shrinkage estimator (Bayesian sparse market-product shocks).
+  3) Runs the Lu shrinkage sampler using tfp.mcmc.
   4) Compares recovered shocks and sigma against ground truth.
 
 All estimator configuration is set in this orchestration layer and passed down as
-validated config objects (no defaults, no fallbacks).
+config objects. The shrinkage sampler is treated as a pure run_chain(...) +
+summarize_samples(...) pipeline.
 """
 
 from __future__ import annotations
 
 import os
 
-# Reduce TensorFlow logging noise in terminal output.
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import numpy as np
@@ -29,9 +29,22 @@ from datasets.lu_dgp import (
 from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
 from lu.blp.blp_input_validation import validate_blp_config
 from lu.shrinkage.lu_posterior import LuPosteriorConfig
-from lu.shrinkage.lu_shrinkage import LuShrinkageEstimator, LuShrinkageFitConfig
-from lu.shrinkage.lu_validate_input import posterior_validate_input
+from lu.shrinkage.lu_shrinkage import (
+    LuShrinkageConfig,
+    run_chain,
+    summarize_samples,
+)
 from toolbox.assess_estimator import print_assessment
+
+
+def _to_numpy_results(results: dict) -> dict:
+    converted = {}
+    for key, value in results.items():
+        if isinstance(value, tf.Tensor):
+            converted[key] = value.numpy()
+        else:
+            converted[key] = value
+    return converted
 
 
 def main() -> None:
@@ -48,23 +61,19 @@ def main() -> None:
     n_draws = 200
 
     # -------------------------------------------------------------------------
-    # BLP configuration (validated in orchestration; no defaults)
+    # BLP configuration
     # -------------------------------------------------------------------------
     blp_config_raw = {
         "n_draws": n_draws,
         "seed": seed,
-        # Contraction mapping / inversion controls
         "damping": 0.5,
         "tol": 1e-12,
         "share_tol": 1e-12,
         "max_iter": 2000,
-        # Objective penalty used when inversion fails
         "fail_penalty": 1e8,
-        # Sigma search region and grid
         "sigma_lower": 1e-3,
         "sigma_upper": 5.0,
         "sigma_grid_points": 25,
-        # Nelder-Mead controls
         "nelder_mead_maxiter": 500,
         "nelder_mead_xatol": 1e-6,
         "nelder_mead_fatol": 1e-6,
@@ -72,46 +81,34 @@ def main() -> None:
     blp_config = validate_blp_config(blp_config_raw)
 
     # -------------------------------------------------------------------------
-    # Lu shrinkage posterior/prior configuration (validated; no defaults)
+    # Lu shrinkage posterior configuration
     # -------------------------------------------------------------------------
     posterior_config = LuPosteriorConfig(
-        # Monte Carlo integration settings
         n_draws=n_draws,
         seed=seed,
-        # Numeric settings
         dtype=tf.float64,
         eps=1e-15,
-        # Global priors: Normal(mean, var)
         beta_p_mean=0.0,
         beta_p_var=10.0,
         beta_w_mean=0.0,
         beta_w_var=10.0,
         r_mean=0.0,
         r_var=0.5,
-        # Market common shock prior: Normal(mean, var)
         E_bar_mean=0.0,
         E_bar_var=10.0,
-        # Spike-and-slab variances
         T0_sq=1e-3,
         T1_sq=1.0,
-        # Beta prior for phi
         a_phi=1.0,
         b_phi=1.0,
     )
-    posterior_validate_input(posterior_config)
 
     # -------------------------------------------------------------------------
-    # Lu shrinkage tuning + sampling configuration (no burn-in/thinning)
+    # Lu shrinkage chain configuration
     # -------------------------------------------------------------------------
-    fit_config = LuShrinkageFitConfig(
-        n_iter=500,
-        pilot_length=20,
-        ridge=1e-6,
-        target_low=0.3,
-        target_high=0.5,
-        max_rounds=100,
-        factor_rw=1.3,
-        factor_tmh=1.05,
+    shrinkage_config = LuShrinkageConfig(
+        num_results=500,
+        num_burnin_steps=0,
+        rw_scale=0.1,
     )
 
     # -------------------------------------------------------------------------
@@ -122,39 +119,20 @@ def main() -> None:
 
         # ---------------------------------------------------------------------
         # Step 1: Generate market-level primitives and construct prices.
-        #
-        # generate_market_conditions returns:
-        #   wjt         : exogenous characteristic
-        #   Ejt         : total demand shock (E_bar_t[:, None] + njt)
-        #   ujt         : cost shock entering pricing
-        #   alpha       : endogeneity shifter (0 for exogenous-price DGPs)
-        #   E_bar_t     : common market component (Lu table "Int")
-        #   njt         : market-product deviations (Lu table "E")
-        #   support_true: nonzero mask for njt (DGP1/2 only; used for "Prob.")
-        #
-        # Pricing rule in this codebase:
-        #   pjt = alpha + 0.3 * wjt + ujt
         # ---------------------------------------------------------------------
         wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
-            T=T, J=J, dgp_type=dgp_type, seed=seed
+            T=T,
+            J=J,
+            dgp_type=dgp_type,
+            seed=seed,
         )
         pjt = alpha + 0.3 * wjt + ujt
 
-        # Paper-style truth for reporting:
-        #   - int_true corresponds to E_bar_t (scalar in Section 4; constant across t).
-        #   - E_true corresponds to the market-product deviations njt (Lu table "E").
         int_true = float(np.mean(E_bar_t))
         E_true = njt
 
         # ---------------------------------------------------------------------
-        # Step 2: Simulate individual utilities and aggregate to market outcomes.
-        #
-        # BasicLuChoiceModel simulates a random-coefficient logit where:
-        #   beta_{p,i} ~ Normal(beta_p_true, sigma_true)
-        #
-        # utilities(...) returns u_{i,j,t}. generate_market converts these to:
-        #   sjt, s0t : expected shares (inside and outside) for BLP
-        #   qjt, q0t : multinomial draws (counts) used by the shrinkage estimator
+        # Step 2: Simulate utilities and aggregate to market outcomes.
         # ---------------------------------------------------------------------
         model = BasicLuChoiceModel(
             N=N,
@@ -170,16 +148,7 @@ def main() -> None:
         print("=== Market generated ===")
 
         # ---------------------------------------------------------------------
-        # Step 3: Fit BLP under two instrument sets (with cost IV vs without).
-        #
-        # Both BLP estimators use demand regressors Xjt = (1, pjt, wjt) and differ
-        # only in instruments Zjt, aligned with Lu(25) Section 4:
-        #
-        #   - BLP (with cost IV):    Zjt = (1, wjt, wjt^2, ujt, ujt^2)
-        #   - BLP (without cost IV): Zjt = (1, wjt, wjt^2, wjt^3, wjt^4)
-        #
-        # The sigma search region and optimization controls are provided via the
-        # validated BLP config.
+        # Step 3: Fit BLP under strong and weak instrument sets.
         # ---------------------------------------------------------------------
         Zjt_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
         blp_strong = BLPEstimator(
@@ -190,6 +159,7 @@ def main() -> None:
             Zjt=Zjt_strong,
             config=blp_config,
         )
+        """
         print("=== Strong IVs and Estimator built ===")
         blp_strong.fit()
         res_strong = blp_strong.get_results()
@@ -208,29 +178,27 @@ def main() -> None:
         blp_weak.fit()
         res_weak = blp_weak.get_results()
         print("=== Weak BLP Estimator fitted ===")
-
+        """
         # ---------------------------------------------------------------------
-        # Step 4: Fit the Lu shrinkage estimator.
+        # Step 4: Run the Lu shrinkage sampler.
         #
-        # The estimator samples from the posterior over:
-        #   - beta_p, beta_w, sigma (via r = log(sigma))
-        #   - market shocks E_bar_t and market-product shocks njt[t,j]
-        #   - sparsity indicators gamma[t,j] and inclusion rates phi[t]
-        #
-        # Proposal scales are tuned once using short pilot runs, then frozen.
+        # The sampler uses:
+        #   - a built-in TFP kernel for the continuous block
+        #   - Gibbs updates for gamma and phi
+        #   - tfp.mcmc.sample_chain as the top-level driver
         # ---------------------------------------------------------------------
-        shrink = LuShrinkageEstimator(
-            pjt=pjt,
-            wjt=wjt,
-            qjt=qjt,
-            q0t=q0t,
+        shrinkage_samples = run_chain(
+            pjt=tf.convert_to_tensor(pjt, dtype=tf.float64),
+            wjt=tf.convert_to_tensor(wjt, dtype=tf.float64),
+            qjt=tf.convert_to_tensor(qjt, dtype=tf.float64),
+            q0t=tf.convert_to_tensor(q0t, dtype=tf.float64),
             posterior_config=posterior_config,
+            shrinkage_config=shrinkage_config,
+            seed=seed,
         )
-        print("=== Shrinkage Estimator built ===")
-        shrink.fit(config=fit_config)
-        res_shrink = shrink.get_results()
-        print("=== Shrinkage Estimator fitted ===")
-
+        res_shrink = _to_numpy_results(summarize_samples(shrinkage_samples))
+        print("=== Shrinkage sampler run ===")
+        """
         # ---------------------------------------------------------------------
         # Step 5: Compare estimates to ground truth.
         # ---------------------------------------------------------------------
@@ -251,7 +219,7 @@ def main() -> None:
             sigma_true=sigma_true,
             support_true=support_true,
         )
-
+        """
         print("=== Shrinkage Estimator Results ===")
         print_assessment(
             results=res_shrink,
