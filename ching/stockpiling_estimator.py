@@ -1,365 +1,501 @@
-"""
-ching/stockpiling_estimator.py
-
-MCMC estimator for the Phase-3 stockpiling model (multi-product).
-
-This module provides a small, examiner-readable wrapper around:
-  - the structural model/CCP solver (ching.stockpiling_model)
-  - the likelihood/prediction layer with inventory filtering (ching.stockpiling_posterior)
-  - RW-MH update kernels for unconstrained parameters (ching.stockpiling_updates)
-  - iteration diagnostics (ching.stockpiling_diagnostics)
-
-Design:
-  - No input validation is performed here. All validation/normalization is delegated
-    to ching.stockpiling_input_validation.
-  - No default argument values. All settings must be supplied by the caller/config.
-  - u_scale is treated as a standard model component (per-market utility scale).
-"""
+"""Run the Ching stockpiling MCMC chain and summarize retained samples."""
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import NamedTuple
 
-import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from ching.stockpiling_diagnostics import report_iteration_progress
-from ching.stockpiling_input_validation import (
-    normalize_stockpiling_estimator_fit_inputs,
-    normalize_stockpiling_estimator_init_inputs,
-    normalize_stockpiling_estimator_init_theta,
+from ching.stockpiling_diagnostics import (
+    StockpilingChunkSummary,
+    StockpilingChunkTrace,
+    report_chunk_progress,
+    report_run_summary,
 )
-from ching.stockpiling_model import build_inventory_maps, unconstrained_to_theta
+from ching.stockpiling_input_validation import run_chain_validate_input
+from ching.stockpiling_model import unconstrained_to_theta
 from ching.stockpiling_posterior import (
-    StockpilingInputs,
-    predict_p_buy_mnjt_from_theta,
+    StockpilingPosteriorConfig,
+    StockpilingPosteriorTF,
 )
 from ching.stockpiling_updates import (
-    update_z_alpha_j,
-    update_z_beta_scalar,
-    update_z_fc_j,
-    update_z_u_scale_m,
-    update_z_v_j,
+    alpha_one_step,
+    beta_one_step,
+    fc_one_step,
+    u_scale_one_step,
+    v_one_step,
 )
 
-ONE_F64 = tf.constant(1.0, dtype=tf.float64)
+__all__ = [
+    "StockpilingConfig",
+    "StockpilingState",
+    "StockpilingKernelResults",
+    "StockpilingHybridKernel",
+    "build_initial_state",
+    "run_chain",
+    "summarize_samples",
+]
 
 
-def _logit(p: tf.Tensor) -> tf.Tensor:
-    """Compute log(p/(1-p)) elementwise (expects p in (0,1))."""
-    return tf.math.log(p) - tf.math.log(ONE_F64 - p)
+@dataclass(frozen=True)
+class StockpilingConfig:
+    """Store sampler controls, proposal scales, and tuning placeholders."""
+
+    num_results: int
+    num_burnin_steps: int
+    chunk_size: int
+    k_beta: tf.Tensor
+    k_alpha: tf.Tensor
+    k_v: tf.Tensor
+    k_fc: tf.Tensor
+    k_u_scale: tf.Tensor
+    pilot_num_steps: int
+    target_accept_low: float
+    target_accept_high: float
+    grow_factor: float
+    shrink_factor: float
+    max_tuning_rounds: int
 
 
-def _pack_z(
-    z_beta: tf.Tensor,
-    z_alpha: tf.Tensor,
-    z_v: tf.Tensor,
-    z_fc: tf.Tensor,
-    z_u_scale: tf.Tensor,
-) -> dict[str, tf.Tensor]:
-    """Pack unconstrained state into the z-dict expected by diagnostics/transforms."""
-    return {
-        "z_beta": z_beta,
-        "z_alpha": z_alpha,
-        "z_v": z_v,
-        "z_fc": z_fc,
-        "z_u_scale": z_u_scale,
-    }
+class StockpilingState(NamedTuple):
+    """Store the current unconstrained chain state."""
+
+    z_beta: tf.Tensor
+    z_alpha: tf.Tensor
+    z_v: tf.Tensor
+    z_fc: tf.Tensor
+    z_u_scale: tf.Tensor
 
 
-def _z_from_init_theta(
-    init_theta: Mapping[str, Any], M: int, J: int
-) -> dict[str, tf.Tensor]:
-    """Convert constrained init_theta to unconstrained z, after normalization."""
-    init = normalize_stockpiling_estimator_init_theta(
-        init_theta=init_theta, M=int(M), J=int(J)
+class StockpilingKernelResults(NamedTuple):
+    """Store scalar block-acceptance diagnostics for one transition step."""
+
+    beta_accept: tf.Tensor
+    alpha_accept: tf.Tensor
+    v_accept: tf.Tensor
+    fc_accept: tf.Tensor
+    u_scale_accept: tf.Tensor
+
+
+def _num_chunks(n_steps: int, chunk_size: int) -> int:
+    """Return the number of chunks needed for a given step count."""
+    if n_steps <= 0:
+        return 0
+    return (n_steps + chunk_size - 1) // chunk_size
+
+
+def _last_state(samples: StockpilingState) -> StockpilingState:
+    """Extract the terminal state from a chunk of sampled states."""
+    return StockpilingState(
+        z_beta=samples.z_beta[-1],
+        z_alpha=samples.z_alpha[-1],
+        z_v=samples.z_v[-1],
+        z_fc=samples.z_fc[-1],
+        z_u_scale=samples.z_u_scale[-1],
     )
 
-    beta = tf.constant(init["beta"], dtype=tf.float64)  # scalar
-    alpha = tf.constant(
-        np.asarray(init["alpha"], dtype=np.float64), dtype=tf.float64
-    )  # (J,)
-    v = tf.constant(np.asarray(init["v"], dtype=np.float64), dtype=tf.float64)  # (J,)
-    fc = tf.constant(np.asarray(init["fc"], dtype=np.float64), dtype=tf.float64)  # (J,)
-    u_scale = tf.constant(
-        np.asarray(init["u_scale"], dtype=np.float64), dtype=tf.float64
-    )  # (M,)
 
-    z_beta = tf.reshape(_logit(beta), (1,))  # store scalar beta as shape (1,)
-    z_alpha = tf.math.log(alpha)
-    z_v = tf.math.log(v)
-    z_fc = tf.math.log(fc)
-    z_u_scale = tf.math.log(u_scale)
+def _concat_sample_chunks(chunks: list[StockpilingState]) -> StockpilingState:
+    """Concatenate retained sample chunks into one state trace."""
+    if len(chunks) == 0:
+        raise ValueError("No retained sample chunks were produced.")
 
-    return _pack_z(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+    return StockpilingState(
+        z_beta=tf.concat([chunk.z_beta for chunk in chunks], axis=0),
+        z_alpha=tf.concat([chunk.z_alpha for chunk in chunks], axis=0),
+        z_v=tf.concat([chunk.z_v for chunk in chunks], axis=0),
+        z_fc=tf.concat([chunk.z_fc for chunk in chunks], axis=0),
+        z_u_scale=tf.concat([chunk.z_u_scale for chunk in chunks], axis=0),
+    )
 
 
-class StockpilingEstimator:
-    """MCMC sampler for the Phase-3 stockpiling model.
+def _raw_trace_to_dataclass(raw_trace: dict[str, tf.Tensor]) -> StockpilingChunkTrace:
+    """Convert the raw trace dictionary into a StockpilingChunkTrace."""
+    return StockpilingChunkTrace(
+        beta=raw_trace["beta"],
+        mean_alpha=raw_trace["mean_alpha"],
+        mean_v=raw_trace["mean_v"],
+        mean_fc=raw_trace["mean_fc"],
+        mean_u_scale=raw_trace["mean_u_scale"],
+        joint_logpost=raw_trace["joint_logpost"],
+        beta_accept=raw_trace["beta_accept"],
+        alpha_accept=raw_trace["alpha_accept"],
+        v_accept=raw_trace["v_accept"],
+        fc_accept=raw_trace["fc_accept"],
+        u_scale_accept=raw_trace["u_scale_accept"],
+    )
 
-    Fixed data (known to the estimator):
-      a_mnjt        (M,N,J,T)  purchases in {0,1}
-      s_mjt         (M,J,T)    price states in {0,...,S-1}
-      u_mj          (M,J)      fixed intercepts from Phase 1–2
-      price_vals_mj (M,J,S)    price levels by state
-      P_price_mj    (M,J,S,S)  price-state transitions
-      lambda_mn     (M,N)      consumption probability in (0,1)
-      pi_I0         (I_max+1,) initial inventory distribution
-      waste_cost    scalar
 
-    Sampler settings:
-      tol, max_iter   DP/CCP solver settings passed through the posterior
-      sigmas          prior scales on unconstrained z-blocks
-      rng_seed        seed for tf.random.Generator
-    """
+def build_initial_state(M: int, J: int) -> StockpilingState:
+    """Construct the default initial state for the stockpiling chain."""
+    return StockpilingState(
+        z_beta=tf.constant(0.0, dtype=tf.float64),
+        z_alpha=tf.zeros([J], dtype=tf.float64),
+        z_v=tf.zeros([J], dtype=tf.float64),
+        z_fc=tf.zeros([J], dtype=tf.float64),
+        z_u_scale=tf.zeros([M], dtype=tf.float64),
+    )
+
+
+class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
+    """Implement one hybrid transition of the stockpiling sampler."""
 
     def __init__(
         self,
-        a_mnjt: Any,
-        s_mjt: Any,
-        u_mj: Any,
-        price_vals_mj: Any,
-        P_price_mj: Any,
-        lambda_mn: Any,
-        I_max: int,
-        pi_I0: Any,
-        waste_cost: float,
-        tol: float,
-        max_iter: int,
-        sigmas: dict[str, Any],
-        rng_seed: int,
-    ) -> None:
-        norm = normalize_stockpiling_estimator_init_inputs(
-            a_mnjt=a_mnjt,
-            s_mjt=s_mjt,
-            u_mj=u_mj,
-            price_vals_mj=price_vals_mj,
-            P_price_mj=P_price_mj,
-            lambda_mn=lambda_mn,
-            I_max=I_max,
-            pi_I0=pi_I0,
-            waste_cost=waste_cost,
-            tol=tol,
-            max_iter=max_iter,
-            sigmas=sigmas,
-            rng_seed=rng_seed,
+        posterior: StockpilingPosteriorTF,
+        config: StockpilingConfig,
+    ):
+        """Store the posterior object and proposal scales."""
+        self._posterior = posterior
+        self._config = config
+
+        self._k_beta = tf.convert_to_tensor(config.k_beta, dtype=tf.float64)
+        self._k_alpha = tf.convert_to_tensor(config.k_alpha, dtype=tf.float64)
+        self._k_v = tf.convert_to_tensor(config.k_v, dtype=tf.float64)
+        self._k_fc = tf.convert_to_tensor(config.k_fc, dtype=tf.float64)
+        self._k_u_scale = tf.convert_to_tensor(config.k_u_scale, dtype=tf.float64)
+
+        self._parameters = {
+            "posterior": posterior,
+            "config": config,
+        }
+
+    @property
+    def parameters(self):
+        """Return the kernel parameters required by the TFP interface."""
+        return self._parameters
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Return whether the kernel is treated as calibrated."""
+        return True
+
+    def bootstrap_results(
+        self,
+        current_state: StockpilingState,
+    ) -> StockpilingKernelResults:
+        """Initialize the acceptance diagnostics for the first step."""
+        del current_state
+        zero = tf.constant(0.0, dtype=tf.float64)
+        return StockpilingKernelResults(
+            beta_accept=zero,
+            alpha_accept=zero,
+            v_accept=zero,
+            fc_accept=zero,
+            u_scale_accept=zero,
         )
 
-        self.M = int(norm["M"])
-        self.N = int(norm["N"])
-        self.J = int(norm["J"])
-        self.T = int(norm["T"])
-        self.S = int(norm["S"])
-        self.I_max = int(norm["I_max"])
-
-        inventory_maps = build_inventory_maps(self.I_max)
-
-        self.inputs: StockpilingInputs = {
-            "a_mnjt": tf.convert_to_tensor(norm["a_mnjt"], dtype=tf.int32),
-            "s_mjt": tf.convert_to_tensor(norm["s_mjt"], dtype=tf.int32),
-            "u_mj": tf.convert_to_tensor(norm["u_mj"], dtype=tf.float64),
-            "P_price_mj": tf.convert_to_tensor(norm["P_price_mj"], dtype=tf.float64),
-            "price_vals_mj": tf.convert_to_tensor(
-                norm["price_vals_mj"], dtype=tf.float64
-            ),
-            "lambda_mn": tf.convert_to_tensor(norm["lambda_mn"], dtype=tf.float64),
-            "waste_cost": tf.convert_to_tensor(norm["waste_cost"], dtype=tf.float64),
-            "inventory_maps": inventory_maps,
-            "tol": float(norm["tol"]),
-            "max_iter": int(norm["max_iter"]),
-            "pi_I0": tf.convert_to_tensor(norm["pi_I0"], dtype=tf.float64),
-        }
-
-        sig = norm["sigmas"]
-        self.sigma_z_beta = tf.convert_to_tensor(sig["z_beta"], dtype=tf.float64)
-        self.sigma_z_alpha = tf.convert_to_tensor(sig["z_alpha"], dtype=tf.float64)
-        self.sigma_z_v = tf.convert_to_tensor(sig["z_v"], dtype=tf.float64)
-        self.sigma_z_fc = tf.convert_to_tensor(sig["z_fc"], dtype=tf.float64)
-        self.sigma_z_u_scale = tf.convert_to_tensor(sig["z_u_scale"], dtype=tf.float64)
-
-        self.rng = tf.random.Generator.from_seed(int(norm["rng_seed"]))
-
-        self.z: dict[str, tf.Tensor] | None = None
-        self.theta_mean: dict[str, tf.Tensor] | None = None
-        self.accept: dict[str, float] | None = None
-        self.n_saved: int | None = None
-
-    def fit(
+    def one_step(
         self,
-        n_iter: int,
-        k: dict[str, Any],
-        init_theta: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        """Run MCMC and return posterior means and acceptance rates.
+        current_state: StockpilingState,
+        previous_kernel_results: StockpilingKernelResults,
+        seed: tf.Tensor,
+    ) -> tuple[StockpilingState, StockpilingKernelResults]:
+        """Apply one full hybrid transition of the stockpiling chain."""
+        del previous_kernel_results
+        seeds = tf.random.experimental.stateless_split(seed, num=5)
 
-        Args:
-          n_iter: number of MCMC iterations
-          k: proposal scales dict with keys {"beta","alpha","v","fc","u_scale"}
-          init_theta: constrained initial state dict with keys {"beta","alpha","v","fc","u_scale"}
+        z_beta_new, beta_accept = beta_one_step(
+            posterior=self._posterior,
+            z_beta=current_state.z_beta,
+            z_alpha=current_state.z_alpha,
+            z_v=current_state.z_v,
+            z_fc=current_state.z_fc,
+            z_u_scale=current_state.z_u_scale,
+            k_beta=self._k_beta,
+            seed=seeds[0],
+        )
 
-        Returns:
-          dict with keys:
-            - theta_mean: constrained posterior mean tensors
-            - acceptance: acceptance rates by block
-            - z_last: final unconstrained state (dict of tensors)
-        """
-        fit_norm = normalize_stockpiling_estimator_fit_inputs(n_iter=n_iter, k=k)
-        n_iter_i = int(fit_norm["n_iter"])
-        k_use = fit_norm["k"]
+        z_alpha_new, alpha_accept = alpha_one_step(
+            posterior=self._posterior,
+            z_beta=z_beta_new,
+            z_alpha=current_state.z_alpha,
+            z_v=current_state.z_v,
+            z_fc=current_state.z_fc,
+            z_u_scale=current_state.z_u_scale,
+            k_alpha=self._k_alpha,
+            seed=seeds[1],
+        )
 
-        z = _z_from_init_theta(init_theta=init_theta, M=self.M, J=self.J)
+        z_v_new, v_accept = v_one_step(
+            posterior=self._posterior,
+            z_beta=z_beta_new,
+            z_alpha=z_alpha_new,
+            z_v=current_state.z_v,
+            z_fc=current_state.z_fc,
+            z_u_scale=current_state.z_u_scale,
+            k_v=self._k_v,
+            seed=seeds[2],
+        )
 
-        k_beta = tf.convert_to_tensor(k_use["beta"], dtype=tf.float64)
-        k_alpha = tf.convert_to_tensor(k_use["alpha"], dtype=tf.float64)
-        k_v = tf.convert_to_tensor(k_use["v"], dtype=tf.float64)
-        k_fc = tf.convert_to_tensor(k_use["fc"], dtype=tf.float64)
-        k_u_scale = tf.convert_to_tensor(k_use["u_scale"], dtype=tf.float64)
+        z_fc_new, fc_accept = fc_one_step(
+            posterior=self._posterior,
+            z_beta=z_beta_new,
+            z_alpha=z_alpha_new,
+            z_v=z_v_new,
+            z_fc=current_state.z_fc,
+            z_u_scale=current_state.z_u_scale,
+            k_fc=self._k_fc,
+            seed=seeds[3],
+        )
 
-        theta_sum = {
-            "beta": tf.zeros((), dtype=tf.float64),
-            "alpha": tf.zeros((self.J,), dtype=tf.float64),
-            "v": tf.zeros((self.J,), dtype=tf.float64),
-            "fc": tf.zeros((self.J,), dtype=tf.float64),
-            "u_scale": tf.zeros((self.M,), dtype=tf.float64),
+        z_u_scale_new, u_scale_accept = u_scale_one_step(
+            posterior=self._posterior,
+            z_beta=z_beta_new,
+            z_alpha=z_alpha_new,
+            z_v=z_v_new,
+            z_fc=z_fc_new,
+            z_u_scale=current_state.z_u_scale,
+            k_u_scale=self._k_u_scale,
+            seed=seeds[4],
+        )
+
+        new_state = StockpilingState(
+            z_beta=z_beta_new,
+            z_alpha=z_alpha_new,
+            z_v=z_v_new,
+            z_fc=z_fc_new,
+            z_u_scale=z_u_scale_new,
+        )
+        new_results = StockpilingKernelResults(
+            beta_accept=beta_accept,
+            alpha_accept=alpha_accept,
+            v_accept=v_accept,
+            fc_accept=fc_accept,
+            u_scale_accept=u_scale_accept,
+        )
+        return new_state, new_results
+
+    def copy(self, **kwargs):
+        """Return a copy of the kernel with updated parameters."""
+        parameters = dict(self.parameters)
+        parameters.update(kwargs)
+        return type(self)(**parameters)
+
+
+def _make_trace(
+    posterior: StockpilingPosteriorTF,
+    current_state: StockpilingState,
+    kernel_results: StockpilingKernelResults,
+) -> dict[str, tf.Tensor]:
+    """Build the per-draw diagnostics recorded during sampling."""
+    if posterior.fix_u_scale:
+        z_u_scale_eff = (
+            tf.zeros_like(current_state.z_u_scale) + posterior.fixed_z_u_scale
+        )
+    else:
+        z_u_scale_eff = current_state.z_u_scale
+
+    theta = unconstrained_to_theta(
+        {
+            "z_beta": current_state.z_beta,
+            "z_alpha": current_state.z_alpha,
+            "z_v": current_state.z_v,
+            "z_fc": current_state.z_fc,
+            "z_u_scale": z_u_scale_eff,
         }
+    )
+    joint_lp = posterior.joint_logpost(
+        z_beta=current_state.z_beta,
+        z_alpha=current_state.z_alpha,
+        z_v=current_state.z_v,
+        z_fc=current_state.z_fc,
+        z_u_scale=current_state.z_u_scale,
+    )
 
-        acc_sum = {
-            "beta": tf.zeros((), dtype=tf.float64),
-            "alpha": tf.zeros((), dtype=tf.float64),
-            "v": tf.zeros((), dtype=tf.float64),
-            "fc": tf.zeros((), dtype=tf.float64),
-            "u_scale": tf.zeros((), dtype=tf.float64),
+    return {
+        "beta": theta["beta"],
+        "mean_alpha": tf.reduce_mean(theta["alpha"]),
+        "mean_v": tf.reduce_mean(theta["v"]),
+        "mean_fc": tf.reduce_mean(theta["fc"]),
+        "mean_u_scale": tf.reduce_mean(theta["u_scale"]),
+        "joint_logpost": joint_lp,
+        "beta_accept": kernel_results.beta_accept,
+        "alpha_accept": kernel_results.alpha_accept,
+        "v_accept": kernel_results.v_accept,
+        "fc_accept": kernel_results.fc_accept,
+        "u_scale_accept": kernel_results.u_scale_accept,
+    }
+
+
+def run_chain(
+    a_mnjt: tf.Tensor,
+    s_mjt: tf.Tensor,
+    u_mj: tf.Tensor,
+    P_price_mj: tf.Tensor,
+    price_vals_mj: tf.Tensor,
+    lambda_mn: tf.Tensor,
+    waste_cost: tf.Tensor,
+    inventory_maps,
+    pi_I0: tf.Tensor,
+    posterior_config: StockpilingPosteriorConfig,
+    stockpiling_config: StockpilingConfig,
+    initial_state: StockpilingState,
+    seed: tf.Tensor,
+) -> StockpilingState:
+    """Validate inputs, run the chain, and return retained draws."""
+    run_chain_validate_input(
+        a_mnjt=a_mnjt,
+        s_mjt=s_mjt,
+        u_mj=u_mj,
+        P_price_mj=P_price_mj,
+        price_vals_mj=price_vals_mj,
+        lambda_mn=lambda_mn,
+        waste_cost=waste_cost,
+        inventory_maps=inventory_maps,
+        pi_I0=pi_I0,
+        posterior_config=posterior_config,
+        sampler_config=stockpiling_config,
+        z_beta=initial_state.z_beta,
+        z_alpha=initial_state.z_alpha,
+        z_v=initial_state.z_v,
+        z_fc=initial_state.z_fc,
+        z_u_scale=initial_state.z_u_scale,
+        seed=seed,
+    )
+
+    posterior = StockpilingPosteriorTF(
+        config=posterior_config,
+        a_mnjt=a_mnjt,
+        s_mjt=s_mjt,
+        u_mj=u_mj,
+        P_price_mj=P_price_mj,
+        price_vals_mj=price_vals_mj,
+        lambda_mn=lambda_mn,
+        waste_cost=waste_cost,
+        inventory_maps=inventory_maps,
+        pi_I0=pi_I0,
+    )
+
+    kernel = StockpilingHybridKernel(
+        posterior=posterior,
+        config=stockpiling_config,
+    )
+
+    def trace_fn(
+        current_state: StockpilingState,
+        kernel_results: StockpilingKernelResults,
+    ) -> dict[str, tf.Tensor]:
+        """Record the per-draw diagnostics reported at chunk boundaries."""
+        return _make_trace(
+            posterior=posterior,
+            current_state=current_state,
+            kernel_results=kernel_results,
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _run_chunk(
+        current_state: StockpilingState,
+        previous_kernel_results: StockpilingKernelResults,
+        num_steps: tf.Tensor,
+        chunk_seed: tf.Tensor,
+    ):
+        """Run one chunk of the chain and return samples, trace, and kernel results."""
+        return tfp.mcmc.sample_chain(
+            num_results=num_steps,
+            num_burnin_steps=0,
+            current_state=current_state,
+            previous_kernel_results=previous_kernel_results,
+            kernel=kernel,
+            trace_fn=trace_fn,
+            return_final_kernel_results=True,
+            seed=chunk_seed,
+        )
+
+    state = initial_state
+    kernel_results = kernel.bootstrap_results(initial_state)
+
+    burnin_chunks = _num_chunks(
+        stockpiling_config.num_burnin_steps,
+        stockpiling_config.chunk_size,
+    )
+    result_chunks = _num_chunks(
+        stockpiling_config.num_results,
+        stockpiling_config.chunk_size,
+    )
+    total_chunks = burnin_chunks + result_chunks
+
+    chunk_seeds = tf.random.experimental.stateless_split(seed, num=total_chunks)
+
+    chunk_idx = 0
+    chunk_summaries: list[StockpilingChunkSummary] = []
+    retained_chunks: list[StockpilingState] = []
+
+    def run_phase(remaining_steps: int, retain: bool) -> int:
+        """Execute one chunked phase of the chain."""
+        nonlocal chunk_idx, state, kernel_results
+
+        while remaining_steps > 0:
+            this_chunk = min(stockpiling_config.chunk_size, remaining_steps)
+
+            chunk_samples, raw_trace, kernel_results = _run_chunk(
+                current_state=state,
+                previous_kernel_results=kernel_results,
+                num_steps=tf.constant(this_chunk, dtype=tf.int32),
+                chunk_seed=chunk_seeds[chunk_idx],
+            )
+
+            state = _last_state(chunk_samples)
+
+            if retain:
+                retained_chunks.append(chunk_samples)
+
+            trace = _raw_trace_to_dataclass(raw_trace)
+            summary = report_chunk_progress(
+                trace=trace,
+                chunk_idx=chunk_idx + 1,
+                total_chunks=total_chunks,
+            )
+            chunk_summaries.append(summary)
+
+            remaining_steps -= this_chunk
+            chunk_idx += 1
+
+        return remaining_steps
+
+    run_phase(stockpiling_config.num_burnin_steps, retain=False)
+    run_phase(stockpiling_config.num_results, retain=True)
+
+    if len(chunk_summaries) > 0:
+        report_run_summary(chunk_summaries)
+
+    return _concat_sample_chunks(retained_chunks)
+
+
+def summarize_samples(
+    samples: StockpilingState,
+    posterior_config: StockpilingPosteriorConfig,
+) -> dict[str, tf.Tensor]:
+    """Compute posterior mean summaries from retained chain output."""
+    if posterior_config.fix_u_scale:
+        z_u_scale_eff = tf.zeros_like(
+            samples.z_u_scale, dtype=tf.float64
+        ) + tf.constant(posterior_config.fixed_z_u_scale, dtype=tf.float64)
+    else:
+        z_u_scale_eff = samples.z_u_scale
+
+    theta = unconstrained_to_theta(
+        {
+            "z_beta": samples.z_beta,
+            "z_alpha": samples.z_alpha,
+            "z_v": samples.z_v,
+            "z_fc": samples.z_fc,
+            "z_u_scale": z_u_scale_eff,
         }
+    )
 
-        for it in range(n_iter_i):
-            z_beta_new, acc_beta = update_z_beta_scalar(
-                z_beta=z["z_beta"],
-                z_alpha=z["z_alpha"],
-                z_v=z["z_v"],
-                z_fc=z["z_fc"],
-                z_u_scale=z["z_u_scale"],
-                inputs=self.inputs,
-                sigma_z_beta=self.sigma_z_beta,
-                k_beta=k_beta,
-                rng=self.rng,
-            )
-            z["z_beta"] = z_beta_new
+    beta_hat = tf.reduce_mean(theta["beta"], axis=0)
+    alpha_hat = tf.reduce_mean(theta["alpha"], axis=0)
+    v_hat = tf.reduce_mean(theta["v"], axis=0)
+    fc_hat = tf.reduce_mean(theta["fc"], axis=0)
+    u_scale_hat = tf.reduce_mean(theta["u_scale"], axis=0)
 
-            z_alpha_new, acc_alpha = update_z_alpha_j(
-                z_beta=z["z_beta"],
-                z_alpha=z["z_alpha"],
-                z_v=z["z_v"],
-                z_fc=z["z_fc"],
-                z_u_scale=z["z_u_scale"],
-                inputs=self.inputs,
-                sigma_z_alpha=self.sigma_z_alpha,
-                k_alpha=k_alpha,
-                rng=self.rng,
-            )
-            z["z_alpha"] = z_alpha_new
-
-            z_v_new, acc_v = update_z_v_j(
-                z_beta=z["z_beta"],
-                z_alpha=z["z_alpha"],
-                z_v=z["z_v"],
-                z_fc=z["z_fc"],
-                z_u_scale=z["z_u_scale"],
-                inputs=self.inputs,
-                sigma_z_v=self.sigma_z_v,
-                k_v=k_v,
-                rng=self.rng,
-            )
-            z["z_v"] = z_v_new
-
-            z_fc_new, acc_fc = update_z_fc_j(
-                z_beta=z["z_beta"],
-                z_alpha=z["z_alpha"],
-                z_v=z["z_v"],
-                z_fc=z["z_fc"],
-                z_u_scale=z["z_u_scale"],
-                inputs=self.inputs,
-                sigma_z_fc=self.sigma_z_fc,
-                k_fc=k_fc,
-                rng=self.rng,
-            )
-            z["z_fc"] = z_fc_new
-
-            z_u_scale_new, acc_u_scale = update_z_u_scale_m(
-                z_beta=z["z_beta"],
-                z_alpha=z["z_alpha"],
-                z_v=z["z_v"],
-                z_fc=z["z_fc"],
-                z_u_scale=z["z_u_scale"],
-                inputs=self.inputs,
-                sigma_z_u_scale=self.sigma_z_u_scale,
-                k_u_scale=k_u_scale,
-                rng=self.rng,
-            )
-            z["z_u_scale"] = z_u_scale_new
-
-            theta = unconstrained_to_theta(z)
-            theta_sum["beta"] = theta_sum["beta"] + tf.reshape(theta["beta"], ())
-            theta_sum["alpha"] = theta_sum["alpha"] + theta["alpha"]
-            theta_sum["v"] = theta_sum["v"] + theta["v"]
-            theta_sum["fc"] = theta_sum["fc"] + theta["fc"]
-            theta_sum["u_scale"] = theta_sum["u_scale"] + theta["u_scale"]
-
-            acc_sum["beta"] = acc_sum["beta"] + tf.reduce_mean(
-                tf.cast(acc_beta, tf.float64)
-            )
-            acc_sum["alpha"] = acc_sum["alpha"] + tf.reduce_mean(
-                tf.cast(acc_alpha, tf.float64)
-            )
-            acc_sum["v"] = acc_sum["v"] + tf.reduce_mean(tf.cast(acc_v, tf.float64))
-            acc_sum["fc"] = acc_sum["fc"] + tf.reduce_mean(tf.cast(acc_fc, tf.float64))
-            acc_sum["u_scale"] = acc_sum["u_scale"] + tf.reduce_mean(
-                tf.cast(acc_u_scale, tf.float64)
-            )
-
-            report_iteration_progress(z=z, it=tf.constant(it, dtype=tf.int32))
-
-        denom = tf.cast(n_iter_i, tf.float64)
-        theta_mean = {
-            "beta": theta_sum["beta"] / denom,
-            "alpha": theta_sum["alpha"] / denom,
-            "v": theta_sum["v"] / denom,
-            "fc": theta_sum["fc"] / denom,
-            "u_scale": theta_sum["u_scale"] / denom,
-        }
-
-        accept = {
-            "beta": float((acc_sum["beta"] / denom).numpy()),
-            "alpha": float((acc_sum["alpha"] / denom).numpy()),
-            "v": float((acc_sum["v"] / denom).numpy()),
-            "fc": float((acc_sum["fc"] / denom).numpy()),
-            "u_scale": float((acc_sum["u_scale"] / denom).numpy()),
-        }
-
-        n_saved = int(n_iter_i)
-
-        self.z = z
-        self.theta_mean = theta_mean
-        self.accept = accept
-        self.n_saved = n_saved
-
-        return {
-            "theta_mean": theta_mean,
-            "accept": accept,
-            "n_saved": n_saved,
-            "z_last": z,
-        }
-
-    def predict_probabilities(self, theta: Mapping[str, tf.Tensor]) -> tf.Tensor:
-        """Predict buy probabilities p_buy_mnjt under the supplied constrained theta.
-
-        Returns:
-          p_buy_mnjt: (M,N,J,T) float64
-        """
-        theta_use = {
-            "beta": tf.convert_to_tensor(theta["beta"], dtype=tf.float64),
-            "alpha": tf.convert_to_tensor(theta["alpha"], dtype=tf.float64),
-            "v": tf.convert_to_tensor(theta["v"], dtype=tf.float64),
-            "fc": tf.convert_to_tensor(theta["fc"], dtype=tf.float64),
-            "u_scale": tf.convert_to_tensor(theta["u_scale"], dtype=tf.float64),
-        }
-        return predict_p_buy_mnjt_from_theta(theta=theta_use, inputs=self.inputs)
+    return {
+        "beta_hat": beta_hat,
+        "alpha_hat": alpha_hat,
+        "v_hat": v_hat,
+        "fc_hat": fc_hat,
+        "u_scale_hat": u_scale_hat,
+    }

@@ -1,54 +1,31 @@
-"""
-run_ching.py
-
-End-to-end orchestration for the Phase-3 stockpiling (Ching-style) layer on top of
-Phase 1–2 utilities (run_zhang_with_lu).
-
-Key objects:
-  - Phase 1 output: delta_hat (J,)
-  - Phase 2 output: E_bar_hat (M,), njt_hat (M,J)
-  - Phase 3 intercepts: u_mj = delta_hat[None,:] + E_bar_hat[:,None] + njt_hat
-
-Phase 3 observed panel:
-  - a_mnjt      (M,N,J,T) purchases
-  - s_mjt       (M,J,T)   exogenous price states
-
-Known to estimator:
-  - P_price_mj    (M,J,S,S) price Markov transitions
-  - price_vals_mj (M,J,S)   price levels by state
-  - u_mj          (M,J)     intercepts
-  - lambda_mn     (M,N)     consumption probabilities (treated as known input)
-
-Phase 3 estimated parameters (MCMC):
-  - beta      (1,)
-  - alpha     (J,)
-  - v         (J,)
-  - fc        (J,)
-  - u_scale   (M,)   (estimation-only nuisance; DGP uses u_mj unscaled)
-"""
+"""Run the Phase 1–3 Ching stockpiling experiment with the refactored Phase-3 chain."""
 
 from __future__ import annotations
 
 import os
 from typing import Any
 
-import numpy as np
-
-# Set TF log level before importing TensorFlow.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
+import numpy as np
 import tensorflow as tf
 
-import ching.stockpiling_model as sp_model
 from datasets.ching_dgp import generate_dgp
 
-from ching.stockpiling_estimator import StockpilingEstimator
+from ching.stockpiling_estimator import (
+    StockpilingConfig,
+    StockpilingState,
+    build_initial_state,
+    run_chain,
+    summarize_samples,
+)
 from ching.stockpiling_evaluate import evaluate_stockpiling, format_evaluation_summary
-from ching.stockpiling_posterior import StockpilingInputs, predict_p_buy_mnjt_from_theta
+from ching.stockpiling_model import build_inventory_maps, unconstrained_to_theta
+from ching.stockpiling_posterior import (
+    StockpilingPosteriorConfig,
+    StockpilingPosteriorTF,
+)
 
-from ching.stockpiling_input_validation import validate_stockpiling_phase3_config
-
-# Phase 1–2 orchestration
 from run_zhang_with_lu import (
     build_shrinkage_fit_config,
     build_shrinkage_init_config,
@@ -60,15 +37,10 @@ from run_zhang_with_lu import (
 
 
 def uniform_pi_I0(I_max: int) -> np.ndarray:
-    """Uniform initial inventory distribution over {0,...,I_max}."""
-    I_max_i = int(I_max)
-    pi = np.ones(I_max_i + 1, dtype=np.float64)
+    """Return the uniform initial inventory distribution over {0, ..., I_max}."""
+    pi = np.ones(int(I_max) + 1, dtype=np.float64)
     return pi / float(pi.sum())
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
 
 CFG_PHASE1: dict[str, Any] = {
     "seed": 123,
@@ -110,12 +82,11 @@ CFG_PHASE2: dict[str, Any] = {
             "b_phi": 1.0,
         },
         "init_state": {
-            # Scalars; expanded to required shapes inside run_phase2().
             "alpha": 1.0,
             "E_bar": 0.0,
             "njt": 0.0,
-            "gamma": 0.0,  # MUST be exactly 0.0 or 1.0
-            "phi": 0.5,  # MUST be strictly in (0,1)
+            "gamma": 0.0,
+            "phi": 0.5,
         },
     },
     "fit_config": {
@@ -143,7 +114,6 @@ CFG_PHASE3: dict[str, Any] = {
     "dp_tol": 1e-5,
     "dp_max_iter": 200,
     "pi_I0": uniform_pi_I0(10),
-    # price process construction
     "price_seed": 777,
     "p_stay": 0.85,
     "P_noise_sd": 0.05,
@@ -153,43 +123,42 @@ CFG_PHASE3: dict[str, Any] = {
     "discount_low": 0.10,
     "discount_high": 0.35,
     "price_noise_sd": 0.02,
-    # MCMC
     "mcmc_seed": 0,
-    "mcmc_n_iter": 500,
-    "init_theta": {
-        "beta": 0.5,
-        "alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.5, dtype=np.float64),
-        "v": np.full((int(CFG_PHASE1["num_products"]),), 0.5, dtype=np.float64),
-        "fc": np.full((int(CFG_PHASE1["num_products"]),), 0.5, dtype=np.float64),
-        "u_scale": np.ones((int(CFG_PHASE1["num_markets"]),), dtype=np.float64),
+    "posterior": {
+        "tol": 1e-5,
+        "max_iter": 200,
+        "eps": 1e-12,
+        "sigma_z_beta": 2.0,
+        "sigma_z_alpha": 2.0,
+        "sigma_z_v": 2.0,
+        "sigma_z_fc": 2.0,
+        "sigma_z_u_scale": 2.0,
+        "fix_u_scale": True,
+        "fixed_z_u_scale": 0.0,
     },
-    # StockpilingEstimator expects z-space prior scales keyed by z_*.
-    "sigmas": {
-        "z_beta": 2.0,
-        "z_alpha": 2.0,
-        "z_v": 2.0,
-        "z_fc": 2.0,
-        "z_u_scale": 2.0,
-    },
-    # Proposal scales (z-space random walk). Set u_scale > 0 to estimate it.
-    "k": {
-        "beta": 0.1,
-        "alpha": 0.05,
-        "v": 0.2,
-        "fc": 0.05,
-        "u_scale": 0.00,
+    "sampler": {
+        "num_results": 500,
+        "num_burnin_steps": 0,
+        "chunk_size": 100,
+        "k_beta": 0.10,
+        "k_alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.05, dtype=np.float64),
+        "k_v": np.full((int(CFG_PHASE1["num_products"]),), 0.20, dtype=np.float64),
+        "k_fc": np.full((int(CFG_PHASE1["num_products"]),), 0.05, dtype=np.float64),
+        "k_u_scale": np.full((int(CFG_PHASE1["num_markets"]),), 0.05, dtype=np.float64),
+        "pilot_num_steps": 100,
+        "target_accept_low": 0.20,
+        "target_accept_high": 0.40,
+        "grow_factor": 1.5,
+        "shrink_factor": 0.75,
+        "max_tuning_rounds": 8,
     },
 }
 
 EVAL_EPS = 1e-12
 
-# =============================================================================
-# Price process helpers
-# =============================================================================
-
 
 def _row_normalize(P: np.ndarray, min_prob: float) -> np.ndarray:
-    """Row-normalize a 2D array after clipping entries below min_prob."""
+    """Clip a transition matrix below min_prob and row-normalize it."""
     P64 = np.asarray(P, dtype=np.float64)
     P64 = np.maximum(P64, float(min_prob))
     return P64 / P64.sum(axis=-1, keepdims=True)
@@ -204,17 +173,18 @@ def _build_price_transitions(
     noise_sd: float,
     min_prob: float,
 ) -> np.ndarray:
-    """Construct (M,J,S,S) row-stochastic Markov transitions with mild randomization."""
-    M_i, J_i, S_i = int(M), int(J), int(S)
-    P = np.zeros((M_i, J_i, S_i, S_i), dtype=np.float64)
+    """Construct row-stochastic (M, J, S, S) price-state transitions."""
+    P = np.zeros((int(M), int(J), int(S), int(S)), dtype=np.float64)
+    base = np.full(
+        (int(S), int(S)),
+        (1.0 - float(p_stay)) / max(int(S) - 1, 1),
+        dtype=np.float64,
+    )
+    np.fill_diagonal(base, float(p_stay))
 
-    p_stay_f = float(p_stay)
-    base = np.full((S_i, S_i), (1.0 - p_stay_f) / max(S_i - 1, 1), dtype=np.float64)
-    np.fill_diagonal(base, p_stay_f)
-
-    for m in range(M_i):
-        for j in range(J_i):
-            noise = rng.normal(0.0, float(noise_sd), size=(S_i, S_i))
+    for m in range(int(M)):
+        for j in range(int(J)):
+            noise = rng.normal(0.0, float(noise_sd), size=(int(S), int(S)))
             P[m, j] = _row_normalize(base + noise, min_prob=min_prob)
 
     return P
@@ -231,11 +201,14 @@ def _build_price_levels(
     discount_high: float,
     noise_sd: float,
 ) -> np.ndarray:
-    """Construct (M,J,S) price levels with per-(m,j) base and state discounts."""
-    M_i, J_i, S_i = int(M), int(J), int(S)
-    base = rng.uniform(float(base_low), float(base_high), size=(M_i, J_i, 1))
-    disc = rng.uniform(float(discount_low), float(discount_high), size=(M_i, J_i, S_i))
-    noise = rng.normal(0.0, float(noise_sd), size=(M_i, J_i, S_i))
+    """Construct per-(market, product, state) price levels."""
+    base = rng.uniform(float(base_low), float(base_high), size=(int(M), int(J), 1))
+    disc = rng.uniform(
+        float(discount_low),
+        float(discount_high),
+        size=(int(M), int(J), int(S)),
+    )
+    noise = rng.normal(0.0, float(noise_sd), size=(int(M), int(J), int(S)))
     return np.maximum(1e-6, base * (1.0 - disc) + noise).astype(np.float64, copy=False)
 
 
@@ -253,7 +226,7 @@ def build_price_processes(
     discount_high: float,
     price_noise_sd: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build P_price_mj and price_vals_mj from config."""
+    """Construct the price-state Markov chains and their price levels."""
     rng = np.random.default_rng(int(seed_price))
     P_price_mj = _build_price_transitions(
         rng=rng,
@@ -278,53 +251,152 @@ def build_price_processes(
     return P_price_mj, price_vals_mj
 
 
-# =============================================================================
-# Diagnostics / summaries
-# =============================================================================
+def _to_numpy_results(results: dict[str, Any]) -> dict[str, Any]:
+    """Convert tensor-valued result entries into NumPy-backed outputs."""
+    out: dict[str, Any] = {}
+    for key, value in results.items():
+        if isinstance(value, tf.Tensor):
+            out[key] = value.numpy()
+        else:
+            out[key] = value
+    return out
+
+
+def _theta_to_state(theta: dict[str, Any], M: int) -> StockpilingState:
+    """Map constrained theta values into the unconstrained sampler state."""
+    beta = np.asarray(theta["beta"], dtype=np.float64)
+    beta = np.clip(beta, 1e-12, 1.0 - 1e-12)
+
+    alpha = np.asarray(theta["alpha"], dtype=np.float64)
+    v = np.asarray(theta["v"], dtype=np.float64)
+    fc = np.asarray(theta["fc"], dtype=np.float64)
+    u_scale = np.asarray(
+        theta.get("u_scale", np.ones((M,), dtype=np.float64)),
+        dtype=np.float64,
+    )
+
+    alpha = np.clip(alpha, 1e-12, None)
+    v = np.clip(v, 1e-12, None)
+    fc = np.clip(fc, 1e-12, None)
+    u_scale = np.clip(u_scale, 1e-12, None)
+
+    return StockpilingState(
+        z_beta=tf.convert_to_tensor(np.log(beta) - np.log1p(-beta), dtype=tf.float64),
+        z_alpha=tf.convert_to_tensor(np.log(alpha), dtype=tf.float64),
+        z_v=tf.convert_to_tensor(np.log(v), dtype=tf.float64),
+        z_fc=tf.convert_to_tensor(np.log(fc), dtype=tf.float64),
+        z_u_scale=tf.convert_to_tensor(np.log(u_scale), dtype=tf.float64),
+    )
+
+
+def _normalize_theta_true_for_eval(
+    theta_true: dict[str, Any],
+    M: int,
+) -> dict[str, np.ndarray]:
+    """Ensure the evaluation truth dictionary contains all standard Phase-3 keys."""
+    return {
+        "beta": np.asarray(theta_true["beta"], dtype=np.float64),
+        "alpha": np.asarray(theta_true["alpha"], dtype=np.float64),
+        "v": np.asarray(theta_true["v"], dtype=np.float64),
+        "fc": np.asarray(theta_true["fc"], dtype=np.float64),
+        "u_scale": np.asarray(
+            theta_true.get("u_scale", np.ones((M,), dtype=np.float64)),
+            dtype=np.float64,
+        ),
+    }
+
+
+def _build_posterior_config(cfg: dict[str, Any]) -> StockpilingPosteriorConfig:
+    """Construct the posterior config dataclass from Phase-3 config."""
+    pcfg = cfg["posterior"]
+    return StockpilingPosteriorConfig(
+        tol=float(pcfg["tol"]),
+        max_iter=int(pcfg["max_iter"]),
+        eps=float(pcfg["eps"]),
+        sigma_z_beta=float(pcfg["sigma_z_beta"]),
+        sigma_z_alpha=float(pcfg["sigma_z_alpha"]),
+        sigma_z_v=float(pcfg["sigma_z_v"]),
+        sigma_z_fc=float(pcfg["sigma_z_fc"]),
+        sigma_z_u_scale=float(pcfg["sigma_z_u_scale"]),
+        fix_u_scale=bool(pcfg["fix_u_scale"]),
+        fixed_z_u_scale=float(pcfg["fixed_z_u_scale"]),
+    )
+
+
+def _build_sampler_config(cfg: dict[str, Any]) -> StockpilingConfig:
+    """Construct the sampler config dataclass from Phase-3 config."""
+    scfg = cfg["sampler"]
+    return StockpilingConfig(
+        num_results=int(scfg["num_results"]),
+        num_burnin_steps=int(scfg["num_burnin_steps"]),
+        chunk_size=int(scfg["chunk_size"]),
+        k_beta=tf.convert_to_tensor(float(scfg["k_beta"]), dtype=tf.float64),
+        k_alpha=tf.convert_to_tensor(
+            np.asarray(scfg["k_alpha"], dtype=np.float64),
+            dtype=tf.float64,
+        ),
+        k_v=tf.convert_to_tensor(
+            np.asarray(scfg["k_v"], dtype=np.float64),
+            dtype=tf.float64,
+        ),
+        k_fc=tf.convert_to_tensor(
+            np.asarray(scfg["k_fc"], dtype=np.float64),
+            dtype=tf.float64,
+        ),
+        k_u_scale=tf.convert_to_tensor(
+            np.asarray(scfg["k_u_scale"], dtype=np.float64),
+            dtype=tf.float64,
+        ),
+        pilot_num_steps=int(scfg["pilot_num_steps"]),
+        target_accept_low=float(scfg["target_accept_low"]),
+        target_accept_high=float(scfg["target_accept_high"]),
+        grow_factor=float(scfg["grow_factor"]),
+        shrink_factor=float(scfg["shrink_factor"]),
+        max_tuning_rounds=int(scfg["max_tuning_rounds"]),
+    )
 
 
 def summarize_stockpiling_panel(
-    panel: dict[str, Any], init_theta: dict[str, Any]
+    panel: dict[str, Any],
+    initial_state: StockpilingState,
 ) -> None:
-    """Lightweight printout of Phase-3 panel + true/init params."""
-    a = np.asarray(panel["a_mnjt"])
+    """Print a lightweight summary of the generated Phase-3 panel."""
+    a = np.asarray(panel["a_mnjt"], dtype=np.float64)
     s = np.asarray(panel["s_mjt"])
-    u = np.asarray(panel["u_mj"])
+    u = np.asarray(panel["u_mj"], dtype=np.float64)
 
     print("")
     print("=== Stockpiling data generated ===")
     print(f"shapes: a_mnjt={a.shape} | p_state_mjt={s.shape} | u_mj={u.shape}")
     print(f"overall buy rate: {float(a.mean()):.4f}")
 
-    theta_true = panel.get("theta_true", None)
+    theta_true = panel.get("theta_true")
     if isinstance(theta_true, dict):
         print(
             "[Stockpiling] True | "
-            f'mean(beta)= "{float(np.mean(theta_true["beta"])):.4f}" , '
-            f'mean(alpha)= "{float(np.mean(theta_true["alpha"])):.4f}" , '
-            f'mean(v)= "{float(np.mean(theta_true["v"])):.4f}" , '
-            f'mean(fc)= "{float(np.mean(theta_true["fc"])):.4f}"'
+            f'mean(beta)="{float(np.mean(np.asarray(theta_true["beta"], dtype=np.float64))):.4f}" , '
+            f'mean(alpha)="{float(np.mean(np.asarray(theta_true["alpha"], dtype=np.float64))):.4f}" , '
+            f'mean(v)="{float(np.mean(np.asarray(theta_true["v"], dtype=np.float64))):.4f}" , '
+            f'mean(fc)="{float(np.mean(np.asarray(theta_true["fc"], dtype=np.float64))):.4f}"'
         )
 
-    beta0 = float(np.mean(np.asarray(init_theta["beta"], dtype=np.float64)))
-    alpha0 = float(np.mean(np.asarray(init_theta["alpha"], dtype=np.float64)))
-    v0 = float(np.mean(np.asarray(init_theta["v"], dtype=np.float64)))
-    fc0 = float(np.mean(np.asarray(init_theta["fc"], dtype=np.float64)))
-    u_scale0 = float(np.mean(np.asarray(init_theta["u_scale"], dtype=np.float64)))
-
+    theta0 = unconstrained_to_theta(
+        {
+            "z_beta": initial_state.z_beta,
+            "z_alpha": initial_state.z_alpha,
+            "z_v": initial_state.z_v,
+            "z_fc": initial_state.z_fc,
+            "z_u_scale": initial_state.z_u_scale,
+        }
+    )
     print(
         "[Stockpiling] Init | "
-        f'mean(beta)= "{beta0:.4f}" , '
-        f'mean(alpha)= "{alpha0:.4f}" , '
-        f'mean(v)= "{v0:.4f}" , '
-        f'mean(fc)= "{fc0:.4f}" , '
-        f'mean(u_scale)= "{u_scale0:.4f}"'
+        f'mean(beta)="{float(theta0["beta"].numpy()):.4f}" , '
+        f'mean(alpha)="{float(tf.reduce_mean(theta0["alpha"]).numpy()):.4f}" , '
+        f'mean(v)="{float(tf.reduce_mean(theta0["v"]).numpy()):.4f}" , '
+        f'mean(fc)="{float(tf.reduce_mean(theta0["fc"]).numpy()):.4f}" , '
+        f'mean(u_scale)="{float(tf.reduce_mean(theta0["u_scale"]).numpy()):.4f}"'
     )
-
-
-# =============================================================================
-# Phase runners
-# =============================================================================
 
 
 def run_phase1(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -366,7 +438,6 @@ def run_phase1(cfg: dict[str, Any]) -> dict[str, Any]:
         eval_include_outside=bool(cfg["eval_include_outside"]),
         eval_against_empirical=bool(cfg["eval_against_empirical"]),
     )
-
     return out1
 
 
@@ -376,41 +447,30 @@ def run_phase2(
     delta_hat: np.ndarray,
     eval_include_outside: bool,
 ) -> dict[str, Any]:
-    """Run Phase 2 Lu-style market-shock estimator and print diagnostics."""
+    """Run Phase 2 Lu-style market-shock estimation and print diagnostics."""
     print("=== Phase 2: Market-shock estimator ===")
 
-    # Data tensors
-    qjt_np = np.asarray(dgp["qjt_shock"], dtype=np.float64)  # (T,J)
-    q0t_np = np.asarray(dgp["q0t_shock"], dtype=np.float64)  # (T,)
-    delta_hat_np = np.asarray(delta_hat, dtype=np.float64)  # (J,)
+    qjt_np = np.asarray(dgp["qjt_shock"], dtype=np.float64)
+    q0t_np = np.asarray(dgp["q0t_shock"], dtype=np.float64)
+    delta_hat_np = np.asarray(delta_hat, dtype=np.float64)
 
     T_i, J_i = qjt_np.shape
-    delta_cl_np = np.repeat(delta_hat_np[None, :], T_i, axis=0)  # (T,J)
+    delta_cl_np = np.repeat(delta_hat_np[None, :], T_i, axis=0)
 
     delta_cl = tf.convert_to_tensor(delta_cl_np, dtype=tf.float64)
     qjt = tf.convert_to_tensor(qjt_np, dtype=tf.float64)
     q0t = tf.convert_to_tensor(q0t_np, dtype=tf.float64)
 
-    # Config blocks (assemble exact types/shapes expected by cl_validate_input.py)
     init_cfg = cfg["init_config"]
     fit_cfg = cfg["fit_config"]
-
     posterior_cfg = init_cfg["posterior"]
     init_state_cfg = init_cfg["init_state"]
 
-    alpha0 = tf.convert_to_tensor(
-        float(init_state_cfg["alpha"]), dtype=tf.float64
-    )  # ()
-    E_bar0 = tf.fill([T_i], tf.cast(float(init_state_cfg["E_bar"]), tf.float64))  # (T,)
-    njt0 = tf.fill(
-        [T_i, J_i], tf.cast(float(init_state_cfg["njt"]), tf.float64)
-    )  # (T,J)
-
-    gamma_init = float(init_state_cfg["gamma"])
-    phi_init = float(init_state_cfg["phi"])
-
-    gamma0 = tf.fill([T_i, J_i], tf.cast(gamma_init, tf.float64))  # (T,J), binary {0,1}
-    phi0 = tf.fill([T_i], tf.cast(phi_init, tf.float64))  # (T,), in (0,1)
+    alpha0 = tf.convert_to_tensor(float(init_state_cfg["alpha"]), dtype=tf.float64)
+    E_bar0 = tf.fill([T_i], tf.cast(float(init_state_cfg["E_bar"]), tf.float64))
+    njt0 = tf.fill([T_i, J_i], tf.cast(float(init_state_cfg["njt"]), tf.float64))
+    gamma0 = tf.fill([T_i, J_i], tf.cast(float(init_state_cfg["gamma"]), tf.float64))
+    phi0 = tf.fill([T_i], tf.cast(float(init_state_cfg["phi"]), tf.float64))
 
     init_config = build_shrinkage_init_config(
         seed=int(init_cfg["seed"]),
@@ -460,7 +520,7 @@ def run_phase2(
 
 
 def build_phase3_inputs(delta_hat: np.ndarray, res2: dict[str, Any]) -> dict[str, Any]:
-    """Construct Phase-3 fixed inputs from Phase 1–2 outputs."""
+    """Build Phase-3 fixed utilities from the Phase 1–2 outputs."""
     return {
         "delta_used": np.asarray(delta_hat, dtype=np.float64),
         "E_bar_used": np.asarray(res2["E_bar_hat"], dtype=np.float64),
@@ -477,7 +537,7 @@ def run_phase3_dgp(
     price_vals_mj: np.ndarray,
     seed_dgp: int,
 ) -> dict[str, Any]:
-    """Generate the Phase-3 seller-observed panel via datasets.ching_dgp.generate_dgp."""
+    """Generate the Phase-3 seller-observed panel from the Ching DGP."""
     a_mnjt, p_state_mjt, u_mj, theta_true = generate_dgp(
         seed=int(seed_dgp),
         delta_true=delta_used,
@@ -510,34 +570,51 @@ def run_phase3_estimation(
     P_price_mj: np.ndarray,
     price_vals_mj: np.ndarray,
 ) -> dict[str, Any]:
-    """Fit stockpiling parameters from observed data, treating lambda_mn as known."""
-    est = StockpilingEstimator(
-        a_mnjt=panel["a_mnjt"],
-        s_mjt=panel["s_mjt"],
-        u_mj=panel["u_mj"],
-        price_vals_mj=price_vals_mj,
-        P_price_mj=P_price_mj,
-        lambda_mn=panel["lambda_mn"],
-        I_max=int(cfg["I_max"]),
-        pi_I0=np.asarray(cfg["pi_I0"], dtype=np.float64),
-        waste_cost=float(cfg["waste_cost"]),
-        tol=float(cfg["dp_tol"]),
-        max_iter=int(cfg["dp_max_iter"]),
-        sigmas=dict(cfg["sigmas"]),
-        rng_seed=int(cfg["mcmc_seed"]),
+    """Run the refactored Phase-3 chain and summarize retained samples."""
+    a_np = np.asarray(panel["a_mnjt"])
+    M = int(a_np.shape[0])
+    J = int(a_np.shape[2])
+
+    posterior_config = _build_posterior_config(cfg)
+    sampler_config = _build_sampler_config(cfg)
+    initial_state = build_initial_state(M=M, J=J)
+    chain_seed = tf.constant([int(cfg["mcmc_seed"]), 0], dtype=tf.int32)
+    inventory_maps = build_inventory_maps(int(cfg["I_max"]))
+
+    samples = run_chain(
+        a_mnjt=tf.convert_to_tensor(panel["a_mnjt"], dtype=tf.int32),
+        s_mjt=tf.convert_to_tensor(panel["s_mjt"], dtype=tf.int32),
+        u_mj=tf.convert_to_tensor(panel["u_mj"], dtype=tf.float64),
+        P_price_mj=tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
+        price_vals_mj=tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
+        lambda_mn=tf.convert_to_tensor(panel["lambda_mn"], dtype=tf.float64),
+        waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
+        inventory_maps=inventory_maps,
+        pi_I0=tf.convert_to_tensor(
+            np.asarray(cfg["pi_I0"], dtype=np.float64),
+            dtype=tf.float64,
+        ),
+        posterior_config=posterior_config,
+        stockpiling_config=sampler_config,
+        initial_state=initial_state,
+        seed=chain_seed,
     )
 
-    res = est.fit(
-        n_iter=int(cfg["mcmc_n_iter"]),
-        k=dict(cfg["k"]),
-        init_theta=dict(cfg["init_theta"]),
-    )
+    theta_hat = _to_numpy_results(summarize_samples(samples, posterior_config))
+    theta_hat = {
+        "beta": np.asarray(theta_hat["beta_hat"], dtype=np.float64),
+        "alpha": np.asarray(theta_hat["alpha_hat"], dtype=np.float64),
+        "v": np.asarray(theta_hat["v_hat"], dtype=np.float64),
+        "fc": np.asarray(theta_hat["fc_hat"], dtype=np.float64),
+        "u_scale": np.asarray(theta_hat["u_scale_hat"], dtype=np.float64),
+    }
 
     return {
-        "theta_hat": res["theta_mean"],
-        "accept": res["accept"],
-        "n_saved": res["n_saved"],
-        "z_last": res["z_last"],
+        "samples": samples,
+        "theta_hat": theta_hat,
+        "n_saved": int(samples.z_beta.shape[0]),
+        "initial_state": initial_state,
+        "posterior_config": posterior_config,
     }
 
 
@@ -548,55 +625,57 @@ def run_phase3_evaluation(
     price_vals_mj: np.ndarray,
     theta_hat: dict[str, Any],
     theta_true: dict[str, Any] | None,
-    mcmc_diag: dict[str, Any] | None,
+    posterior_config: StockpilingPosteriorConfig,
+    mcmc_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """
-    Evaluation wrapper aligned with ching.stockpiling_evaluate.evaluate_stockpiling().
-
-    - Computes fitted p_buy_hat_mnjt from theta_hat
-    - Optionally computes oracle p_buy_oracle_mnjt from theta_true (if provided)
-    - Calls evaluate_stockpiling(...) with the correct argument names/signature
-    """
-    a_np = np.asarray(panel["a_mnjt"])
+    """Evaluate the fitted Phase-3 stockpiling model."""
+    a_np = np.asarray(panel["a_mnjt"], dtype=np.float64)
     s_np = np.asarray(panel["s_mjt"])
-    u_np = np.asarray(panel["u_mj"])
-    lam_np = np.asarray(panel["lambda_mn"])
+    u_np = np.asarray(panel["u_mj"], dtype=np.float64)
+    lam_np = np.asarray(panel["lambda_mn"], dtype=np.float64)
 
     M = int(a_np.shape[0])
+    inventory_maps = build_inventory_maps(int(cfg["I_max"]))
 
-    # Build posterior inputs (must match StockpilingInputs keys)
-    inv_maps = sp_model.build_inventory_maps(int(cfg["I_max"]))
-    inputs: StockpilingInputs = {
-        "a_mnjt": tf.convert_to_tensor(a_np, dtype=tf.int32),
-        "s_mjt": tf.convert_to_tensor(s_np, dtype=tf.int32),
-        "u_mj": tf.convert_to_tensor(u_np, dtype=tf.float64),
-        "P_price_mj": tf.convert_to_tensor(np.asarray(P_price_mj), dtype=tf.float64),
-        "price_vals_mj": tf.convert_to_tensor(
-            np.asarray(price_vals_mj), dtype=tf.float64
+    posterior = StockpilingPosteriorTF(
+        config=posterior_config,
+        a_mnjt=tf.convert_to_tensor(panel["a_mnjt"], dtype=tf.int32),
+        s_mjt=tf.convert_to_tensor(panel["s_mjt"], dtype=tf.int32),
+        u_mj=tf.convert_to_tensor(u_np, dtype=tf.float64),
+        P_price_mj=tf.convert_to_tensor(P_price_mj, dtype=tf.float64),
+        price_vals_mj=tf.convert_to_tensor(price_vals_mj, dtype=tf.float64),
+        lambda_mn=tf.convert_to_tensor(lam_np, dtype=tf.float64),
+        waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
+        inventory_maps=inventory_maps,
+        pi_I0=tf.convert_to_tensor(
+            np.asarray(cfg["pi_I0"], dtype=np.float64),
+            dtype=tf.float64,
         ),
-        "lambda_mn": tf.convert_to_tensor(lam_np, dtype=tf.float64),
-        "waste_cost": tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
-        "inventory_maps": inv_maps,
-        "tol": float(cfg["dp_tol"]),
-        "max_iter": int(cfg["dp_max_iter"]),
-        "pi_I0": tf.convert_to_tensor(
-            np.asarray(cfg["pi_I0"], dtype=np.float64), dtype=tf.float64
-        ),
-    }
+    )
 
-    # Fitted probabilities
-    theta_hat_tf = {
-        "beta": tf.convert_to_tensor(theta_hat["beta"], dtype=tf.float64),
-        "alpha": tf.convert_to_tensor(theta_hat["alpha"], dtype=tf.float64),
-        "v": tf.convert_to_tensor(theta_hat["v"], dtype=tf.float64),
-        "fc": tf.convert_to_tensor(theta_hat["fc"], dtype=tf.float64),
-        "u_scale": tf.convert_to_tensor(theta_hat["u_scale"], dtype=tf.float64),
-    }
-    p_buy_hat_tf = predict_p_buy_mnjt_from_theta(theta=theta_hat_tf, inputs=inputs)
-    p_buy_hat_mnjt = np.asarray(p_buy_hat_tf.numpy(), dtype=np.float64)
+    fitted_state = _theta_to_state(theta_hat, M=M)
+    p_buy_hat_mnjt = posterior.predict_p_buy_mnjt(
+        z_beta=fitted_state.z_beta,
+        z_alpha=fitted_state.z_alpha,
+        z_v=fitted_state.z_v,
+        z_fc=fitted_state.z_fc,
+        z_u_scale=fitted_state.z_u_scale,
+    ).numpy()
 
-    # Prepare theta_hat for parameter_metrics (numpy arrays)
-    theta_hat_np: dict[str, np.ndarray] = {
+    p_buy_oracle_mnjt: np.ndarray | None = None
+    theta_true_np: dict[str, np.ndarray] | None = None
+    if theta_true is not None:
+        theta_true_np = _normalize_theta_true_for_eval(theta_true, M=M)
+        oracle_state = _theta_to_state(theta_true_np, M=M)
+        p_buy_oracle_mnjt = posterior.predict_p_buy_mnjt(
+            z_beta=oracle_state.z_beta,
+            z_alpha=oracle_state.z_alpha,
+            z_v=oracle_state.z_v,
+            z_fc=oracle_state.z_fc,
+            z_u_scale=oracle_state.z_u_scale,
+        ).numpy()
+
+    theta_hat_np = {
         "beta": np.asarray(theta_hat["beta"], dtype=np.float64),
         "alpha": np.asarray(theta_hat["alpha"], dtype=np.float64),
         "v": np.asarray(theta_hat["v"], dtype=np.float64),
@@ -604,55 +683,14 @@ def run_phase3_evaluation(
         "u_scale": np.asarray(theta_hat["u_scale"], dtype=np.float64),
     }
 
-    # Optional oracle probabilities + parameter recovery
-    p_buy_oracle_mnjt: np.ndarray | None = None
-    theta_true_np: dict[str, np.ndarray] | None = None
-
-    if theta_true is not None:
-        # Ensure theta_true has all PARAM_KEYS expected by evaluation (incl. u_scale).
-        # DGP may not contain u_scale; treat it as ones(M,) for evaluation compatibility.
-        u_scale_true = (
-            np.asarray(theta_true["u_scale"], dtype=np.float64)
-            if "u_scale" in theta_true
-            else np.ones((M,), dtype=np.float64)
-        )
-
-        theta_true_np = {
-            "beta": np.asarray(theta_true["beta"], dtype=np.float64),
-            "alpha": np.asarray(theta_true["alpha"], dtype=np.float64),
-            "v": np.asarray(theta_true["v"], dtype=np.float64),
-            "fc": np.asarray(theta_true["fc"], dtype=np.float64),
-            "u_scale": u_scale_true,
-        }
-
-        theta_true_tf = {
-            "beta": tf.convert_to_tensor(theta_true_np["beta"], dtype=tf.float64),
-            "alpha": tf.convert_to_tensor(theta_true_np["alpha"], dtype=tf.float64),
-            "v": tf.convert_to_tensor(theta_true_np["v"], dtype=tf.float64),
-            "fc": tf.convert_to_tensor(theta_true_np["fc"], dtype=tf.float64),
-            "u_scale": tf.convert_to_tensor(theta_true_np["u_scale"], dtype=tf.float64),
-        }
-        p_buy_oracle_tf = predict_p_buy_mnjt_from_theta(
-            theta=theta_true_tf, inputs=inputs
-        )
-        p_buy_oracle_mnjt = np.asarray(p_buy_oracle_tf.numpy(), dtype=np.float64)
-
-    # Optional MCMC diagnostics (must include accept and n_saved if provided)
-    mcmc = None
-    if mcmc_diag is not None:
-        mcmc = {
-            "accept": mcmc_diag["accept"],
-            "n_saved": mcmc_diag["n_saved"],
-        }
-
     eval_out = evaluate_stockpiling(
         a_mnjt=a_np,
-        p_buy_hat_mnjt=p_buy_hat_mnjt,
-        s_mjt=s_np,
+        p_buy_hat_mnjt=np.asarray(p_buy_hat_mnjt, dtype=np.float64),
+        s_mjt=np.asarray(s_np),
         theta_hat=theta_hat_np if theta_true_np is not None else None,
         theta_true=theta_true_np,
         p_buy_oracle_mnjt=p_buy_oracle_mnjt,
-        mcmc=mcmc,
+        mcmc=mcmc_summary,
         eps=float(EVAL_EPS),
     )
 
@@ -661,14 +699,14 @@ def run_phase3_evaluation(
 
     return {
         "eval": eval_out,
-        "p_buy_hat_mnjt": p_buy_hat_mnjt,
+        "p_buy_hat_mnjt": np.asarray(p_buy_hat_mnjt, dtype=np.float64),
         "p_buy_oracle_mnjt": p_buy_oracle_mnjt,
-        "mcmc": mcmc,
+        "mcmc": mcmc_summary,
     }
 
 
 def main() -> None:
-    """Run Phases 1–3 end-to-end."""
+    """Run the full Phase 1–3 stockpiling experiment."""
     out1 = run_phase1(CFG_PHASE1)
     dgp = out1["dgp"]
     delta_hat = np.asarray(out1["delta_hat"], dtype=np.float64)
@@ -687,8 +725,6 @@ def main() -> None:
 
     M = int(E_bar_used.shape[0])
     J = int(delta_used.shape[0])
-
-    validate_stockpiling_phase3_config(cfg=CFG_PHASE3, M=M, J=J)
 
     P_price_mj, price_vals_mj = build_price_processes(
         M=M,
@@ -720,7 +756,8 @@ def main() -> None:
         seed_dgp=int(CFG_PHASE3["price_seed"]) + 1,
     )
 
-    summarize_stockpiling_panel(panel=panel, init_theta=dict(CFG_PHASE3["init_theta"]))
+    initial_state = build_initial_state(M=M, J=J)
+    summarize_stockpiling_panel(panel=panel, initial_state=initial_state)
 
     res3 = run_phase3_estimation(
         CFG_PHASE3,
@@ -739,11 +776,8 @@ def main() -> None:
         price_vals_mj=price_vals_mj,
         theta_hat=theta_hat,
         theta_true=theta_true,
-        mcmc_diag={
-            "accept": res3["accept"],
-            "n_saved": res3["n_saved"],
-            "z_last": res3["z_last"],
-        },
+        posterior_config=res3["posterior_config"],
+        mcmc_summary=None,
     )
 
 

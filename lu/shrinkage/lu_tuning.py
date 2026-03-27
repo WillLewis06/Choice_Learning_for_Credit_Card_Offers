@@ -50,7 +50,7 @@ def _tune_block(
     target_low_t = tf.constant(target_low, dtype=tf.float64)
     target_high_t = tf.constant(target_high, dtype=tf.float64)
 
-    @tf.function(reduce_retracing=True)
+    @tf.function(jit_compile=True, reduce_retracing=True)
     def _pilot(
         theta_in: tf.Tensor,
         k_in: tf.Tensor,

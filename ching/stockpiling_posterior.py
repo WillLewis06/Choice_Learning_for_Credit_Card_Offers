@@ -1,335 +1,456 @@
-"""
-stockpiling_posterior.py
-
-Likelihood and prediction utilities for the Phase-3 stockpiling model.
-
-This module is intentionally stateless:
-  - `inputs` is a typed mapping of fixed/known tensors and hyperparameters.
-  - the current constrained parameter state is passed explicitly via `theta`.
-
-Observed data:
-  - purchases a_mnjt: (M,N,J,T) int32 in {0,1}
-  - price states s_mjt: (M,J,T) int32 in {0,...,S-1}
-
-Latent state:
-  - per-(m,n,j) inventory I_t in {0,...,I_max}
-  - per-period consumption is integrated out via known lambda_mn: (M,N) float64
-
-Likelihood:
-  - inventory is marginalized with a forward filter over the finite inventory state.
-
-Required `inputs` keys:
-  - a_mnjt: tf.Tensor (M,N,J,T) int32
-  - s_mjt: tf.Tensor (M,J,T) int32
-  - u_mj: tf.Tensor (M,J) float64
-  - P_price_mj: tf.Tensor (M,J,S,S) float64
-  - price_vals_mj: tf.Tensor (M,J,S) float64
-  - lambda_mn: tf.Tensor (M,N) float64, in (0,1)
-  - waste_cost: tf.Tensor () float64
-  - inventory_maps: tuple returned by build_inventory_maps(I_max)
-  - tol: float
-  - max_iter: int
-  - pi_I0: tf.Tensor (I_max+1,) float64 initial inventory distribution (sums to 1)
-
-Notes:
-  - This module does not clamp or repair invalid inputs. All external inputs must be
-    validated upstream (configs / input validation).
-"""
-
 from __future__ import annotations
 
-import math
-from typing import TypedDict
+from dataclasses import dataclass
 
 import tensorflow as tf
 
-from ching.stockpiling_model import solve_ccp_buy
+from ching.stockpiling_model import InventoryMaps, solve_ccp_buy, unconstrained_to_theta
 
 __all__ = [
-    "InventoryMaps",
-    "StockpilingInputs",
-    "logprior_normal",
-    "loglik_mnj_from_theta",
-    "predict_p_buy_mnjt_from_theta",
+    "StockpilingPosteriorConfig",
+    "StockpilingPosteriorTF",
 ]
 
-# (I_vals, stockout_mask, at_cap_mask, idx_down, idx_up)
-InventoryMaps = tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
-
-TWO_PI_F64 = tf.constant(2.0 * math.pi, dtype=tf.float64)
 ONE_F64 = tf.constant(1.0, dtype=tf.float64)
-EPS_F64 = tf.constant(1e-12, dtype=tf.float64)
 
 
-class StockpilingInputs(TypedDict):
-    """Typed container for fixed inputs required by the stockpiling posterior."""
+@dataclass(frozen=True)
+class StockpilingPosteriorConfig:
+    """Store fixed hyperparameters and numerical settings for posterior evaluation."""
 
-    a_mnjt: tf.Tensor
-    s_mjt: tf.Tensor
-    u_mj: tf.Tensor
-    P_price_mj: tf.Tensor
-    price_vals_mj: tf.Tensor
-    lambda_mn: tf.Tensor
-    waste_cost: tf.Tensor
-    inventory_maps: InventoryMaps
     tol: float
     max_iter: int
-    pi_I0: tf.Tensor
+    eps: float
+
+    sigma_z_beta: float
+    sigma_z_alpha: float
+    sigma_z_v: float
+    sigma_z_fc: float
+    sigma_z_u_scale: float
+
+    fix_u_scale: bool
+    fixed_z_u_scale: float
 
 
-def logprior_normal(z: tf.Tensor, sigma_z: tf.Tensor) -> tf.Tensor:
-    """Elementwise Normal(0, sigma_z^2) log density.
+class StockpilingPosteriorTF:
+    """Evaluate posterior terms for the Ching-style stockpiling sampler."""
 
-    Args:
-      z: float64 tensor
-      sigma_z: float64 tensor broadcastable to z, strictly positive
+    def __init__(
+        self,
+        config: StockpilingPosteriorConfig,
+        a_mnjt: tf.Tensor,
+        s_mjt: tf.Tensor,
+        u_mj: tf.Tensor,
+        P_price_mj: tf.Tensor,
+        price_vals_mj: tf.Tensor,
+        lambda_mn: tf.Tensor,
+        waste_cost: tf.Tensor,
+        inventory_maps: InventoryMaps,
+        pi_I0: tf.Tensor,
+    ):
+        """Cache fixed observed tensors, prior scales, and numerical constants."""
 
-    Returns:
-      logp: float64 tensor with the same shape as z
-    """
-    const = -0.5 * tf.math.log(TWO_PI_F64)
-    return const - tf.math.log(sigma_z) - 0.5 * tf.square(z / sigma_z)
+        self.tol = float(config.tol)
+        self.max_iter = int(config.max_iter)
+        self.eps = tf.constant(config.eps, dtype=tf.float64)
 
+        self.sigma_z_beta = tf.constant(config.sigma_z_beta, dtype=tf.float64)
+        self.sigma_z_alpha = tf.constant(config.sigma_z_alpha, dtype=tf.float64)
+        self.sigma_z_v = tf.constant(config.sigma_z_v, dtype=tf.float64)
+        self.sigma_z_fc = tf.constant(config.sigma_z_fc, dtype=tf.float64)
+        self.sigma_z_u_scale = tf.constant(config.sigma_z_u_scale, dtype=tf.float64)
 
-def _inventory_maps(inputs: StockpilingInputs) -> InventoryMaps:
-    """Return precomputed inventory maps."""
-    return inputs["inventory_maps"]
+        self.fix_u_scale = bool(config.fix_u_scale)
+        self.fixed_z_u_scale = tf.constant(config.fixed_z_u_scale, dtype=tf.float64)
 
+        self.a_mnjt = a_mnjt
+        self.s_mjt = s_mjt
+        self.u_mj = u_mj
+        self.P_price_mj = P_price_mj
+        self.price_vals_mj = price_vals_mj
+        self.lambda_mn = lambda_mn
+        self.waste_cost = waste_cost
+        self.pi_I0 = tf.reshape(pi_I0, (-1,))
 
-def _ccp_buy_from_theta(
-    theta: dict[str, tf.Tensor], inputs: StockpilingInputs
-) -> tf.Tensor:
-    """Compute buy CCPs for the given theta and fixed inputs.
+        self.inventory_maps = inventory_maps
+        _, _, _, idx_down, idx_up = inventory_maps
+        self.idx_down = idx_down
+        self.idx_up = idx_up
 
-    Returns:
-      ccp_buy: (M,N,J,S,I) float64
-    """
-    maps = _inventory_maps(inputs)
+        self.lambda_mn_11 = self.lambda_mn[:, :, None, None]
 
-    ccp_buy, _, _ = solve_ccp_buy(
-        u_mj=inputs["u_mj"],
-        price_vals_mj=inputs["price_vals_mj"],
-        P_price_mj=inputs["P_price_mj"],
-        theta=theta,
-        lambda_mn=inputs["lambda_mn"],
-        waste_cost=inputs["waste_cost"],
-        maps=maps,
-        tol=float(inputs["tol"]),
-        max_iter=int(inputs["max_iter"]),
-    )
-    return ccp_buy
+        self._log_two_pi = tf.math.log(
+            tf.constant(2.0 * 3.141592653589793, dtype=tf.float64)
+        )
+        self._lp0_beta = -0.5 * (
+            self._log_two_pi + 2.0 * tf.math.log(self.sigma_z_beta)
+        )
+        self._lp0_alpha = -0.5 * (
+            self._log_two_pi + 2.0 * tf.math.log(self.sigma_z_alpha)
+        )
+        self._lp0_v = -0.5 * (self._log_two_pi + 2.0 * tf.math.log(self.sigma_z_v))
+        self._lp0_fc = -0.5 * (self._log_two_pi + 2.0 * tf.math.log(self.sigma_z_fc))
+        self._lp0_u_scale = -0.5 * (
+            self._log_two_pi + 2.0 * tf.math.log(self.sigma_z_u_scale)
+        )
 
+    def _effective_z_u_scale(self, z_u_scale: tf.Tensor) -> tf.Tensor:
+        """Return the active z_u_scale state, possibly fixed for this run."""
+        if self.fix_u_scale:
+            return tf.zeros_like(z_u_scale, dtype=tf.float64) + self.fixed_z_u_scale
+        return z_u_scale
 
-def _shift_down(post: tf.Tensor, idx_up: tf.Tensor) -> tf.Tensor:
-    """Map mass via I' = max(I-1, 0) (down-shift with absorption at 0)."""
-    I = tf.shape(idx_up)[0]
+    def _theta_from_z(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> dict[str, tf.Tensor]:
+        """Map unconstrained sampler state to constrained structural parameters."""
+        return unconstrained_to_theta(
+            {
+                "z_beta": z_beta,
+                "z_alpha": z_alpha,
+                "z_v": z_v,
+                "z_fc": z_fc,
+                "z_u_scale": self._effective_z_u_scale(z_u_scale),
+            }
+        )
 
-    def case_I1() -> tf.Tensor:
-        return post
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _ccp_buy_from_z(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Solve buy CCPs for the current unconstrained sampler state."""
+        theta = self._theta_from_z(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        ccp_buy, _, _ = solve_ccp_buy(
+            u_mj=self.u_mj,
+            price_vals_mj=self.price_vals_mj,
+            P_price_mj=self.P_price_mj,
+            theta=theta,
+            lambda_mn=self.lambda_mn,
+            waste_cost=self.waste_cost,
+            maps=self.inventory_maps,
+            tol=self.tol,
+            max_iter=self.max_iter,
+        )
+        return ccp_buy
 
-    def case_Igt1() -> tf.Tensor:
-        base = tf.gather(post, idx_up, axis=-1)  # (..., I)
-        first = base[..., :1] + post[..., :1]
-        mid = base[..., 1:-1]
-        last = base[..., -1:] - post[..., -1:]
-        return tf.concat([first, mid, last], axis=-1)
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _shift_down(self, post: tf.Tensor) -> tf.Tensor:
+        """Map mass via I' = max(I-1, 0)."""
+        I = tf.shape(self.idx_up)[0]
 
-    return tf.cond(tf.equal(I, 1), case_I1, case_Igt1)
+        def case_I1() -> tf.Tensor:
+            return post
 
+        def case_Igt1() -> tf.Tensor:
+            base = tf.gather(post, self.idx_up, axis=-1)
+            first = base[..., :1] + post[..., :1]
+            mid = base[..., 1:-1]
+            last = base[..., -1:] - post[..., -1:]
+            return tf.concat([first, mid, last], axis=-1)
 
-def _shift_up(post: tf.Tensor, idx_down: tf.Tensor) -> tf.Tensor:
-    """Map mass via I' = min(I+1, I_max) (up-shift with absorption at I_max)."""
-    I = tf.shape(idx_down)[0]
+        return tf.cond(tf.equal(I, 1), case_I1, case_Igt1)
 
-    def case_I1() -> tf.Tensor:
-        return post
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _shift_up(self, post: tf.Tensor) -> tf.Tensor:
+        """Map mass via I' = min(I+1, I_max)."""
+        I = tf.shape(self.idx_down)[0]
 
-    def case_Igt1() -> tf.Tensor:
-        base = tf.gather(post, idx_down, axis=-1)  # (..., I)
-        first = base[..., :1] - post[..., :1]
-        mid = base[..., 1:-1]
-        last = base[..., -1:] + post[..., -1:]
-        return tf.concat([first, mid, last], axis=-1)
+        def case_I1() -> tf.Tensor:
+            return post
 
-    return tf.cond(tf.equal(I, 1), case_I1, case_Igt1)
+        def case_Igt1() -> tf.Tensor:
+            base = tf.gather(post, self.idx_down, axis=-1)
+            first = base[..., :1] - post[..., :1]
+            mid = base[..., 1:-1]
+            last = base[..., -1:] + post[..., -1:]
+            return tf.concat([first, mid, last], axis=-1)
 
+        return tf.cond(tf.equal(I, 1), case_I1, case_Igt1)
 
-def _transition_inventory(
-    post: tf.Tensor,
-    lambda_mn_11: tf.Tensor,
-    a_t: tf.Tensor,
-    idx_down: tf.Tensor,
-    idx_up: tf.Tensor,
-) -> tf.Tensor:
-    """Inventory transition pi_{t+1} from post(I_t | history, a_t) by marginalizing c_t."""
-    lam = lambda_mn_11  # (M,N,1,1)
-    one_minus = ONE_F64 - lam
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _transition_inventory(self, post: tf.Tensor, a_t: tf.Tensor) -> tf.Tensor:
+        """Propagate the inventory distribution one step forward."""
+        lam = self.lambda_mn_11
+        one_minus = ONE_F64 - lam
 
-    down = _shift_down(post, idx_up)  # I' = max(I-1, 0)
-    up = _shift_up(post, idx_down)  # I' = min(I+1, I_max)
+        down = self._shift_down(post)
+        up = self._shift_up(post)
 
-    # a=0: I' = I - c
-    pi0 = one_minus * post + lam * down
-    # a=1: I' = I + 1 - c
-    pi1 = lam * post + one_minus * up
+        pi0 = one_minus * post + lam * down
+        pi1 = lam * post + one_minus * up
+        return tf.where(tf.equal(a_t[..., None], 1), pi1, pi0)
 
-    return tf.where(tf.equal(a_t[..., None], 1), pi1, pi0)
-
-
-def _filter_step_core(
-    t: tf.Tensor,
-    pi_acc: tf.Tensor,
-    a_mnjt: tf.Tensor,
-    s_mjt: tf.Tensor,
-    ccp_buy: tf.Tensor,
-    lambda_mn_11: tf.Tensor,
-    idx_down: tf.Tensor,
-    idx_up: tf.Tensor,
-) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """One forward-filter step.
-
-    Returns:
-      p_buy_I:    (M,N,J,I) float64  CCP evaluated at current price state s_t
-      denom_safe: (M,N,J) float64    P(a_t | history)
-      pi_next:    (M,N,J,I) float64  next-period inventory prior
-    """
-    mnjs_shape = tf.shape(pi_acc)[:3]  # (3,) = (M,N,J)
-
-    s_t_mj = s_mjt[:, :, t]  # (M,J)
-    s_idx = tf.broadcast_to(s_t_mj[:, None, :], mnjs_shape)  # (M,N,J)
-
-    # CCP evaluated at current price state: p_buy_I[m,n,j,I] = CCP[m,n,j,s_t,I]
-    p_buy_I = tf.gather(ccp_buy, s_idx, axis=3, batch_dims=3)  # (M,N,J,I)
-
-    a_t_mnj = a_mnjt[:, :, :, t]  # (M,N,J)
-    e = tf.where(
-        tf.equal(a_t_mnj[..., None], 1), p_buy_I, ONE_F64 - p_buy_I
-    )  # (M,N,J,I)
-
-    # Bayes update over inventory I_t
-    numer = pi_acc * e
-    denom = tf.reduce_sum(numer, axis=3)  # (M,N,J)
-    denom_safe = tf.maximum(denom, EPS_F64)
-    post = numer / denom_safe[..., None]
-
-    # Propagate inventory prior using the structural transition and known consumption rate
-    pi_next = _transition_inventory(
-        post=post,
-        lambda_mn_11=lambda_mn_11,
-        a_t=a_t_mnj,
-        idx_down=idx_down,
-        idx_up=idx_up,
-    )
-    return p_buy_I, denom_safe, pi_next
-
-
-def loglik_mnj_from_theta(
-    theta: dict[str, tf.Tensor], inputs: StockpilingInputs
-) -> tf.Tensor:
-    """Log-likelihood per (m,n,j), integrating out latent inventory.
-
-    Returns:
-      ll_mnj: (M,N,J) float64
-    """
-    a_mnjt = inputs["a_mnjt"]
-    s_mjt = inputs["s_mjt"]
-
-    M = tf.shape(a_mnjt)[0]
-    N = tf.shape(a_mnjt)[1]
-    J = tf.shape(a_mnjt)[2]
-    T = tf.shape(a_mnjt)[3]
-
-    _, _, _, idx_down, idx_up = _inventory_maps(inputs)
-    I = tf.shape(idx_up)[0]
-
-    ccp_buy = _ccp_buy_from_theta(theta=theta, inputs=inputs)  # (M,N,J,S,I)
-
-    pi0 = tf.reshape(inputs["pi_I0"], (-1,))  # (I,)
-    pi = tf.broadcast_to(pi0[None, None, None, :], tf.stack([M, N, J, I]))  # (M,N,J,I)
-
-    lambda_mn_11 = inputs["lambda_mn"][:, :, None, None]  # (M,N,1,1)
-
-    ll0 = tf.zeros((M, N, J), dtype=tf.float64)
-    t0 = tf.constant(0, dtype=tf.int32)
-
-    def body(
-        t: tf.Tensor, ll_acc: tf.Tensor, pi_acc: tf.Tensor
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _filter_step_core(
+        self,
+        t: tf.Tensor,
+        pi_acc: tf.Tensor,
+        a_mnjt: tf.Tensor,
+        s_mjt: tf.Tensor,
+        ccp_buy: tf.Tensor,
     ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        _, denom_safe, pi_next = _filter_step_core(
-            t=t,
-            pi_acc=pi_acc,
-            a_mnjt=a_mnjt,
-            s_mjt=s_mjt,
-            ccp_buy=ccp_buy,
-            lambda_mn_11=lambda_mn_11,
-            idx_down=idx_down,
-            idx_up=idx_up,
-        )
-        ll_acc = ll_acc + tf.math.log(denom_safe)
-        return t + 1, ll_acc, pi_next
+        """Perform one forward-filter step over latent inventory."""
+        mnj_shape = tf.shape(pi_acc)[:3]
+        s_t_mj = s_mjt[:, :, t]
+        s_idx = tf.broadcast_to(s_t_mj[:, None, :], mnj_shape)
 
-    _, ll_final, _ = tf.while_loop(
-        cond=lambda t, ll_acc, pi_acc: t < T,
-        body=body,
-        loop_vars=(t0, ll0, pi),
-    )
-    return ll_final
+        p_buy_I = tf.gather(ccp_buy, s_idx, axis=3, batch_dims=3)
+        a_t_mnj = a_mnjt[:, :, :, t]
+        emission = tf.where(tf.equal(a_t_mnj[..., None], 1), p_buy_I, ONE_F64 - p_buy_I)
 
+        numer = pi_acc * emission
+        denom = tf.reduce_sum(numer, axis=3)
+        denom_safe = tf.maximum(denom, self.eps)
+        post = numer / denom_safe[..., None]
+        pi_next = self._transition_inventory(post=post, a_t=a_t_mnj)
+        return p_buy_I, denom_safe, pi_next
 
-def predict_p_buy_mnjt_from_theta(
-    theta: dict[str, tf.Tensor], inputs: StockpilingInputs
-) -> tf.Tensor:
-    """Predict P(a_t=1 | s_1:t, a_1:t-1) for each (m,n,j,t), integrating out inventory.
-
-    Returns:
-      p_buy_mnjt: (M,N,J,T) float64
-    """
-    a_mnjt = inputs["a_mnjt"]
-    s_mjt = inputs["s_mjt"]
-
-    M = tf.shape(a_mnjt)[0]
-    N = tf.shape(a_mnjt)[1]
-    J = tf.shape(a_mnjt)[2]
-    T = tf.shape(a_mnjt)[3]
-
-    _, _, _, idx_down, idx_up = _inventory_maps(inputs)
-    I = tf.shape(idx_up)[0]
-
-    ccp_buy = _ccp_buy_from_theta(theta=theta, inputs=inputs)  # (M,N,J,S,I)
-
-    pi0 = tf.reshape(inputs["pi_I0"], (-1,))  # (I,)
-    pi = tf.broadcast_to(pi0[None, None, None, :], tf.stack([M, N, J, I]))  # (M,N,J,I)
-
-    lambda_mn_11 = inputs["lambda_mn"][:, :, None, None]  # (M,N,1,1)
-
-    out_ta = tf.TensorArray(tf.float64, size=T)
-    t0 = tf.constant(0, dtype=tf.int32)
-
-    def body(
-        t: tf.Tensor, pi_acc: tf.Tensor, out_acc: tf.TensorArray
-    ) -> tuple[tf.Tensor, tf.Tensor, tf.TensorArray]:
-        p_buy_I, _, pi_next = _filter_step_core(
-            t=t,
-            pi_acc=pi_acc,
-            a_mnjt=a_mnjt,
-            s_mjt=s_mjt,
-            ccp_buy=ccp_buy,
-            lambda_mn_11=lambda_mn_11,
-            idx_down=idx_down,
-            idx_up=idx_up,
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_beta(self, z_beta: tf.Tensor) -> tf.Tensor:
+        """Return the scalar Normal prior term for z_beta."""
+        return tf.reduce_sum(
+            self._lp0_beta - 0.5 * tf.square(z_beta / self.sigma_z_beta)
         )
 
-        # Predictive probability of buying at t given history up to t-1:
-        # p_hat = sum_I pi_t(I) * CCP(s_t, I)
-        p_hat = tf.reduce_sum(pi_acc * p_buy_I, axis=3)  # (M,N,J)
-        out_acc = out_acc.write(t, p_hat)
-        return t + 1, pi_next, out_acc
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_alpha_vec(self, z_alpha: tf.Tensor) -> tf.Tensor:
+        """Return the elementwise Normal prior terms for z_alpha."""
+        return self._lp0_alpha - 0.5 * tf.square(z_alpha / self.sigma_z_alpha)
 
-    _, _, out_final = tf.while_loop(
-        cond=lambda t, pi_acc, out_acc: t < T,
-        body=body,
-        loop_vars=(t0, pi, out_ta),
-    )
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_v_vec(self, z_v: tf.Tensor) -> tf.Tensor:
+        """Return the elementwise Normal prior terms for z_v."""
+        return self._lp0_v - 0.5 * tf.square(z_v / self.sigma_z_v)
 
-    p_buy_tmnj = out_final.stack()  # (T,M,N,J)
-    return tf.transpose(p_buy_tmnj, perm=[1, 2, 3, 0])
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_fc_vec(self, z_fc: tf.Tensor) -> tf.Tensor:
+        """Return the elementwise Normal prior terms for z_fc."""
+        return self._lp0_fc - 0.5 * tf.square(z_fc / self.sigma_z_fc)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior_u_scale_vec(self, z_u_scale: tf.Tensor) -> tf.Tensor:
+        """Return the elementwise Normal prior terms for z_u_scale."""
+        z_use = self._effective_z_u_scale(z_u_scale)
+        if self.fix_u_scale:
+            return tf.zeros_like(z_use, dtype=tf.float64)
+        return self._lp0_u_scale - 0.5 * tf.square(z_use / self.sigma_z_u_scale)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def logprior(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the total prior contribution across all unconstrained blocks."""
+        return (
+            self.logprior_beta(z_beta)
+            + tf.reduce_sum(self.logprior_alpha_vec(z_alpha))
+            + tf.reduce_sum(self.logprior_v_vec(z_v))
+            + tf.reduce_sum(self.logprior_fc_vec(z_fc))
+            + tf.reduce_sum(self.logprior_u_scale_vec(z_u_scale))
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def loglik_mnj(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return log-likelihood contributions per (m,n,j)."""
+        a_mnjt = self.a_mnjt
+        M = tf.shape(a_mnjt)[0]
+        N = tf.shape(a_mnjt)[1]
+        J = tf.shape(a_mnjt)[2]
+        T = tf.shape(a_mnjt)[3]
+        I = tf.shape(self.idx_up)[0]
+
+        ccp_buy = self._ccp_buy_from_z(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        pi = tf.broadcast_to(self.pi_I0[None, None, None, :], tf.stack([M, N, J, I]))
+        ll0 = tf.zeros((M, N, J), dtype=tf.float64)
+        t0 = tf.constant(0, dtype=tf.int32)
+
+        def cond(t: tf.Tensor, ll_acc: tf.Tensor, pi_acc: tf.Tensor) -> tf.Tensor:
+            return t < T
+
+        def body(
+            t: tf.Tensor,
+            ll_acc: tf.Tensor,
+            pi_acc: tf.Tensor,
+        ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+            _, denom_safe, pi_next = self._filter_step_core(
+                t=t,
+                pi_acc=pi_acc,
+                a_mnjt=self.a_mnjt,
+                s_mjt=self.s_mjt,
+                ccp_buy=ccp_buy,
+            )
+            ll_acc = ll_acc + tf.math.log(denom_safe)
+            return t + 1, ll_acc, pi_next
+
+        _, ll_final, _ = tf.while_loop(
+            cond=cond,
+            body=body,
+            loop_vars=(t0, ll0, pi),
+        )
+        return ll_final
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def loglik(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the total log-likelihood after integrating out inventory."""
+        return tf.reduce_sum(self.loglik_mnj(z_beta, z_alpha, z_v, z_fc, z_u_scale))
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def beta_block_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the scalar block log posterior for z_beta."""
+        return self.loglik(z_beta, z_alpha, z_v, z_fc, z_u_scale) + self.logprior_beta(
+            z_beta
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def alpha_block_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the per-product block log posterior for z_alpha."""
+        ll_mnj = self.loglik_mnj(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        return tf.reduce_sum(ll_mnj, axis=[0, 1]) + self.logprior_alpha_vec(z_alpha)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def v_block_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the per-product block log posterior for z_v."""
+        ll_mnj = self.loglik_mnj(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        return tf.reduce_sum(ll_mnj, axis=[0, 1]) + self.logprior_v_vec(z_v)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def fc_block_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the per-product block log posterior for z_fc."""
+        ll_mnj = self.loglik_mnj(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        return tf.reduce_sum(ll_mnj, axis=[0, 1]) + self.logprior_fc_vec(z_fc)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def u_scale_block_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the per-market block log posterior for z_u_scale."""
+        ll_mnj = self.loglik_mnj(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        return tf.reduce_sum(ll_mnj, axis=[1, 2]) + self.logprior_u_scale_vec(z_u_scale)
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def joint_logpost(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the full joint log posterior."""
+        return self.loglik(z_beta, z_alpha, z_v, z_fc, z_u_scale) + self.logprior(
+            z_beta, z_alpha, z_v, z_fc, z_u_scale
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def predict_p_buy_mnjt(
+        self,
+        z_beta: tf.Tensor,
+        z_alpha: tf.Tensor,
+        z_v: tf.Tensor,
+        z_fc: tf.Tensor,
+        z_u_scale: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return predictive buy probabilities given filtered latent inventory."""
+        a_mnjt = self.a_mnjt
+        M = tf.shape(a_mnjt)[0]
+        N = tf.shape(a_mnjt)[1]
+        J = tf.shape(a_mnjt)[2]
+        T = tf.shape(a_mnjt)[3]
+        I = tf.shape(self.idx_up)[0]
+
+        ccp_buy = self._ccp_buy_from_z(z_beta, z_alpha, z_v, z_fc, z_u_scale)
+        pi = tf.broadcast_to(self.pi_I0[None, None, None, :], tf.stack([M, N, J, I]))
+        out_ta = tf.TensorArray(dtype=tf.float64, size=T)
+        t0 = tf.constant(0, dtype=tf.int32)
+
+        def cond(
+            t: tf.Tensor,
+            pi_acc: tf.Tensor,
+            out_acc: tf.TensorArray,
+        ) -> tf.Tensor:
+            return t < T
+
+        def body(
+            t: tf.Tensor,
+            pi_acc: tf.Tensor,
+            out_acc: tf.TensorArray,
+        ) -> tuple[tf.Tensor, tf.Tensor, tf.TensorArray]:
+            p_buy_I, _, pi_next = self._filter_step_core(
+                t=t,
+                pi_acc=pi_acc,
+                a_mnjt=self.a_mnjt,
+                s_mjt=self.s_mjt,
+                ccp_buy=ccp_buy,
+            )
+            p_hat = tf.reduce_sum(pi_acc * p_buy_I, axis=3)
+            out_acc = out_acc.write(t, p_hat)
+            return t + 1, pi_next, out_acc
+
+        _, _, out_final = tf.while_loop(
+            cond=cond,
+            body=body,
+            loop_vars=(t0, pi, out_ta),
+        )
+        p_buy_tmnj = out_final.stack()
+        return tf.transpose(p_buy_tmnj, perm=[1, 2, 3, 0])

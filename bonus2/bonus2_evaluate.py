@@ -6,10 +6,13 @@ Evaluation utilities for Bonus Q2.
 Scope:
 - Pure NumPy predictive metrics from realized choices and predicted probabilities.
 - Baseline is the delta-only model (outside utility 0, inside utility = delta_mj).
+- Optional parameter-recovery summaries on the structural parameter scale.
+- Optional chain summaries derived from chunk-level diagnostics produced by the
+  refactored TFP sampler.
 
 Non-goals:
 - No TensorFlow calls.
-- No routing/fallback logic to "compute probabilities if missing".
+- No routing/fallback logic to compute probabilities from theta.
 - No input validation (assumed handled upstream).
 
 Choice encoding:
@@ -23,6 +26,7 @@ Predicted probabilities:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -53,17 +57,11 @@ def choice_metrics_from_probs(
     y = np.asarray(y_mit, dtype=np.int64)
     p = np.asarray(p_choice_mntc, dtype=np.float64)
 
-    # Predicted probability assigned to the realized class.
     p_true = np.take_along_axis(p, y[..., None], axis=3)[..., 0]
-
-    # NLL uses clipped probabilities to avoid log(0).
     p_true_clip = np.clip(p_true, eps, 1.0)
+
     nll = float(-np.mean(np.log(p_true_clip)))
-
-    # Accuracy uses argmax class prediction.
     acc = float(np.mean(np.argmax(p, axis=3) == y))
-
-    # Outside shares.
     out_emp = float(np.mean(y == 0))
     out_pred = float(np.mean(p[..., 0]))
 
@@ -90,19 +88,13 @@ def choice_metrics_from_market_probs(
     y = np.asarray(y_mit, dtype=np.int64)
     p = np.asarray(p_mjc, dtype=np.float64)
 
-    # Broadcast market probabilities to observation grid (M,N,T,C).
     p4 = p[:, None, None, :]
-
-    # Realized-class probability and NLL.
     p_true = np.take_along_axis(p4, y[..., None], axis=3)[..., 0]
     p_true_clip = np.clip(p_true, eps, 1.0)
+
     nll = float(-np.mean(np.log(p_true_clip)))
-
-    # Market-level argmax prediction (constant within market).
-    c_hat_m = np.argmax(p, axis=1)  # (M,)
+    c_hat_m = np.argmax(p, axis=1)
     acc = float(np.mean(y == c_hat_m[:, None, None]))
-
-    # Outside shares.
     out_emp = float(np.mean(y == 0))
     out_pred = float(np.mean(p[:, 0]))
 
@@ -128,17 +120,14 @@ def delta_only_baseline_probs(delta_mj: np.ndarray) -> np.ndarray:
     """
     delta = np.asarray(delta_mj, dtype=np.float64)
 
-    # Stabilize exponentials by shifting by max(max(delta), outside=0).
-    max_u = np.maximum(0.0, np.max(delta, axis=1))  # (M,)
+    max_u = np.maximum(0.0, np.max(delta, axis=1))
+    exp_in = np.exp(delta - max_u[:, None])
+    exp_out = np.exp(-max_u)
+    den = exp_out + np.sum(exp_in, axis=1)
 
-    exp_in = np.exp(delta - max_u[:, None])  # (M,J)
-    exp_out = np.exp(-max_u)  # (M,)
-    den = exp_out + np.sum(exp_in, axis=1)  # (M,)
-
-    p_out = (exp_out / den)[:, None]  # (M,1)
-    p_in = exp_in / den[:, None]  # (M,J)
-
-    return np.concatenate([p_out, p_in], axis=1)  # (M,J+1)
+    p_out = (exp_out / den)[:, None]
+    p_in = exp_in / den[:, None]
+    return np.concatenate([p_out, p_in], axis=1)
 
 
 # =============================================================================
@@ -234,6 +223,79 @@ def parameter_recovery_dispersion_stats(
 
 
 # =============================================================================
+# Chain summaries
+# =============================================================================
+
+
+def _get_field(summary: Any, name: str) -> float:
+    """Read a scalar field from either an object with attributes or a dict."""
+    if isinstance(summary, dict):
+        value = summary[name]
+    else:
+        value = getattr(summary, name)
+    return float(value)
+
+
+def chain_summary_from_chunk_summaries(
+    chunk_summaries: Sequence[Any],
+    n_saved: int | None,
+) -> dict[str, Any]:
+    """
+    Build a compact chain summary from chunk-level diagnostics.
+
+    Expected fields on each chunk summary:
+      beta_intercept_accept_mean
+      beta_habit_accept_mean
+      beta_peer_accept_mean
+      beta_weekend_accept_mean
+      a_accept_mean
+      b_accept_mean
+      joint_logpost_last
+    """
+    if len(chunk_summaries) == 0:
+        return {
+            "n_saved": n_saved,
+            "num_chunks": 0,
+            "accept_rates": {},
+            "final_joint_logpost": None,
+        }
+
+    accept_rates = {
+        "beta_intercept": float(
+            np.mean(
+                [_get_field(s, "beta_intercept_accept_mean") for s in chunk_summaries]
+            )
+        ),
+        "beta_habit": float(
+            np.mean([_get_field(s, "beta_habit_accept_mean") for s in chunk_summaries])
+        ),
+        "beta_peer": float(
+            np.mean([_get_field(s, "beta_peer_accept_mean") for s in chunk_summaries])
+        ),
+        "beta_weekend": float(
+            np.mean(
+                [_get_field(s, "beta_weekend_accept_mean") for s in chunk_summaries]
+            )
+        ),
+        "a_m": float(
+            np.mean([_get_field(s, "a_accept_mean") for s in chunk_summaries])
+        ),
+        "b_m": float(
+            np.mean([_get_field(s, "b_accept_mean") for s in chunk_summaries])
+        ),
+    }
+
+    final_joint_logpost = _get_field(chunk_summaries[-1], "joint_logpost_last")
+
+    return {
+        "n_saved": n_saved,
+        "num_chunks": int(len(chunk_summaries)),
+        "accept_rates": accept_rates,
+        "final_joint_logpost": final_joint_logpost,
+    }
+
+
+# =============================================================================
 # Top-level evaluation
 # =============================================================================
 
@@ -245,11 +307,12 @@ def evaluate_bonus2(
     p_choice_oracle_mntc: np.ndarray | None,
     theta_hat: dict[str, Any] | None,
     theta_true: dict[str, Any] | None,
-    mcmc: dict[str, Any] | None,
+    chunk_summaries: Sequence[Any] | None,
+    n_saved: int | None,
     eps: float,
 ) -> dict[str, Any]:
     """
-    Evaluate fitted probabilities against the delta-only baseline (and optionally oracle).
+    Evaluate fitted probabilities against the delta-only baseline and optionally oracle.
 
     This function expects probabilities to be provided explicitly. It does not
     compute probabilities from theta.
@@ -260,7 +323,7 @@ def evaluate_bonus2(
         "models": {...},
         "deltas": {...},
         "param": {...} (optional),
-        "mcmc": {...} (optional),
+        "chain": {...} (optional),
       }
     """
     y = np.asarray(y_mit, dtype=np.int64)
@@ -271,11 +334,8 @@ def evaluate_bonus2(
     J = int(delta.shape[1])
     n_obs = int(M * N * T)
 
-    # Baseline (delta-only, market-constant).
     p_base_mjc = delta_only_baseline_probs(delta)
     base_metrics = choice_metrics_from_market_probs(y, p_base_mjc, eps)
-
-    # Fitted (per observation).
     fit_metrics = choice_metrics_from_probs(y, p_fit, eps)
 
     models: dict[str, dict[str, float]] = {
@@ -283,17 +343,17 @@ def evaluate_bonus2(
         "fitted": fit_metrics,
     }
 
-    # Oracle (optional).
     if p_choice_oracle_mntc is not None:
         p_or = np.asarray(p_choice_oracle_mntc, dtype=np.float64)
         models["oracle"] = choice_metrics_from_probs(y, p_or, eps)
 
-    # Deltas are defined as fitted - comparator.
-    deltas: dict[str, dict[str, float]] = {}
-    deltas["fitted_minus_baseline"] = {
-        "delta_nll": float(models["fitted"]["nll"] - models["baseline"]["nll"]),
-        "delta_acc": float(models["fitted"]["acc"] - models["baseline"]["acc"]),
+    deltas: dict[str, dict[str, float]] = {
+        "fitted_minus_baseline": {
+            "delta_nll": float(models["fitted"]["nll"] - models["baseline"]["nll"]),
+            "delta_acc": float(models["fitted"]["acc"] - models["baseline"]["acc"]),
+        }
     }
+
     if "oracle" in models:
         deltas["fitted_minus_oracle"] = {
             "delta_nll": float(models["fitted"]["nll"] - models["oracle"]["nll"]),
@@ -306,7 +366,6 @@ def evaluate_bonus2(
         "deltas": deltas,
     }
 
-    # Parameter recovery (optional).
     if theta_true is not None and theta_hat is not None:
         out["param"] = {
             "mean_stats": parameter_recovery_mean_stats(theta_true, theta_hat),
@@ -315,12 +374,11 @@ def evaluate_bonus2(
             ),
         }
 
-    # MCMC acceptance rates / draws (optional).
-    if mcmc is not None:
-        out["mcmc"] = {
-            "n_saved": mcmc.get("n_saved", None),
-            "accept_rates": mcmc.get("accept", {}),
-        }
+    if chunk_summaries is not None:
+        out["chain"] = chain_summary_from_chunk_summaries(
+            chunk_summaries=chunk_summaries,
+            n_saved=n_saved,
+        )
 
     return out
 
@@ -331,12 +389,12 @@ def evaluate_bonus2(
 
 
 def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
-    """Format the evaluate_bonus2 output into a compact, examiner-readable summary string."""
+    """Format evaluate_bonus2 output into a compact summary string."""
     shp = eval_out.get("shape", {})
     models = eval_out.get("models", {})
     deltas = eval_out.get("deltas", {})
     params = eval_out.get("param", None)
-    mcmc = eval_out.get("mcmc", None)
+    chain = eval_out.get("chain", None)
 
     def f6(x: float) -> str:
         return f"{x:>10.6f}"
@@ -421,14 +479,23 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
                     f"{k:<18}{d['rmse']:>10.6f} {d['std_true']:>10.6f} {d['std_hat']:>10.6f} {d['bias_std']:>10.6f}"
                 )
 
-    if isinstance(mcmc, dict):
-        rates = mcmc.get("accept_rates", {})
-        n_saved = mcmc.get("n_saved", None)
+    if isinstance(chain, dict):
+        rates = chain.get("accept_rates", {})
+        n_saved = chain.get("n_saved", None)
+        num_chunks = chain.get("num_chunks", None)
+        final_joint_logpost = chain.get("final_joint_logpost", None)
+
         if isinstance(rates, dict) and rates:
             lines.append("")
-            lines.append("mcmc acceptance (block rates)")
+            lines.append("chain summary")
             if n_saved is not None:
                 lines.append(f"n_saved: {int(n_saved)}")
+            if num_chunks is not None:
+                lines.append(f"num_chunks: {int(num_chunks)}")
+            if final_joint_logpost is not None:
+                lines.append(f"final_joint_logpost: {float(final_joint_logpost):.6f}")
+            lines.append("")
+            lines.append("acceptance (mean block rates)")
             lines.append(f"{'block':<16}{'rate':>10}")
             lines.append("-" * 26)
             for k in sorted(rates.keys()):

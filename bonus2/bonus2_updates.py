@@ -1,203 +1,254 @@
 """
 bonus2_updates.py
 
-Random-walk Metropolis-Hastings updates for Bonus Q2 unconstrained parameter blocks z.
+One-step MCMC updates for the Bonus Q2 sampler.
 
-This module implements a symmetric Gaussian random-walk proposal:
-  z' = z + step_size[z_key] * eps,   eps ~ Normal(0, I)
+Design
+- Each parameter block is updated with a TFP random-walk Metropolis step.
+- Proposal mechanics are delegated to tfp.mcmc.RandomWalkMetropolis.
+- Each one-step function evaluates an explicit compiled block log-posterior on the
+  Bonus2PosteriorTF object.
+- Randomness is driven by stateless seeds so the updates are compatible with
+  jit_compile=True.
 
-Acceptance uses the block log-target:
-  log_target_block = loglik(z) + logprior(z_block)
-where priors for other blocks are omitted because they cancel in MH ratios.
-
-No input validation is performed here. Configs and external inputs are expected to be validated
-in bonus2_input_validation.py before tensors reach this module.
+This module performs no input validation.
+All tensors are assumed to have already been validated and normalized upstream.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from bonus2.bonus2_posterior import PosteriorInputs, log_target_block_normal_prior
-
-
-def _rw_mh_update_block(
-    z: dict[str, tf.Tensor],
-    z_key: str,
-    inputs: PosteriorInputs,
-    step_size: tf.Tensor,
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Propose and accept/reject a RW-MH update for a single z block.
-
-    Args:
-      z: dictionary of unconstrained parameter blocks (float64 tensors).
-      z_key: key of the block to update.
-      inputs: likelihood inputs.
-      step_size: scalar float64 step size for this block.
-      sigma_z: prior scale dictionary keyed by z keys; sigma_z[z_key] broadcastable to z[z_key].
-      rng: tf.random.Generator used for proposals and accept/reject.
-
-    Returns:
-      z_block_next: updated block tensor (same shape as z[z_key]).
-      accepted: scalar float64 in {0,1}.
-    """
-    z_curr = z[z_key]
-
-    # Symmetric Gaussian random-walk proposal.
-    eps = rng.normal(shape=tf.shape(z_curr), dtype=z_curr.dtype)
-    z_prop = z_curr + step_size * eps
-
-    # Evaluate block log-targets at current and proposed states.
-    logt_curr = log_target_block_normal_prior(
-        z=z, z_key=z_key, inputs=inputs, sigma_z=sigma_z
-    )
-
-    z_prop_dict = dict(z)
-    z_prop_dict[z_key] = z_prop
-    logt_prop = log_target_block_normal_prior(
-        z=z_prop_dict, z_key=z_key, inputs=inputs, sigma_z=sigma_z
-    )
-
-    # Accept with probability min(1, exp(logt_prop - logt_curr)).
-    log_alpha = logt_prop - logt_curr
-
-    # Guard against log(0) from RNG edge cases.
-    u = tf.maximum(
-        rng.uniform(shape=(), dtype=z_curr.dtype), tf.constant(1e-12, z_curr.dtype)
-    )
-    log_u = tf.math.log(u)
-
-    accept = tf.cast(log_u < log_alpha, tf.int32)
-    z_next = tf.where(accept > 0, z_prop, z_curr)
-    return z_next, accept
+from bonus2.bonus2_posterior import Bonus2PosteriorTF
 
 
-def update_z_block(
-    z: dict[str, tf.Tensor],
-    z_key: str,
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update dispatcher for the requested z_key."""
-    return _rw_mh_update_block(
-        z=z,
-        z_key=z_key,
-        inputs=inputs,
-        step_size=step_size_z[z_key],
-        sigma_z=sigma_z,
-        rng=rng,
+def _make_rw_kernel(
+    target_log_prob_fn,
+    scale: tf.Tensor,
+) -> tfp.mcmc.RandomWalkMetropolis:
+    """Construct a Gaussian random-walk Metropolis kernel."""
+    return tfp.mcmc.RandomWalkMetropolis(
+        target_log_prob_fn=target_log_prob_fn,
+        new_state_fn=tfp.mcmc.random_walk_normal_fn(scale=scale),
     )
 
 
-def update_z_beta_intercept_j(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_beta_intercept_j (J,)."""
-    return update_z_block(
-        z=z,
-        z_key="z_beta_intercept_j",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+@tf.function(jit_compile=True, reduce_retracing=True)
+def beta_intercept_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_beta_intercept: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_beta_intercept_j."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.beta_intercept_block_logpost(
+            z_beta_intercept_j=z_block,
+            z_beta_habit_j=z_beta_habit_j,
+            z_beta_peer_j=z_beta_peer_j,
+            z_beta_weekend_jw=z_beta_weekend_jw,
+            z_a_m=z_a_m,
+            z_b_m=z_b_m,
+        )
+
+    kernel = _make_rw_kernel(
+        target_log_prob_fn=target_log_prob_fn, scale=k_beta_intercept
+    )
+    kernel_results = kernel.bootstrap_results(z_beta_intercept_j)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_beta_intercept_j,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
 
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted
 
-def update_z_beta_habit_j(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_beta_habit_j (J,)."""
-    return update_z_block(
-        z=z,
-        z_key="z_beta_habit_j",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def beta_habit_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_beta_habit: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_beta_habit_j."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.beta_habit_block_logpost(
+            z_beta_intercept_j=z_beta_intercept_j,
+            z_beta_habit_j=z_block,
+            z_beta_peer_j=z_beta_peer_j,
+            z_beta_weekend_jw=z_beta_weekend_jw,
+            z_a_m=z_a_m,
+            z_b_m=z_b_m,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta_habit)
+    kernel_results = kernel.bootstrap_results(z_beta_habit_j)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_beta_habit_j,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
 
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted
 
-def update_z_beta_peer_j(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_beta_peer_j (J,)."""
-    return update_z_block(
-        z=z,
-        z_key="z_beta_peer_j",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def beta_peer_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_beta_peer: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_beta_peer_j."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.beta_peer_block_logpost(
+            z_beta_intercept_j=z_beta_intercept_j,
+            z_beta_habit_j=z_beta_habit_j,
+            z_beta_peer_j=z_block,
+            z_beta_weekend_jw=z_beta_weekend_jw,
+            z_a_m=z_a_m,
+            z_b_m=z_b_m,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta_peer)
+    kernel_results = kernel.bootstrap_results(z_beta_peer_j)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_beta_peer_j,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
 
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted
 
-def update_z_beta_weekend_jw(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_beta_weekend_jw (J,2)."""
-    return update_z_block(
-        z=z,
-        z_key="z_beta_weekend_jw",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def beta_weekend_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_beta_weekend: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_beta_weekend_jw."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.beta_weekend_block_logpost(
+            z_beta_intercept_j=z_beta_intercept_j,
+            z_beta_habit_j=z_beta_habit_j,
+            z_beta_peer_j=z_beta_peer_j,
+            z_beta_weekend_jw=z_block,
+            z_a_m=z_a_m,
+            z_b_m=z_b_m,
+        )
+
+    kernel = _make_rw_kernel(
+        target_log_prob_fn=target_log_prob_fn, scale=k_beta_weekend
+    )
+    kernel_results = kernel.bootstrap_results(z_beta_weekend_jw)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_beta_weekend_jw,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
 
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted
 
-def update_z_a_m(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_a_m (M,K)."""
-    return update_z_block(
-        z=z,
-        z_key="z_a_m",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def a_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_a: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_a_m."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.a_block_logpost(
+            z_beta_intercept_j=z_beta_intercept_j,
+            z_beta_habit_j=z_beta_habit_j,
+            z_beta_peer_j=z_beta_peer_j,
+            z_beta_weekend_jw=z_beta_weekend_jw,
+            z_a_m=z_block,
+            z_b_m=z_b_m,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_a)
+    kernel_results = kernel.bootstrap_results(z_a_m)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_a_m,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
 
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted
 
-def update_z_b_m(
-    z: dict[str, tf.Tensor],
-    inputs: PosteriorInputs,
-    step_size_z: dict[str, tf.Tensor],
-    sigma_z: dict[str, tf.Tensor],
-    rng: tf.random.Generator,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """RW-MH update for z_b_m (M,K)."""
-    return update_z_block(
-        z=z,
-        z_key="z_b_m",
-        inputs=inputs,
-        step_size_z=step_size_z,
-        sigma_z=sigma_z,
-        rng=rng,
+
+@tf.function(jit_compile=True, reduce_retracing=True)
+def b_one_step(
+    posterior: Bonus2PosteriorTF,
+    z_beta_intercept_j: tf.Tensor,
+    z_beta_habit_j: tf.Tensor,
+    z_beta_peer_j: tf.Tensor,
+    z_beta_weekend_jw: tf.Tensor,
+    z_a_m: tf.Tensor,
+    z_b_m: tf.Tensor,
+    k_b: tf.Tensor,
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Perform one Metropolis update for z_b_m."""
+
+    def target_log_prob_fn(z_block: tf.Tensor) -> tf.Tensor:
+        return posterior.b_block_logpost(
+            z_beta_intercept_j=z_beta_intercept_j,
+            z_beta_habit_j=z_beta_habit_j,
+            z_beta_peer_j=z_beta_peer_j,
+            z_beta_weekend_jw=z_beta_weekend_jw,
+            z_a_m=z_a_m,
+            z_b_m=z_block,
+        )
+
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_b)
+    kernel_results = kernel.bootstrap_results(z_b_m)
+    z_new, kernel_results = kernel.one_step(
+        current_state=z_b_m,
+        previous_kernel_results=kernel_results,
+        seed=seed,
     )
+
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return z_new, accepted

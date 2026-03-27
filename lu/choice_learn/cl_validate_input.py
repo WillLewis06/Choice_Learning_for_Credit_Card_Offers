@@ -1,189 +1,210 @@
-"""
-Input validation for the choice-learn + Lu shrinkage estimator.
-
-Scope:
-  - Validate external data tensors passed into the estimator (delta_cl, qjt, q0t).
-  - Validate external configuration mappings (init_config, fit_config).
-
-Policy:
-  - Reject missing or invalid inputs outright (no defaults, no fallbacks).
-  - Do not coerce or cast inputs.
-"""
+"""Input validation for the choice-learn shrinkage sampler."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
 
 import tensorflow as tf
 
 
-def _require(cond: bool, msg: str) -> None:
-    if not cond:
-        raise ValueError(msg)
+def _require(condition: bool, message: str) -> None:
+    """Raise a ValueError when a validation condition fails."""
 
-
-def _require_type(x, types, name: str) -> None:
-    if not isinstance(x, types):
-        raise TypeError(f"{name} must be {types}, got {type(x)}")
-
-
-def _require_mapping(x, name: str) -> None:
-    _require_type(x, Mapping, name)
-
-
-def _require_has_keys(section: Mapping, keys: Sequence[str], name: str) -> None:
-    missing = [k for k in keys if k not in section]
-    _require(not missing, f"{name} missing keys: {missing}")
+    if not condition:
+        raise ValueError(message)
 
 
 def _require_int(x, name: str) -> None:
-    _require_type(x, int, name)
+    """Require a Python int."""
+
+    _require(
+        isinstance(x, int) and not isinstance(x, bool),
+        f"{name} must be an int; got {type(x).__name__}.",
+    )
 
 
 def _require_positive_int(x, name: str) -> None:
+    """Require a strictly positive Python int."""
+
     _require_int(x, name)
-    _require(x > 0, f"{name} must be > 0")
+    _require(x > 0, f"{name} must be > 0; got {x}.")
 
 
-def _require_floatlike(x, name: str) -> None:
-    _require_type(x, (int, float), name)
+def _require_nonnegative_int(x, name: str) -> None:
+    """Require a nonnegative Python int."""
+
+    _require_int(x, name)
+    _require(x >= 0, f"{name} must be >= 0; got {x}.")
 
 
-def _require_nonnegative_floatlike(x, name: str) -> None:
-    _require_floatlike(x, name)
-    _require(float(x) >= 0.0, f"{name} must be >= 0")
+def _require_float(x, name: str) -> None:
+    """Require a real Python scalar usable as a float."""
 
-
-def _require_positive_floatlike(x, name: str) -> None:
-    _require_floatlike(x, name)
-    _require(float(x) > 0.0, f"{name} must be > 0")
-
-
-def _require_prob_band(low, high, name_low: str, name_high: str) -> None:
-    _require_floatlike(low, name_low)
-    _require_floatlike(high, name_high)
-    lo = float(low)
-    hi = float(high)
-    _require(0.0 <= lo <= 1.0, f"{name_low} must be in [0, 1]")
-    _require(0.0 <= hi <= 1.0, f"{name_high} must be in [0, 1]")
-    _require(lo <= hi, f"{name_low} must be <= {name_high}")
-
-
-def _require_tf_tensor(x, name: str) -> None:
-    if not isinstance(x, (tf.Tensor, tf.Variable)):
-        raise TypeError(f"{name} must be a tf.Tensor or tf.Variable, got {type(x)}")
-
-
-def _require_float64_tensor(x, name: str) -> None:
-    _require_tf_tensor(x, name)
-    _require(x.dtype == tf.float64, f"{name} must have dtype tf.float64, got {x.dtype}")
-
-
-def _require_static_shape(x: tf.Tensor, expected: tuple[int, ...], name: str) -> None:
-    shape = x.shape
     _require(
-        shape.rank == len(expected),
-        f"{name} must have rank {len(expected)}, got {shape.rank}",
+        isinstance(x, (int, float)) and not isinstance(x, bool),
+        f"{name} must be a float; got {type(x).__name__}.",
     )
-    dims = shape.as_list()
+
+
+def _require_finite_float(x, name: str) -> None:
+    """Require a finite real scalar."""
+
+    _require_float(x, name)
+    _require(math.isfinite(float(x)), f"{name} must be finite; got {x}.")
+
+
+def _require_positive_float(x, name: str) -> None:
+    """Require a strictly positive finite real scalar."""
+
+    _require_finite_float(x, name)
+    _require(float(x) > 0.0, f"{name} must be > 0; got {x}.")
+
+
+def _require_open_unit_float(x, name: str) -> None:
+    """Require a finite real scalar in the open unit interval."""
+
+    _require_finite_float(x, name)
+    _require(0.0 < float(x) < 1.0, f"{name} must satisfy 0 < {name} < 1; got {x}.")
+
+
+def _require_gt_one_float(x, name: str) -> None:
+    """Require a finite real scalar strictly greater than one."""
+
+    _require_finite_float(x, name)
+    _require(float(x) > 1.0, f"{name} must be > 1; got {x}.")
+
+
+def _require_tensor_input(x, name: str) -> None:
+    """Require a TensorFlow tensor input."""
+
     _require(
-        all(d is not None for d in dims),
-        f"{name} must have a fully known static shape, got {shape}",
+        isinstance(x, tf.Tensor),
+        f"{name} must be a tf.Tensor; got {type(x).__name__}.",
     )
+
+
+def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
+    """Require a float64 tensor."""
+
+    _require_tensor_input(x, name)
     _require(
-        tuple(dims) == expected, f"{name} must have shape {expected}, got {tuple(dims)}"
+        x.dtype == tf.float64, f"{name} must have dtype tf.float64; got {x.dtype}."
+    )
+
+
+def _require_rank(x: tf.Tensor, rank: int, name: str) -> None:
+    """Require a fixed tensor rank."""
+
+    _require(
+        x.shape.rank == rank,
+        f"{name} must have rank {rank}; got rank {x.shape.rank}.",
+    )
+
+
+def _require_static_shape(x: tf.Tensor, shape: tuple[int, ...], name: str) -> None:
+    """Require an exact static tensor shape."""
+
+    actual = x.shape.as_list()
+    _require(
+        actual == list(shape),
+        f"{name} must have shape {shape}; got {tuple(actual) if actual is not None else x.shape}.",
     )
 
 
 def _require_all_finite(x: tf.Tensor, name: str) -> None:
-    tf.debugging.assert_all_finite(x, f"{name} must be finite")
+    """Require all tensor entries to be finite."""
+
+    ok = bool(tf.reduce_all(tf.math.is_finite(x)).numpy())
+    _require(ok, f"{name} must contain only finite values.")
 
 
-def _require_nonnegative(x: tf.Tensor, name: str) -> None:
-    tf.debugging.assert_greater_equal(
-        x, tf.zeros([], tf.float64), f"{name} must be >= 0"
-    )
+def _require_all_nonnegative(x: tf.Tensor, name: str) -> None:
+    """Require all tensor entries to be nonnegative."""
+
+    ok = bool(tf.reduce_all(x >= tf.zeros([], dtype=x.dtype)).numpy())
+    _require(ok, f"{name} must contain only nonnegative values.")
 
 
-def _require_binary_01(x: tf.Tensor, name: str) -> None:
-    ok = tf.reduce_all(tf.logical_or(tf.equal(x, 0.0), tf.equal(x, 1.0)))
-    _require(bool(ok.numpy()), f"{name} must be binary in {{0,1}}")
+def _require_seed_input(seed: tf.Tensor, name: str) -> None:
+    """Require a stateless RNG seed tensor of shape (2,)."""
 
-
-def _require_open_unit_interval(x: tf.Tensor, name: str) -> None:
-    gt0 = tf.reduce_all(x > 0.0)
-    lt1 = tf.reduce_all(x < 1.0)
+    _require_tensor_input(seed, name)
     _require(
-        bool(gt0.numpy()) and bool(lt1.numpy()),
-        f"{name} must satisfy 0 < {name} < 1 elementwise",
+        seed.dtype.is_integer,
+        f"{name} must have an integer dtype; got {seed.dtype}.",
+    )
+    _require_rank(seed, 1, name)
+
+    shape = seed.shape.as_list()
+    _require(
+        shape[0] == 2,
+        f"{name} must have shape (2,); got {tuple(shape)}.",
     )
 
+    ok = bool(tf.reduce_all(seed >= tf.zeros([2], dtype=seed.dtype)).numpy())
+    _require(ok, f"{name} must contain only nonnegative values.")
 
-def validate_data_inputs(
-    delta_cl: tf.Tensor, qjt: tf.Tensor, q0t: tf.Tensor
-) -> tuple[int, int]:
-    """Validate external data tensors and return (T, J)."""
+
+def observed_data_validate_input(
+    delta_cl: tf.Tensor,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+) -> None:
+    """Validate the observed choice-learn shrinkage inputs."""
+
     _require_float64_tensor(delta_cl, "delta_cl")
     _require_float64_tensor(qjt, "qjt")
     _require_float64_tensor(q0t, "q0t")
 
-    _require(
-        delta_cl.shape.rank == 2,
-        f"delta_cl must have rank 2, got {delta_cl.shape.rank}",
-    )
-    _require(qjt.shape.rank == 2, f"qjt must have rank 2, got {qjt.shape.rank}")
-    _require(q0t.shape.rank == 1, f"q0t must have rank 1, got {q0t.shape.rank}")
+    _require_rank(delta_cl, 2, "delta_cl")
+    _require_rank(qjt, 2, "qjt")
+    _require_rank(q0t, 1, "q0t")
 
-    dc = delta_cl.shape.as_list()
-    qj = qjt.shape.as_list()
-    q0 = q0t.shape.as_list()
+    delta_shape = delta_cl.shape.as_list()
+    qjt_shape = qjt.shape.as_list()
+    q0t_shape = q0t.shape.as_list()
+
     _require(
-        all(d is not None for d in dc),
-        f"delta_cl must have static shape (T,J), got {delta_cl.shape}",
+        all(dim is not None for dim in delta_shape),
+        f"delta_cl must have static shape (T, J); got {delta_cl.shape}.",
     )
     _require(
-        all(d is not None for d in qj),
-        f"qjt must have static shape (T,J), got {qjt.shape}",
+        all(dim is not None for dim in qjt_shape),
+        f"qjt must have static shape (T, J); got {qjt.shape}.",
     )
     _require(
-        all(d is not None for d in q0),
-        f"q0t must have static shape (T,), got {q0t.shape}",
+        all(dim is not None for dim in q0t_shape),
+        f"q0t must have static shape (T,); got {q0t.shape}.",
     )
 
-    T, J = int(dc[0]), int(dc[1])
+    T = delta_shape[0]
+    J = delta_shape[1]
+
+    _require(T > 0, f"delta_cl must have T > 0; got T={T}.")
+    _require(J > 0, f"delta_cl must have J > 0; got J={J}.")
+
     _require(
-        qj[0] == T and qj[1] == J,
-        f"qjt shape must match delta_cl shape {(T, J)}, got {tuple(qj)}",
+        qjt_shape == [T, J],
+        f"qjt must have shape ({T}, {J}); got {tuple(qjt_shape)}.",
     )
-    _require(q0[0] == T, f"q0t length must match T={T}, got {q0[0]}")
+    _require(
+        q0t_shape == [T],
+        f"q0t must have shape ({T},); got {tuple(q0t_shape)}.",
+    )
 
     _require_all_finite(delta_cl, "delta_cl")
     _require_all_finite(qjt, "qjt")
     _require_all_finite(q0t, "q0t")
 
-    _require_nonnegative(qjt, "qjt")
-    _require_nonnegative(q0t, "q0t")
-
-    return T, J
+    _require_all_nonnegative(qjt, "qjt")
+    _require_all_nonnegative(q0t, "q0t")
 
 
-def validate_init_config(config: Mapping[str, object], T: int, J: int) -> None:
-    """Validate estimator construction config (priors + initial state)."""
-    _require_mapping(config, "init_config")
-    _require_positive_int(T, "T")
-    _require_positive_int(J, "J")
+def posterior_validate_input(posterior_config) -> None:
+    """Validate the posterior config required to construct ChoiceLearnPosteriorTF."""
 
-    _require_has_keys(config, ["seed", "posterior", "init_state"], "init_config")
-
-    seed = config["seed"]
-    posterior = config["posterior"]
-    init_state = config["init_state"]
-
-    _require_int(seed, "seed")
-    _require_mapping(posterior, "posterior")
-    _require_mapping(init_state, "init_state")
-
-    posterior_keys = [
+    required = [
+        "eps",
         "alpha_mean",
         "alpha_var",
         "E_bar_mean",
@@ -193,99 +214,103 @@ def validate_init_config(config: Mapping[str, object], T: int, J: int) -> None:
         "a_phi",
         "b_phi",
     ]
-    _require_has_keys(posterior, posterior_keys, "posterior")
+    missing = [name for name in required if not hasattr(posterior_config, name)]
+    _require(not missing, "posterior_config missing fields: " + ", ".join(missing))
 
-    _require_floatlike(posterior["alpha_mean"], "posterior.alpha_mean")
-    _require_positive_floatlike(posterior["alpha_var"], "posterior.alpha_var")
-    _require_floatlike(posterior["E_bar_mean"], "posterior.E_bar_mean")
-    _require_positive_floatlike(posterior["E_bar_var"], "posterior.E_bar_var")
-    _require_positive_floatlike(posterior["T0_sq"], "posterior.T0_sq")
-    _require_positive_floatlike(posterior["T1_sq"], "posterior.T1_sq")
-    _require_positive_floatlike(posterior["a_phi"], "posterior.a_phi")
-    _require_positive_floatlike(posterior["b_phi"], "posterior.b_phi")
+    _require_finite_float(posterior_config.eps, "posterior_config.eps")
     _require(
-        float(posterior["T1_sq"]) > float(posterior["T0_sq"]),
-        "posterior.T1_sq must be > posterior.T0_sq",
+        0.0 < float(posterior_config.eps) < 0.5,
+        f"posterior_config.eps must satisfy 0 < eps < 0.5; got {posterior_config.eps}.",
     )
 
-    init_keys = ["alpha", "E_bar", "njt", "gamma", "phi"]
-    _require_has_keys(init_state, init_keys, "init_state")
+    _require_finite_float(posterior_config.alpha_mean, "posterior_config.alpha_mean")
+    _require_finite_float(posterior_config.E_bar_mean, "posterior_config.E_bar_mean")
 
-    alpha0 = init_state["alpha"]
-    E_bar0 = init_state["E_bar"]
-    njt0 = init_state["njt"]
-    gamma0 = init_state["gamma"]
-    phi0 = init_state["phi"]
+    _require_positive_float(posterior_config.alpha_var, "posterior_config.alpha_var")
+    _require_positive_float(posterior_config.E_bar_var, "posterior_config.E_bar_var")
 
-    _require_float64_tensor(alpha0, "init_state.alpha")
-    _require_float64_tensor(E_bar0, "init_state.E_bar")
-    _require_float64_tensor(njt0, "init_state.njt")
-    _require_float64_tensor(gamma0, "init_state.gamma")
-    _require_float64_tensor(phi0, "init_state.phi")
+    _require_positive_float(posterior_config.T0_sq, "posterior_config.T0_sq")
+    _require_positive_float(posterior_config.T1_sq, "posterior_config.T1_sq")
+    _require(
+        float(posterior_config.T1_sq) > float(posterior_config.T0_sq),
+        "posterior_config.T1_sq must be > posterior_config.T0_sq; "
+        f"got {posterior_config.T1_sq} <= {posterior_config.T0_sq}.",
+    )
 
-    _require_static_shape(alpha0, (), "init_state.alpha")
-    _require_static_shape(E_bar0, (T,), "init_state.E_bar")
-    _require_static_shape(njt0, (T, J), "init_state.njt")
-    _require_static_shape(gamma0, (T, J), "init_state.gamma")
-    _require_static_shape(phi0, (T,), "init_state.phi")
-
-    _require_all_finite(alpha0, "init_state.alpha")
-    _require_all_finite(E_bar0, "init_state.E_bar")
-    _require_all_finite(njt0, "init_state.njt")
-    _require_all_finite(gamma0, "init_state.gamma")
-    _require_all_finite(phi0, "init_state.phi")
-
-    _require_binary_01(gamma0, "init_state.gamma")
-    _require_open_unit_interval(phi0, "init_state.phi")
+    _require_positive_float(posterior_config.a_phi, "posterior_config.a_phi")
+    _require_positive_float(posterior_config.b_phi, "posterior_config.b_phi")
 
 
-def validate_fit_config(config: Mapping[str, object]) -> None:
-    """Validate fit() configuration (run length + tuning settings)."""
-    _require_mapping(config, "fit_config")
+def shrinkage_validate_input(shrinkage_config) -> None:
+    """Validate the sampler and tuning config for the choice-learn chain."""
 
     required = [
-        "n_iter",
+        "num_results",
+        "num_burnin_steps",
+        "chunk_size",
+        "k_alpha",
+        "k_E_bar",
+        "k_njt",
         "pilot_length",
-        "ridge",
         "target_low",
         "target_high",
         "max_rounds",
-        "factor_rw",
-        "factor_tmh",
-        "k_alpha0",
-        "k_E_bar0",
-        "k_njt0",
-        "tune_seed",
+        "factor",
     ]
-    _require_has_keys(config, required, "fit_config")
+    missing = [name for name in required if not hasattr(shrinkage_config, name)]
+    _require(not missing, "shrinkage_config missing fields: " + ", ".join(missing))
 
-    n_iter = config["n_iter"]
-    pilot_length = config["pilot_length"]
-
-    _require_positive_int(n_iter, "n_iter")
-    _require_positive_int(pilot_length, "pilot_length")
-    _require(pilot_length <= n_iter, "pilot_length must be <= n_iter")
-
-    _require_nonnegative_floatlike(config["ridge"], "ridge")
-    _require_prob_band(
-        config["target_low"], config["target_high"], "target_low", "target_high"
+    _require_positive_int(shrinkage_config.num_results, "shrinkage_config.num_results")
+    _require_nonnegative_int(
+        shrinkage_config.num_burnin_steps,
+        "shrinkage_config.num_burnin_steps",
     )
-    _require_positive_int(config["max_rounds"], "max_rounds")
+    _require_positive_int(shrinkage_config.chunk_size, "shrinkage_config.chunk_size")
 
-    _require_positive_floatlike(config["factor_rw"], "factor_rw")
-    _require_positive_floatlike(config["factor_tmh"], "factor_tmh")
-    _require(float(config["factor_rw"]) > 1.0, "factor_rw must be > 1")
-    _require(float(config["factor_tmh"]) > 1.0, "factor_tmh must be > 1")
+    _require_positive_float(shrinkage_config.k_alpha, "shrinkage_config.k_alpha")
+    _require_positive_float(shrinkage_config.k_E_bar, "shrinkage_config.k_E_bar")
+    _require_positive_float(shrinkage_config.k_njt, "shrinkage_config.k_njt")
 
-    _require_positive_floatlike(config["k_alpha0"], "k_alpha0")
-    _require_positive_floatlike(config["k_E_bar0"], "k_E_bar0")
-    _require_positive_floatlike(config["k_njt0"], "k_njt0")
-
-    _require_int(config["tune_seed"], "tune_seed")
-
-
-def fit_validate_input(*args, **kwargs):
-    """Deprecated. Use validate_fit_config(fit_config) instead."""
-    raise RuntimeError(
-        "fit_validate_input is deprecated. Use validate_fit_config(fit_config)."
+    _require_positive_int(
+        shrinkage_config.pilot_length, "shrinkage_config.pilot_length"
     )
+    _require_positive_int(shrinkage_config.max_rounds, "shrinkage_config.max_rounds")
+
+    _require_open_unit_float(shrinkage_config.target_low, "shrinkage_config.target_low")
+    _require_open_unit_float(
+        shrinkage_config.target_high,
+        "shrinkage_config.target_high",
+    )
+    _require(
+        float(shrinkage_config.target_low) < float(shrinkage_config.target_high),
+        "shrinkage_config.target_low must be < shrinkage_config.target_high; "
+        f"got {shrinkage_config.target_low} >= {shrinkage_config.target_high}.",
+    )
+
+    _require_gt_one_float(shrinkage_config.factor, "shrinkage_config.factor")
+
+
+def seed_validate_input(seed: tf.Tensor) -> None:
+    """Validate the external chain seed tensor."""
+
+    _require_seed_input(seed, "seed")
+
+
+def run_chain_validate_input(
+    delta_cl: tf.Tensor,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    posterior_config,
+    shrinkage_config,
+    seed: tf.Tensor,
+) -> None:
+    """Validate the full external input set required by run_chain."""
+
+    observed_data_validate_input(
+        delta_cl=delta_cl,
+        qjt=qjt,
+        q0t=q0t,
+    )
+    posterior_validate_input(posterior_config)
+    shrinkage_validate_input(shrinkage_config)
+    seed_validate_input(seed)

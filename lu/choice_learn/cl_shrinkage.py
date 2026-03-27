@@ -1,266 +1,462 @@
-"""
-Choice-learn + Lu shrinkage estimator (MCMC sampler).
-
-Samples sparse market-product shocks under a spike-and-slab prior, conditional on
-fixed choice-learn mean utilities.
-
-Model (systematic utility):
-  delta[t, j] = alpha * delta_cl[t, j] + E_bar[t] + njt[t, j]
-"""
+"""Run the choice-learn shrinkage MCMC chain and summarize retained samples."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from types import SimpleNamespace
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from lu.choice_learn.cl_diagnostics import ChoiceLearnShrinkageDiagnostics
-from lu.choice_learn.cl_posterior import LuPosteriorTF
+from lu.choice_learn.cl_diagnostics import (
+    ChoiceLearnChunkSummary,
+    ChoiceLearnChunkTrace,
+    report_chunk_progress,
+    report_run_summary,
+)
+from lu.choice_learn.cl_posterior import (
+    ChoiceLearnPosteriorConfig,
+    ChoiceLearnPosteriorTF,
+)
 from lu.choice_learn.cl_tuning import tune_shrinkage
 from lu.choice_learn.cl_updates import (
-    update_E_bar,
-    update_alpha,
-    update_gamma,
-    update_njt,
-    update_phi,
+    E_bar_one_step,
+    alpha_one_step,
+    gamma_one_step,
+    njt_one_step,
 )
-from lu.choice_learn.cl_validate_input import (
-    validate_data_inputs,
-    validate_fit_config,
-    validate_init_config,
-)
+from lu.choice_learn.cl_validate_input import run_chain_validate_input
 
 
-class ChoiceLearnShrinkageEstimator:
-    """MCMC sampler for the choice-learn + Lu sparse-shock model.
+@dataclass(frozen=True)
+class ChoiceLearnShrinkageConfig:
+    """Store sampler controls, proposal scales, and tuning parameters."""
 
-    Fixed data:
-      - delta_cl: (T, J) float64 baseline mean utilities from choice-learn
-      - qjt:      (T, J) float64 inside counts/shares
-      - q0t:      (T,)   float64 outside counts/shares
+    num_results: int
+    num_burnin_steps: int
+    chunk_size: int
+    k_alpha: float
+    k_E_bar: float
+    k_njt: float
+    pilot_length: int
+    target_low: float
+    target_high: float
+    max_rounds: int
+    factor: float
 
-    Sampled state:
-      - alpha: scalar
-      - E_bar: (T,)
-      - njt:   (T, J)
-      - gamma: (T, J) in {0,1} (stored as float64)
-      - phi:   (T,) in (0,1)
-    """
+
+class ChoiceLearnShrinkageState(NamedTuple):
+    """Store the current state of the choice-learn shrinkage chain."""
+
+    alpha: tf.Tensor
+    E_bar: tf.Tensor
+    njt: tf.Tensor
+    gamma: tf.Tensor
+
+
+class ChoiceLearnHybridKernelResults(NamedTuple):
+    """Store the acceptance diagnostics for one hybrid transition step."""
+
+    alpha_accept: tf.Tensor
+    E_bar_accept: tf.Tensor
+    njt_accept: tf.Tensor
+
+
+def _num_chunks(n_steps: int, chunk_size: int) -> int:
+    """Return the number of chunks needed for a given step count."""
+
+    if n_steps <= 0:
+        return 0
+    return (n_steps + chunk_size - 1) // chunk_size
+
+
+def _last_state(samples: ChoiceLearnShrinkageState) -> ChoiceLearnShrinkageState:
+    """Extract the terminal state from a chunk of sampled states."""
+
+    return ChoiceLearnShrinkageState(
+        alpha=samples.alpha[-1],
+        E_bar=samples.E_bar[-1],
+        njt=samples.njt[-1],
+        gamma=samples.gamma[-1],
+    )
+
+
+def _concat_sample_chunks(
+    chunks: list[ChoiceLearnShrinkageState],
+) -> ChoiceLearnShrinkageState:
+    """Concatenate retained sample chunks into one state trace."""
+
+    if len(chunks) == 0:
+        raise ValueError("No retained sample chunks were produced.")
+
+    return ChoiceLearnShrinkageState(
+        alpha=tf.concat([chunk.alpha for chunk in chunks], axis=0),
+        E_bar=tf.concat([chunk.E_bar for chunk in chunks], axis=0),
+        njt=tf.concat([chunk.njt for chunk in chunks], axis=0),
+        gamma=tf.concat([chunk.gamma for chunk in chunks], axis=0),
+    )
+
+
+def _raw_trace_to_dataclass(
+    raw_trace: dict[str, tf.Tensor],
+) -> ChoiceLearnChunkTrace:
+    """Convert the raw trace dictionary into a ChoiceLearnChunkTrace."""
+
+    return ChoiceLearnChunkTrace(
+        alpha=raw_trace["alpha"],
+        mean_E_bar=raw_trace["mean_E_bar"],
+        norm_E_bar=raw_trace["norm_E_bar"],
+        norm_njt=raw_trace["norm_njt"],
+        gamma_active_share=raw_trace["gamma_active_share"],
+        joint_logpost=raw_trace["joint_logpost"],
+        alpha_accept=raw_trace["alpha_accept"],
+        E_bar_accept=raw_trace["E_bar_accept"],
+        njt_accept=raw_trace["njt_accept"],
+    )
+
+
+def build_initial_state(
+    delta_cl: tf.Tensor,
+    posterior: ChoiceLearnPosteriorTF,
+) -> ChoiceLearnShrinkageState:
+    """Construct the default initial state for the shrinkage chain."""
+
+    T = tf.shape(delta_cl)[0]
+    J = tf.shape(delta_cl)[1]
+
+    return ChoiceLearnShrinkageState(
+        alpha=tf.constant(0.0, dtype=tf.float64),
+        E_bar=tf.fill([T], posterior.E_bar_mean),
+        njt=tf.zeros([T, J], dtype=tf.float64),
+        gamma=tf.zeros([T, J], dtype=tf.float64),
+    )
+
+
+class ChoiceLearnHybridKernel(tfp.mcmc.TransitionKernel):
+    """Implement one hybrid transition of the choice-learn shrinkage sampler."""
 
     def __init__(
         self,
-        delta_cl: tf.Tensor,
+        posterior: ChoiceLearnPosteriorTF,
         qjt: tf.Tensor,
         q0t: tf.Tensor,
-        config: Mapping[str, object],
+        delta_cl: tf.Tensor,
+        config: ChoiceLearnShrinkageConfig,
     ):
-        """Validate inputs, build posterior helper, and initialize sampler state.
+        """Store the posterior object, observed data, and proposal scales."""
 
-        Required init config keys:
-          - seed: int
-          - posterior: mapping of LuPosteriorTF hyperparameters
-          - init_state: mapping with keys {alpha, E_bar, njt, gamma, phi}
-        """
-        # Boundary validation for data tensors and init config.
-        T, J = validate_data_inputs(delta_cl=delta_cl, qjt=qjt, q0t=q0t)
-        validate_init_config(config=config, T=T, J=J)
+        self._posterior = posterior
+        self._qjt = qjt
+        self._q0t = q0t
+        self._delta_cl = delta_cl
+        self._config = config
 
-        self.T = T
-        self.J = J
+        self._k_alpha = tf.constant(config.k_alpha, dtype=tf.float64)
+        self._k_E_bar = tf.constant(config.k_E_bar, dtype=tf.float64)
+        self._k_njt = tf.constant(config.k_njt, dtype=tf.float64)
 
-        self.delta_cl = delta_cl
-        self.qjt = qjt
-        self.q0t = q0t
-
-        seed = config["seed"]
-        posterior_cfg = config["posterior"]
-        init_state = config["init_state"]
-
-        # Posterior helper (likelihood + priors), fully specified by config.
-        self.posterior = LuPosteriorTF(posterior_cfg)
-
-        # RNG owned by the sampler (used by the main chain only).
-        self.rng = tf.random.Generator.from_seed(seed)
-
-        # Latent state (explicitly initialized from config; no fallbacks).
-        self.alpha = tf.Variable(init_state["alpha"], dtype=tf.float64, trainable=False)
-        self.E_bar = tf.Variable(init_state["E_bar"], dtype=tf.float64, trainable=False)
-        self.njt = tf.Variable(init_state["njt"], dtype=tf.float64, trainable=False)
-        self.gamma = tf.Variable(init_state["gamma"], dtype=tf.float64, trainable=False)
-        self.phi = tf.Variable(init_state["phi"], dtype=tf.float64, trainable=False)
-
-        self._diag: ChoiceLearnShrinkageDiagnostics | None = None
-
-    def fit(self, fit_config: Mapping[str, object]) -> None:
-        """Tune proposal scales, run MCMC, and accumulate posterior means."""
-        validate_fit_config(fit_config)
-
-        n_iter = fit_config["n_iter"]
-
-        pilot_length = fit_config["pilot_length"]
-        ridge = fit_config["ridge"]
-        target_low = fit_config["target_low"]
-        target_high = fit_config["target_high"]
-        max_rounds = fit_config["max_rounds"]
-        factor_rw = fit_config["factor_rw"]
-        factor_tmh = fit_config["factor_tmh"]
-
-        k_alpha0 = tf.constant(fit_config["k_alpha0"], tf.float64)
-        k_E_bar0 = tf.constant(fit_config["k_E_bar0"], tf.float64)
-        k_njt0 = tf.constant(fit_config["k_njt0"], tf.float64)
-        tune_seed = fit_config["tune_seed"]
-
-        ridge_t = tf.constant(ridge, tf.float64)
-
-        # Build the minimal view object required by tune_shrinkage().
-        tune_view = SimpleNamespace(
-            pilot_length=pilot_length,
-            ridge=ridge_t,
-            target_low=target_low,
-            target_high=target_high,
-            max_rounds=max_rounds,
-            factor_rw=factor_rw,
-            factor_tmh=factor_tmh,
-            k_alpha0=k_alpha0,
-            k_E_bar0=k_E_bar0,
-            k_njt0=k_njt0,
-            tune_seed=tune_seed,
-            T=self.T,
-            J=self.J,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            delta_cl=self.delta_cl,
-            alpha=self.alpha,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            gamma=self.gamma,
-            phi=self.phi,
-            posterior=self.posterior,
-        )
-
-        k_alpha, k_E_bar, k_njt = tune_shrinkage(tune_view)
-
-        diag = ChoiceLearnShrinkageDiagnostics(T=self.T, J=self.J)
-        self._run_mcmc_loop(
-            n_iter=n_iter,
-            k_alpha=k_alpha,
-            k_E_bar=k_E_bar,
-            k_njt=k_njt,
-            ridge=ridge_t,
-            diag=diag,
-        )
-
-    def get_results(self) -> dict:
-        """Return posterior-mean summaries from accumulated running sums."""
-        if self._diag is None:
-            raise ValueError("get_results() called before fit().")
-
-        saved, sum_alpha, sum_E_bar, sum_njt, sum_phi, sum_gamma = self._diag.get_sums()
-        saved_f = tf.cast(saved, tf.float64)
-
-        alpha_mean = float((sum_alpha / saved_f).numpy())
-        E_bar_mean = (sum_E_bar / saved_f).numpy()  # (T,)
-        njt_mean = (sum_njt / saved_f).numpy()  # (T,J)
-        E_mean = E_bar_mean[:, None] + njt_mean  # (T,J)
-
-        phi_mean = (sum_phi / saved_f).numpy()  # (T,)
-        gamma_mean = (sum_gamma / saved_f).numpy()  # (T,J)
-
-        return {
-            "alpha_hat": alpha_mean,
-            "E_hat": E_mean,
-            "E_bar_hat": E_bar_mean,
-            "njt_hat": njt_mean,
-            "phi_hat": phi_mean,
-            "gamma_hat": gamma_mean,
-            "n_saved": int(saved.numpy()),
+        self._parameters = {
+            "posterior": posterior,
+            "qjt": qjt,
+            "q0t": q0t,
+            "delta_cl": delta_cl,
+            "config": config,
         }
 
-    def _run_mcmc_loop(
+    @property
+    def parameters(self):
+        """Return the kernel parameters required by the TFP interface."""
+
+        return self._parameters
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Return whether the kernel is treated as calibrated."""
+
+        return True
+
+    def bootstrap_results(
         self,
-        n_iter: int,
-        k_alpha: tf.Tensor,
-        k_E_bar: tf.Tensor,
-        k_njt: tf.Tensor,
-        ridge: tf.Tensor,
-        diag: ChoiceLearnShrinkageDiagnostics,
-    ) -> None:
-        """Run the iteration loop, mutate sampler state, and record diagnostics."""
-        self._diag = diag
+        current_state: ChoiceLearnShrinkageState,
+    ) -> ChoiceLearnHybridKernelResults:
+        """Initialize the acceptance diagnostics for the first step."""
 
-        for it in range(n_iter):
-            it_t = tf.convert_to_tensor(it, dtype=tf.int32)
+        del current_state
+        zero = tf.constant(0.0, dtype=tf.float64)
 
-            # State update (compiled).
-            self._mcmc_iteration_step(
-                k_alpha=k_alpha,
-                k_E_bar=k_E_bar,
-                k_njt=k_njt,
-                ridge=ridge,
+        return ChoiceLearnHybridKernelResults(
+            alpha_accept=zero,
+            E_bar_accept=zero,
+            njt_accept=zero,
+        )
+
+    def one_step(
+        self,
+        current_state: ChoiceLearnShrinkageState,
+        previous_kernel_results: ChoiceLearnHybridKernelResults,
+        seed: tf.Tensor,
+    ) -> tuple[ChoiceLearnShrinkageState, ChoiceLearnHybridKernelResults]:
+        """Apply one full hybrid transition of the shrinkage chain."""
+
+        del previous_kernel_results
+
+        seeds = tf.random.experimental.stateless_split(seed, num=4)
+
+        alpha_new, alpha_accept = alpha_one_step(
+            posterior=self._posterior,
+            qjt=self._qjt,
+            q0t=self._q0t,
+            delta_cl=self._delta_cl,
+            alpha=current_state.alpha,
+            E_bar=current_state.E_bar,
+            njt=current_state.njt,
+            k_alpha=self._k_alpha,
+            seed=seeds[0],
+        )
+
+        E_bar_new, E_bar_accept = E_bar_one_step(
+            posterior=self._posterior,
+            qjt=self._qjt,
+            q0t=self._q0t,
+            delta_cl=self._delta_cl,
+            alpha=alpha_new,
+            E_bar=current_state.E_bar,
+            njt=current_state.njt,
+            k_E_bar=self._k_E_bar,
+            seed=seeds[1],
+        )
+
+        njt_new, njt_accept = njt_one_step(
+            posterior=self._posterior,
+            qjt=self._qjt,
+            q0t=self._q0t,
+            delta_cl=self._delta_cl,
+            alpha=alpha_new,
+            E_bar=E_bar_new,
+            njt=current_state.njt,
+            gamma=current_state.gamma,
+            k_njt=self._k_njt,
+            seed=seeds[2],
+        )
+
+        gamma_new = gamma_one_step(
+            posterior=self._posterior,
+            njt=njt_new,
+            gamma=current_state.gamma,
+            seed=seeds[3],
+        )
+
+        new_state = ChoiceLearnShrinkageState(
+            alpha=alpha_new,
+            E_bar=E_bar_new,
+            njt=njt_new,
+            gamma=gamma_new,
+        )
+        new_results = ChoiceLearnHybridKernelResults(
+            alpha_accept=alpha_accept,
+            E_bar_accept=E_bar_accept,
+            njt_accept=njt_accept,
+        )
+        return new_state, new_results
+
+    def copy(self, **kwargs):
+        """Return a copy of the kernel with updated parameters."""
+
+        parameters = dict(self.parameters)
+        parameters.update(kwargs)
+        return type(self)(**parameters)
+
+
+def _make_trace(
+    posterior: ChoiceLearnPosteriorTF,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    delta_cl: tf.Tensor,
+    current_state: ChoiceLearnShrinkageState,
+    kernel_results: ChoiceLearnHybridKernelResults,
+) -> dict[str, tf.Tensor]:
+    """Build the per-draw diagnostics recorded during sampling."""
+
+    joint_lp = posterior.joint_logpost(
+        qjt=qjt,
+        q0t=q0t,
+        delta_cl=delta_cl,
+        alpha=current_state.alpha,
+        E_bar=current_state.E_bar,
+        njt=current_state.njt,
+        gamma=current_state.gamma,
+    )
+
+    return {
+        "alpha": current_state.alpha,
+        "mean_E_bar": tf.reduce_mean(current_state.E_bar),
+        "norm_E_bar": tf.linalg.norm(current_state.E_bar),
+        "norm_njt": tf.linalg.norm(current_state.njt),
+        "gamma_active_share": tf.reduce_mean(current_state.gamma),
+        "joint_logpost": joint_lp,
+        "alpha_accept": kernel_results.alpha_accept,
+        "E_bar_accept": kernel_results.E_bar_accept,
+        "njt_accept": kernel_results.njt_accept,
+    }
+
+
+def run_chain(
+    delta_cl: tf.Tensor,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    posterior_config: ChoiceLearnPosteriorConfig,
+    shrinkage_config: ChoiceLearnShrinkageConfig,
+    seed: tf.Tensor,
+) -> ChoiceLearnShrinkageState:
+    """Validate inputs, tune scales, run the chain, and return retained draws."""
+
+    run_chain_validate_input(
+        delta_cl=delta_cl,
+        qjt=qjt,
+        q0t=q0t,
+        posterior_config=posterior_config,
+        shrinkage_config=shrinkage_config,
+        seed=seed,
+    )
+
+    posterior = ChoiceLearnPosteriorTF(posterior_config)
+    initial_state = build_initial_state(delta_cl=delta_cl, posterior=posterior)
+
+    seeds = tf.random.experimental.stateless_split(seed, num=2)
+    tuning_seed = seeds[0]
+    sampling_seed = seeds[1]
+
+    tuned_config = tune_shrinkage(
+        posterior=posterior,
+        qjt=qjt,
+        q0t=q0t,
+        delta_cl=delta_cl,
+        initial_state=initial_state,
+        shrinkage_config=shrinkage_config,
+        pilot_length=shrinkage_config.pilot_length,
+        target_low=shrinkage_config.target_low,
+        target_high=shrinkage_config.target_high,
+        max_rounds=shrinkage_config.max_rounds,
+        factor=shrinkage_config.factor,
+        seed=tuning_seed,
+    )
+
+    kernel = ChoiceLearnHybridKernel(
+        posterior=posterior,
+        qjt=qjt,
+        q0t=q0t,
+        delta_cl=delta_cl,
+        config=tuned_config,
+    )
+
+    def trace_fn(
+        current_state: ChoiceLearnShrinkageState,
+        kernel_results: ChoiceLearnHybridKernelResults,
+    ) -> dict[str, tf.Tensor]:
+        """Record the per-draw diagnostics reported at chunk boundaries."""
+
+        return _make_trace(
+            posterior=posterior,
+            qjt=qjt,
+            q0t=q0t,
+            delta_cl=delta_cl,
+            current_state=current_state,
+            kernel_results=kernel_results,
+        )
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _run_chunk(
+        current_state: ChoiceLearnShrinkageState,
+        previous_kernel_results: ChoiceLearnHybridKernelResults,
+        num_steps: tf.Tensor,
+        chunk_seed: tf.Tensor,
+    ):
+        """Run one chunk of the chain and return samples, trace, and kernel results."""
+
+        return tfp.mcmc.sample_chain(
+            num_results=num_steps,
+            num_burnin_steps=0,
+            current_state=current_state,
+            previous_kernel_results=previous_kernel_results,
+            kernel=kernel,
+            trace_fn=trace_fn,
+            return_final_kernel_results=True,
+            seed=chunk_seed,
+        )
+
+    state = initial_state
+    kernel_results = kernel.bootstrap_results(initial_state)
+
+    burnin_chunks = _num_chunks(tuned_config.num_burnin_steps, tuned_config.chunk_size)
+    result_chunks = _num_chunks(tuned_config.num_results, tuned_config.chunk_size)
+    total_chunks = burnin_chunks + result_chunks
+
+    chunk_seeds = tf.random.experimental.stateless_split(
+        sampling_seed,
+        num=total_chunks,
+    )
+
+    chunk_idx = 0
+    chunk_summaries: list[ChoiceLearnChunkSummary] = []
+    retained_chunks: list[ChoiceLearnShrinkageState] = []
+
+    def run_phase(remaining_steps: int, retain: bool) -> int:
+        """Execute one chunked phase of the chain."""
+
+        nonlocal chunk_idx, state, kernel_results
+
+        while remaining_steps > 0:
+            this_chunk = min(tuned_config.chunk_size, remaining_steps)
+
+            chunk_samples, raw_trace, kernel_results = _run_chunk(
+                current_state=state,
+                previous_kernel_results=kernel_results,
+                num_steps=tf.constant(this_chunk, dtype=tf.int32),
+                chunk_seed=chunk_seeds[chunk_idx],
             )
 
-            # Diagnostics: accumulate and print a progress line (compiled).
-            diag.step(self, it_t)
+            state = _last_state(chunk_samples)
 
-    @tf.function(reduce_retracing=True)
-    def _mcmc_iteration_step(self, k_alpha, k_E_bar, k_njt, ridge):
-        """Run one full MCMC iteration (state updates only)."""
-        alpha_new, _ = update_alpha(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            delta_cl=self.delta_cl,
-            alpha=self.alpha,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            k_alpha=k_alpha,
-        )
-        self.alpha.assign(alpha_new)
+            if retain:
+                retained_chunks.append(chunk_samples)
 
-        E_bar_new, _ = update_E_bar(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            delta_cl=self.delta_cl,
-            alpha=self.alpha,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            gamma=self.gamma,
-            phi=self.phi,
-            k_E_bar=k_E_bar,
-        )
-        self.E_bar.assign(E_bar_new)
+            trace = _raw_trace_to_dataclass(raw_trace)
+            summary = report_chunk_progress(
+                trace=trace,
+                chunk_idx=chunk_idx + 1,
+                total_chunks=total_chunks,
+            )
+            chunk_summaries.append(summary)
 
-        njt_new, _ = update_njt(
-            posterior=self.posterior,
-            rng=self.rng,
-            qjt=self.qjt,
-            q0t=self.q0t,
-            delta_cl=self.delta_cl,
-            alpha=self.alpha,
-            E_bar=self.E_bar,
-            njt=self.njt,
-            gamma=self.gamma,
-            phi=self.phi,
-            k_njt=k_njt,
-            ridge=ridge,
-        )
-        self.njt.assign(njt_new)
+            remaining_steps -= this_chunk
+            chunk_idx += 1
 
-        gamma_new = update_gamma(
-            posterior=self.posterior,
-            rng=self.rng,
-            njt=self.njt,
-            phi=self.phi,
-        )
-        self.gamma.assign(gamma_new)
+        return remaining_steps
 
-        phi_new = update_phi(
-            posterior=self.posterior,
-            rng=self.rng,
-            gamma=self.gamma,
-        )
-        self.phi.assign(phi_new)
+    run_phase(tuned_config.num_burnin_steps, retain=False)
+    run_phase(tuned_config.num_results, retain=True)
+
+    if len(chunk_summaries) > 0:
+        report_run_summary(chunk_summaries)
+
+    return _concat_sample_chunks(retained_chunks)
+
+
+def summarize_samples(
+    samples: ChoiceLearnShrinkageState,
+) -> dict[str, tf.Tensor]:
+    """Compute posterior mean summaries from retained chain output."""
+
+    alpha_hat = tf.reduce_mean(samples.alpha, axis=0)
+    E_bar_hat = tf.reduce_mean(samples.E_bar, axis=0)
+    njt_hat = tf.reduce_mean(samples.njt, axis=0)
+    gamma_hat = tf.reduce_mean(samples.gamma, axis=0)
+    E_hat = E_bar_hat[:, None] + njt_hat
+
+    return {
+        "alpha_hat": alpha_hat,
+        "E_hat": E_hat,
+        "E_bar_hat": E_bar_hat,
+        "njt_hat": njt_hat,
+        "gamma_hat": gamma_hat,
+    }

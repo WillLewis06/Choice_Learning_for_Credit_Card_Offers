@@ -1,386 +1,345 @@
 """
 bonus2_input_validation.py
 
-Centralized input validation for Bonus Q2.
+Validate external inputs for the Bonus Q2 codebase.
 
-This module is the single source of truth for validating external inputs:
-- raw arrays (panel inputs, Phase-1 outputs)
-- configuration dictionaries (init values, prior scales, step sizes)
-- DGP configuration (if used)
+This module supports two validation layers:
 
-Other Bonus2 modules must not implement their own validation, fallback logic, or
-shape/dtype coercions beyond straightforward conversion after validation.
+1) DGP / raw panel validation
+   - validate_bonus2_dgp_inputs(...)
+   - validate_bonus2_panel(...)
+
+2) Refactored estimator-chain validation
+   - preprocessing_validate_input(...)
+   - observed_data_validate_input(...)
+   - posterior_validate_input(...)
+   - sampler_validate_input(...)
+   - seed_validate_input(...)
+   - run_chain_validate_input(...)
+
+The DGP validators are NumPy/list based.
+The refactored chain validators are TensorFlow based.
+
+This module performs validation only. It does not apply defaults.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
 
 import numpy as np
+import tensorflow as tf
 
 
-# =============================================================================
-# Constants
-# =============================================================================
+def _require(cond: bool, msg: str) -> None:
+    """Raise ValueError when a validation condition fails."""
+    if not cond:
+        raise ValueError(msg)
 
 
-Z_KEYS: tuple[str, ...] = (
-    "z_beta_intercept_j",
-    "z_beta_habit_j",
-    "z_beta_peer_j",
-    "z_beta_weekend_jw",
-    "z_a_m",
-    "z_b_m",
-)
+def _require_type(x, t, msg: str) -> None:
+    """Raise TypeError when a value is not of the required type."""
+    if not isinstance(x, t):
+        raise TypeError(msg)
 
 
-INIT_THETA_KEYS: tuple[str, ...] = (
-    "beta_intercept",
-    "beta_habit",
-    "beta_peer",
-    "beta_weekend_weekday",
-    "beta_weekend_weekend",
-    "a_m",
-    "b_m",
-)
+def _require_int(x, name: str) -> None:
+    """Validate that a value is a non-bool integer scalar."""
+    _require_type(x, (int, np.integer), f"{name} must be an int; got {type(x)}.")
+    _require(not isinstance(x, bool), f"{name} must be an int (not bool).")
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
+def _require_positive_int(x, name: str) -> None:
+    """Validate that an int is strictly positive."""
+    _require_int(x, name)
+    _require(int(x) > 0, f"{name} must be > 0; got {x}.")
 
 
-def _as_np(x: Any, name: str, dtype: Any | None = None) -> np.ndarray:
-    """Convert to numpy array or raise with a clear message."""
-    try:
-        return np.asarray(x, dtype=dtype) if dtype is not None else np.asarray(x)
-    except Exception as e:  # pragma: no cover
-        raise ValueError(f"{name}: could not convert to numpy array ({e})") from e
+def _require_nonnegative_int(x, name: str) -> None:
+    """Validate that an int is non-negative."""
+    _require_int(x, name)
+    _require(int(x) >= 0, f"{name} must be >= 0; got {x}.")
 
 
-def _require_ndim(a: np.ndarray, ndim: int, name: str) -> None:
-    if a.ndim != ndim:
-        raise ValueError(
-            f"{name}: expected ndim={ndim}, got ndim={a.ndim} shape={a.shape}"
-        )
+def _require_float(x, name: str) -> None:
+    """Validate that a value is a non-bool floating scalar."""
+    _require_type(
+        x,
+        (float, np.floating),
+        f"{name} must be a float; got {type(x)}.",
+    )
+    _require(not isinstance(x, bool), f"{name} must be a float (not bool).")
 
 
-def _require_shape(a: np.ndarray, shape: tuple[int, ...], name: str) -> None:
-    if a.shape != shape:
-        raise ValueError(f"{name}: expected shape={shape}, got shape={a.shape}")
+def _require_finite_float(x, name: str) -> None:
+    """Validate that a float is finite."""
+    _require_float(x, name)
+    _require(np.isfinite(float(x)), f"{name} must be finite; got {x}.")
 
 
-def _require_finite(a: np.ndarray, name: str) -> None:
-    if not np.isfinite(a).all():
-        raise ValueError(f"{name}: expected all finite, got non-finite entries")
+def _require_positive_float(x, name: str) -> None:
+    """Validate that a float is finite and strictly positive."""
+    _require_finite_float(x, name)
+    _require(float(x) > 0.0, f"{name} must be > 0; got {x}.")
 
 
-def _require_int_scalar(x: Any, name: str, min_value: int | None = None) -> int:
-    try:
-        v = int(x)
-    except Exception as e:  # pragma: no cover
-        raise ValueError(f"{name}: expected int scalar, got {x} ({e})") from e
-    if min_value is not None and v < min_value:
-        raise ValueError(f"{name}: expected >= {min_value}, got {v}")
-    return v
+def _require_nonnegative_float(x, name: str) -> None:
+    """Validate that a float is finite and non-negative."""
+    _require_finite_float(x, name)
+    _require(float(x) >= 0.0, f"{name} must be >= 0; got {x}.")
 
 
-def _require_float_scalar(x: Any, name: str) -> float:
-    try:
-        v = float(x)
-    except Exception as e:  # pragma: no cover
-        raise ValueError(f"{name}: expected float scalar, got {x} ({e})") from e
-    if not np.isfinite(v):
-        raise ValueError(f"{name}: expected finite float, got {v}")
-    return v
+def _require_open_unit_float(x, name: str) -> None:
+    """Validate that a float lies in the open unit interval."""
+    _require_finite_float(x, name)
+    _require(float(x) > 0.0, f"{name} must be > 0; got {x}.")
+    _require(float(x) < 1.0, f"{name} must be < 1; got {x}.")
 
 
-def _require_float_in_open_interval(x: Any, name: str, lo: float, hi: float) -> float:
-    v = _require_float_scalar(x, name)
-    if not (lo < v < hi):
-        raise ValueError(f"{name}: expected in ({lo},{hi}), got {v}")
-    return v
+def _require_gt_one_float(x, name: str) -> None:
+    """Validate that a float is greater than one."""
+    _require_finite_float(x, name)
+    _require(float(x) > 1.0, f"{name} must be > 1; got {x}.")
 
 
-def _require_dict(x: Any, name: str) -> dict:
-    if not isinstance(x, dict):
-        raise ValueError(f"{name}: expected dict, got type={type(x)}")
-    return x
+def _require_tensor_rank(x: tf.Tensor, rank: int, name: str) -> None:
+    """Validate the rank of a tensor input."""
+    _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
+    _require(
+        x.shape.rank == rank,
+        f"{name} must have rank {rank}; got rank {x.shape.rank}.",
+    )
 
 
-def _validate_required_keys(d: dict, name: str, required: set[str]) -> None:
-    missing = required - set(d.keys())
-    if missing:
-        raise ValueError(f"{name}: missing keys {sorted(missing)}")
-    extra = set(d.keys()) - required
-    if extra:
-        raise ValueError(f"{name}: unexpected keys {sorted(extra)}")
+def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
+    """Validate that an input is a tf.float64 tensor."""
+    _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
+    _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
 
 
-def _validate_positive_float_dict(d: dict, name: str, required: set[str]) -> None:
-    _validate_required_keys(d, name, required)
-    for k in sorted(required):
-        v = _require_float_scalar(d[k], f"{name}['{k}']")
-        if v <= 0.0:
-            raise ValueError(f"{name}['{k}']: expected > 0, got {v}")
+def _require_integer_tensor(x: tf.Tensor, name: str) -> None:
+    """Validate that an input is an integer tensor."""
+    _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
+    _require(
+        x.dtype.is_integer,
+        f"{name} must have integer dtype; got {x.dtype}.",
+    )
 
 
-def _panel_dims_from_y(y_mit: Any, name: str) -> tuple[np.ndarray, int, int, int]:
-    y = _as_np(y_mit, name)
-    _require_ndim(y, 3, name)
-    if y.dtype.kind not in ("i", "u"):
-        raise ValueError(f"{name}: expected integer dtype, got dtype={y.dtype}")
-    M, N, T = (int(x) for x in y.shape)
-    return y, M, N, T
+def _require_all_finite(x: tf.Tensor, name: str) -> None:
+    """Validate that all tensor entries are finite."""
+    ok = bool(tf.reduce_all(tf.math.is_finite(x)).numpy())
+    _require(ok, f"{name} must be finite (no NaN/inf).")
 
 
-def _validate_is_weekend_t(is_weekend_t: Any, T: int, name: str) -> np.ndarray:
-    w = _as_np(is_weekend_t, name)
-    _require_ndim(w, 1, name)
-    _require_shape(w, (T,), name)
-
-    if w.dtype.kind not in ("i", "u", "b"):
-        raise ValueError(f"{name}: expected integer/bool dtype, got dtype={w.dtype}")
-
-    w_int = w.astype(np.int64, copy=False)
-    if w_int.size:
-        if not np.all((w_int == 0) | (w_int == 1)):
-            mn = int(w_int.min())
-            mx = int(w_int.max())
-            raise ValueError(
-                f"{name}: expected values in {{0,1}}, got min={mn}, max={mx}"
-            )
-    return w_int
+def _require_all_nonnegative(x: tf.Tensor, name: str) -> None:
+    """Validate that all tensor entries are non-negative."""
+    ok = bool(tf.reduce_all(x >= tf.cast(0, x.dtype)).numpy())
+    _require(ok, f"{name} must be non-negative.")
 
 
-def _validate_y_range(y: np.ndarray, J: int, name: str) -> None:
-    y_int = y.astype(np.int64, copy=False)
-    if y_int.size:
-        mn = int(y_int.min())
-        mx = int(y_int.max())
-        if mn < 0 or mx > J:
-            raise ValueError(
-                f"{name}: expected values in [0,{J}] (0=outside, 1..J=inside encoded as j+1), "
-                f"got min={mn}, max={mx}"
-            )
+def _require_all_binary_int(x: tf.Tensor, name: str) -> None:
+    """Validate that an integer tensor contains only 0/1 values."""
+    zero = tf.cast(0, x.dtype)
+    one = tf.cast(1, x.dtype)
+    ok = bool(tf.reduce_all((x == zero) | (x == one)).numpy())
+    _require(ok, f"{name} must contain only 0/1 values.")
 
 
-def _validate_neighbors_m(neighbors_m: Any, M: int, N: int, name: str) -> None:
-    """Validate neighbors_m[m][i] -> 1D integer list with indices in [0,N-1], no self, no dups."""
-    if not isinstance(neighbors_m, (list, tuple)):
-        raise ValueError(f"{name}: expected list/tuple, got type={type(neighbors_m)}")
-    if len(neighbors_m) != M:
-        raise ValueError(
-            f"{name}: expected length M={M}, got length={len(neighbors_m)}"
-        )
-
-    for m in range(M):
-        nm = neighbors_m[m]
-        if not isinstance(nm, (list, tuple)):
-            raise ValueError(
-                f"{name}[{m}]: expected list/tuple (length N={N}), got type={type(nm)}"
-            )
-        if len(nm) != N:
-            raise ValueError(
-                f"{name}[{m}]: expected length N={N}, got length={len(nm)}"
-            )
-
-        for i in range(N):
-            ni = nm[i]
-            arr = _as_np(ni, f"{name}[{m}][{i}]")
-            if arr.dtype.kind not in ("i", "u"):
-                raise ValueError(
-                    f"{name}[{m}][{i}]: expected integer dtype, got dtype={arr.dtype}"
-                )
-            _require_ndim(arr, 1, f"{name}[{m}][{i}]")
-
-            if arr.size == 0:
-                continue
-
-            mn = int(arr.min())
-            mx = int(arr.max())
-            if mn < 0 or mx >= N:
-                raise ValueError(
-                    f"{name}[{m}][{i}]: expected indices in [0,{N-1}], got min={mn}, max={mx}"
-                )
-            if (arr == i).any():
-                raise ValueError(f"{name}[{m}][{i}]: self-edge detected (i={i})")
-            if np.unique(arr).size != arr.size:
-                raise ValueError(
-                    f"{name}[{m}][{i}]: duplicate neighbor indices detected"
-                )
+def _require_static_shape_known(x: tf.Tensor, name: str) -> None:
+    """Validate that all dimensions of a tensor are statically known."""
+    _require(
+        all(dim is not None for dim in x.shape),
+        f"{name} must have fully static shape; got {x.shape}.",
+    )
 
 
-def _validate_seasonal_features(
-    season_sin_kt: Any, season_cos_kt: Any, T: int
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Validate seasonal basis matrices with canonical shape (K,T)."""
-    sin = _as_np(season_sin_kt, "season_sin_kt", dtype=np.float64)
-    cos = _as_np(season_cos_kt, "season_cos_kt", dtype=np.float64)
-
-    _require_ndim(sin, 2, "season_sin_kt")
-    _require_ndim(cos, 2, "season_cos_kt")
-    _require_finite(sin, "season_sin_kt")
-    _require_finite(cos, "season_cos_kt")
-
-    if sin.shape != cos.shape:
-        raise ValueError(
-            "season_sin_kt/season_cos_kt: expected same shape, "
-            f"got {sin.shape} vs {cos.shape}"
-        )
-
-    if int(sin.shape[1]) != int(T):
-        raise ValueError(
-            f"season_sin_kt/season_cos_kt: expected shape (K,T) with T={T}, got shape={sin.shape}"
-        )
-
-    K = int(sin.shape[0])
-    if K < 0:
-        raise ValueError(f"season_sin_kt/season_cos_kt: expected K>=0, got K={K}")
-
-    return sin, cos, K
+def _require_positive_static_dim(dim: int | None, name: str) -> None:
+    """Validate that a static tensor dimension is known and strictly positive."""
+    _require(dim is not None, f"{name} must be statically known.")
+    _require(dim > 0, f"{name} must be > 0; got {dim}.")
 
 
-# =============================================================================
-# Public validators
-# =============================================================================
+def _require_seed_input(seed: tf.Tensor, name: str) -> None:
+    """Validate a stateless RNG seed tensor of shape (2,)."""
+    _require(tf.is_tensor(seed), f"{name} must be a tf.Tensor.")
+    _require(
+        seed.dtype.is_integer,
+        f"{name} must have integer dtype; got {seed.dtype}.",
+    )
+    _require(
+        seed.shape.rank == 1,
+        f"{name} must have rank 1; got rank {seed.shape.rank}.",
+    )
+    _require(
+        seed.shape[0] == 2,
+        f"{name} must have shape (2,); got {seed.shape}.",
+    )
+    ok = bool(tf.reduce_all(seed >= tf.cast(0, seed.dtype)).numpy())
+    _require(ok, f"{name} must be non-negative.")
 
 
-def validate_phase1_delta_hat(delta_hat: Any, num_products: Any) -> None:
-    """Validate Phase-1 delta_hat vector used to build delta_mj."""
-    J = _require_int_scalar(num_products, "num_products", min_value=1)
-    a = _as_np(delta_hat, "delta_hat", dtype=np.float64)
-    _require_ndim(a, 1, "delta_hat")
-    _require_shape(a, (J,), "delta_hat")
-    _require_finite(a, "delta_hat")
+def _require_choice_codes(y_mit: tf.Tensor, num_products: int, name: str) -> None:
+    """Validate that choices are coded as 0 for outside and 1..J for inside."""
+    y_min = int(tf.reduce_min(y_mit).numpy())
+    y_max = int(tf.reduce_max(y_mit).numpy())
+    _require(
+        y_min >= 0,
+        f"{name} must have min >= 0; got min={y_min}.",
+    )
+    _require(
+        y_max <= num_products,
+        f"{name} must have max <= J={num_products}; got max={y_max}.",
+    )
 
 
-def validate_bonus2_panel(panel: Any) -> None:
-    """Validate an estimator-ready Bonus2 panel dict (canonical schema)."""
-    p = _require_dict(panel, "panel")
-    required = {
-        "y_mit",
-        "delta_mj",
-        "is_weekend_t",
-        "season_sin_kt",
-        "season_cos_kt",
-        "neighbors_m",
-        "lookback",
-        "decay",
-    }
-    _validate_required_keys(p, "panel", required)
-
-    y, M, N, T = _panel_dims_from_y(p["y_mit"], "panel['y_mit']")
-
-    delta = _as_np(p["delta_mj"], "panel['delta_mj']", dtype=np.float64)
-    _require_ndim(delta, 2, "panel['delta_mj']")
-    _require_finite(delta, "panel['delta_mj']")
-    if int(delta.shape[0]) != M:
-        raise ValueError(
-            f"panel['delta_mj']: expected first axis M={M} to match panel['y_mit'], got shape={delta.shape}"
-        )
-    J = int(delta.shape[1])
-    if J < 1:
-        raise ValueError(f"panel['delta_mj']: expected J>=1, got J={J}")
-
-    _validate_y_range(y, J, "panel['y_mit']")
-    _validate_is_weekend_t(p["is_weekend_t"], T, "panel['is_weekend_t']")
-    _validate_seasonal_features(p["season_sin_kt"], p["season_cos_kt"], T)
-    _validate_neighbors_m(p["neighbors_m"], M=M, N=N, name="panel['neighbors_m']")
-
-    _require_int_scalar(p["lookback"], "panel['lookback']", min_value=1)
-    _require_float_in_open_interval(p["decay"], "panel['decay']", 0.0, 1.0)
-
-
-def validate_bonus2_estimator_init_inputs(
-    y_mit: Any,
-    delta_mj: Any,
-    is_weekend_t: Any,
-    season_sin_kt: Any,
-    season_cos_kt: Any,
-    neighbors_m: Any,
-    lookback: Any,
-    decay: Any,
-    init_theta: Any,
-    sigmas: Any,
-    step_size_z: Any,
-    seed: Any,
+def _require_neighbors_m(
+    neighbors_m,
+    num_markets: int,
+    num_consumers: int,
+    name: str,
 ) -> None:
-    """Validate inputs to Bonus2Estimator.__init__ (canonical schema)."""
-    _require_int_scalar(seed, "seed", min_value=0)
+    """Validate the within-market neighbor-list structure."""
+    _require_type(
+        neighbors_m,
+        (list, tuple),
+        f"{name} must be a list/tuple of length M={num_markets}; got {type(neighbors_m)}.",
+    )
+    _require(
+        len(neighbors_m) == num_markets,
+        f"{name} must have length M={num_markets}; got {len(neighbors_m)}.",
+    )
 
-    y, M, N, T = _panel_dims_from_y(y_mit, "y_mit")
+    for m, neighbors_i in enumerate(neighbors_m):
+        _require_type(
+            neighbors_i,
+            (list, tuple),
+            f"{name}[{m}] must be a list/tuple of length N={num_consumers}; got {type(neighbors_i)}.",
+        )
+        _require(
+            len(neighbors_i) == num_consumers,
+            f"{name}[{m}] must have length N={num_consumers}; got {len(neighbors_i)}.",
+        )
 
-    d = _as_np(delta_mj, "delta_mj", dtype=np.float64)
-    _require_ndim(d, 2, "delta_mj")
-    _require_finite(d, "delta_mj")
-    if int(d.shape[0]) != M:
-        raise ValueError(f"delta_mj: expected first axis M={M}, got shape={d.shape}")
-    J = int(d.shape[1])
-    if J < 1:
-        raise ValueError(f"delta_mj: expected J>=1, got J={J}")
+        for i, nbrs in enumerate(neighbors_i):
+            _require_type(
+                nbrs,
+                (list, tuple),
+                f"{name}[{m}][{i}] must be a list/tuple of neighbor indices; got {type(nbrs)}.",
+            )
 
-    _validate_y_range(y, J, "y_mit")
-    _validate_is_weekend_t(is_weekend_t, T, "is_weekend_t")
-    _validate_seasonal_features(season_sin_kt, season_cos_kt, T)
-    _validate_neighbors_m(neighbors_m, M=M, N=N, name="neighbors_m")
-
-    _require_int_scalar(lookback, "lookback", min_value=1)
-    _require_float_in_open_interval(decay, "decay", 0.0, 1.0)
-
-    init_theta_d = _require_dict(init_theta, "init_theta")
-    _validate_required_keys(init_theta_d, "init_theta", set(INIT_THETA_KEYS))
-    for k in INIT_THETA_KEYS:
-        _require_float_scalar(init_theta_d[k], f"init_theta['{k}']")
-
-    sigmas_d = _require_dict(sigmas, "sigmas")
-    _validate_positive_float_dict(sigmas_d, "sigmas", set(Z_KEYS))
-
-    step_d = _require_dict(step_size_z, "step_size_z")
-    _validate_positive_float_dict(step_d, "step_size_z", set(Z_KEYS))
+            seen: set[int] = set()
+            for k in nbrs:
+                _require_int(k, f"{name}[{m}][{i}] neighbor")
+                k_int = int(k)
+                _require(
+                    0 <= k_int < num_consumers,
+                    f"{name}[{m}][{i}] neighbor index must lie in [0,{num_consumers - 1}]; got {k_int}.",
+                )
+                _require(
+                    k_int != i,
+                    f"{name}[{m}][{i}] must not contain self-edge {i}.",
+                )
+                _require(
+                    k_int not in seen,
+                    f"{name}[{m}][{i}] contains duplicate neighbor index {k_int}.",
+                )
+                seen.add(k_int)
 
 
-def validate_bonus2_estimator_fit_inputs(n_iter: Any) -> None:
-    """Validate inputs to Bonus2Estimator.fit(n_iter)."""
-    _require_int_scalar(n_iter, "n_iter", min_value=1)
+def _as_numpy_array(x, name: str, dtype=None) -> np.ndarray:
+    """Convert a raw input to a NumPy array for DGP/panel validation."""
+    try:
+        return np.asarray(x, dtype=dtype)
+    except Exception as exc:
+        raise TypeError(f"{name} must be convertible to a NumPy array.") from exc
+
+
+def _require_numpy_rank(x: np.ndarray, rank: int, name: str) -> None:
+    """Validate NumPy array rank."""
+    _require(
+        x.ndim == rank,
+        f"{name} must have rank {rank}; got rank {x.ndim}.",
+    )
+
+
+def _require_numpy_finite(x: np.ndarray, name: str) -> None:
+    """Validate that a NumPy array contains only finite values."""
+    _require(np.all(np.isfinite(x)), f"{name} must be finite (no NaN/inf).")
+
+
+def _require_numpy_nonnegative(x: np.ndarray, name: str) -> None:
+    """Validate that a NumPy array is elementwise non-negative."""
+    _require(np.all(x >= 0), f"{name} must be non-negative.")
+
+
+def _require_numpy_integer_array(x: np.ndarray, name: str) -> None:
+    """Validate that a NumPy array has integer dtype."""
+    _require(
+        np.issubdtype(x.dtype, np.integer),
+        f"{name} must have integer dtype; got {x.dtype}.",
+    )
+
+
+def _require_numpy_binary_array(x: np.ndarray, name: str) -> None:
+    """Validate that a NumPy integer array contains only 0/1 values."""
+    _require_numpy_integer_array(x, name)
+    _require(
+        np.all((x == 0) | (x == 1)),
+        f"{name} must contain only 0/1 values.",
+    )
+
+
+def _require_choice_codes_np(y_mit: np.ndarray, num_products: int, name: str) -> None:
+    """Validate NumPy-coded choices with outside=0 and inside=1..J."""
+    y_min = int(np.min(y_mit))
+    y_max = int(np.max(y_mit))
+    _require(
+        y_min >= 0,
+        f"{name} must have min >= 0; got min={y_min}.",
+    )
+    _require(
+        y_max <= num_products,
+        f"{name} must have max <= J={num_products}; got max={y_max}.",
+    )
 
 
 def validate_bonus2_dgp_inputs(
-    delta_mj: Any,
-    N: Any,
-    T: Any,
-    avg_friends: Any,
-    params_true: Any,
-    decay: Any,
-    seed: Any,
-    season_period: Any,
-    friends_sd: Any,
-    K: Any,
-    lookback: Any,
+    delta_mj,
+    N: int,
+    T: int,
+    avg_friends: float,
+    params_true: dict,
+    decay: float,
+    seed: int,
+    season_period: int,
+    friends_sd: float,
+    K: int,
+    lookback: int,
 ) -> None:
-    """Validate inputs to the Bonus2 DGP simulation (canonical naming)."""
-    d = _as_np(delta_mj, "delta_mj", dtype=np.float64)
-    _require_ndim(d, 2, "delta_mj")
-    _require_finite(d, "delta_mj")
-    M, J = int(d.shape[0]), int(d.shape[1])
-    if M < 1 or J < 1:
-        raise ValueError(
-            f"delta_mj: expected shape (M,J) with M>=1,J>=1, got {d.shape}"
-        )
+    """Validate the raw inputs to simulate_bonus2_dgp(...)."""
+    delta = _as_numpy_array(delta_mj, "delta_mj", dtype=np.float64)
+    _require_numpy_rank(delta, 2, "delta_mj")
+    _require_numpy_finite(delta, "delta_mj")
 
-    _require_int_scalar(N, "N", min_value=1)
-    _require_int_scalar(T, "T", min_value=1)
-    _require_int_scalar(season_period, "season_period", min_value=1)
-    _require_int_scalar(K, "K", min_value=0)
-    _require_int_scalar(lookback, "lookback", min_value=1)
+    M, J = delta.shape
+    _require(M > 0, f"delta_mj.shape[0] must be > 0; got {M}.")
+    _require(J > 0, f"delta_mj.shape[1] must be > 0; got {J}.")
 
-    _require_float_scalar(avg_friends, "avg_friends")
-    _require_float_scalar(friends_sd, "friends_sd")
-    _require_float_in_open_interval(decay, "decay", 0.0, 1.0)
-    _require_int_scalar(seed, "seed", min_value=0)
+    _require_positive_int(N, "N")
+    _require_positive_int(T, "T")
+    _require_nonnegative_float(avg_friends, "avg_friends")
+    _require_open_unit_float(decay, "decay")
+    _require_nonnegative_int(seed, "seed")
+    _require_positive_int(season_period, "season_period")
+    _require_nonnegative_float(friends_sd, "friends_sd")
+    _require_positive_int(K, "K")
+    _require_positive_int(lookback, "lookback")
 
-    pt = _require_dict(params_true, "params_true")
-    required_keys = {
+    _require_type(
+        params_true, dict, f"params_true must be a dict; got {type(params_true)}."
+    )
+    required_keys = (
         "habit_mean",
         "habit_sd",
         "peer_mean",
@@ -388,19 +347,383 @@ def validate_bonus2_dgp_inputs(
         "mktprod_sd",
         "weekend_prod_sd",
         "season_mkt_sd",
-    }
-    _validate_required_keys(pt, "params_true", required_keys)
+    )
+    missing = [k for k in required_keys if k not in params_true]
+    _require(not missing, "params_true missing keys: " + ", ".join(missing))
 
-    _require_float_scalar(pt["habit_mean"], "params_true['habit_mean']")
-    _require_float_scalar(pt["peer_mean"], "params_true['peer_mean']")
+    _require_finite_float(params_true["habit_mean"], "params_true['habit_mean']")
+    _require_nonnegative_float(params_true["habit_sd"], "params_true['habit_sd']")
+    _require_finite_float(params_true["peer_mean"], "params_true['peer_mean']")
+    _require_nonnegative_float(params_true["peer_sd"], "params_true['peer_sd']")
+    _require_nonnegative_float(params_true["mktprod_sd"], "params_true['mktprod_sd']")
+    _require_nonnegative_float(
+        params_true["weekend_prod_sd"],
+        "params_true['weekend_prod_sd']",
+    )
+    _require_nonnegative_float(
+        params_true["season_mkt_sd"],
+        "params_true['season_mkt_sd']",
+    )
 
-    habit_sd = _require_float_scalar(pt["habit_sd"], "params_true['habit_sd']")
-    peer_sd = _require_float_scalar(pt["peer_sd"], "params_true['peer_sd']")
-    if habit_sd <= 0.0:
-        raise ValueError(f"params_true['habit_sd']: expected > 0, got {habit_sd}")
-    if peer_sd <= 0.0:
-        raise ValueError(f"params_true['peer_sd']: expected > 0, got {peer_sd}")
 
-    _require_float_scalar(pt["mktprod_sd"], "params_true['mktprod_sd']")
-    _require_float_scalar(pt["weekend_prod_sd"], "params_true['weekend_prod_sd']")
-    _require_float_scalar(pt["season_mkt_sd"], "params_true['season_mkt_sd']")
+def validate_bonus2_panel(panel: dict) -> None:
+    """Validate the raw panel dict produced by simulate_bonus2_dgp(...)."""
+    _require_type(panel, dict, f"panel must be a dict; got {type(panel)}.")
+
+    required_keys = (
+        "y_mit",
+        "delta_mj",
+        "is_weekend_t",
+        "neighbors_m",
+        "lookback",
+        "season_sin_kt",
+        "season_cos_kt",
+        "decay",
+    )
+    missing = [k for k in required_keys if k not in panel]
+    _require(not missing, "panel missing keys: " + ", ".join(missing))
+
+    y_mit = _as_numpy_array(panel["y_mit"], "panel['y_mit']")
+    delta_mj = _as_numpy_array(panel["delta_mj"], "panel['delta_mj']", dtype=np.float64)
+    is_weekend_t = _as_numpy_array(panel["is_weekend_t"], "panel['is_weekend_t']")
+    season_sin_kt = _as_numpy_array(
+        panel["season_sin_kt"],
+        "panel['season_sin_kt']",
+        dtype=np.float64,
+    )
+    season_cos_kt = _as_numpy_array(
+        panel["season_cos_kt"],
+        "panel['season_cos_kt']",
+        dtype=np.float64,
+    )
+
+    _require_numpy_rank(y_mit, 3, "panel['y_mit']")
+    _require_numpy_rank(delta_mj, 2, "panel['delta_mj']")
+    _require_numpy_rank(is_weekend_t, 1, "panel['is_weekend_t']")
+    _require_numpy_rank(season_sin_kt, 2, "panel['season_sin_kt']")
+    _require_numpy_rank(season_cos_kt, 2, "panel['season_cos_kt']")
+
+    _require_numpy_integer_array(y_mit, "panel['y_mit']")
+    _require_numpy_integer_array(is_weekend_t, "panel['is_weekend_t']")
+    _require_numpy_finite(delta_mj, "panel['delta_mj']")
+    _require_numpy_finite(season_sin_kt, "panel['season_sin_kt']")
+    _require_numpy_finite(season_cos_kt, "panel['season_cos_kt']")
+    _require_numpy_binary_array(is_weekend_t, "panel['is_weekend_t']")
+
+    M, N, T = y_mit.shape
+    M_delta, J = delta_mj.shape
+    T_weekend = is_weekend_t.shape[0]
+    K_sin, T_sin = season_sin_kt.shape
+    K_cos, T_cos = season_cos_kt.shape
+
+    _require(M > 0, f"panel['y_mit'].shape[0] must be > 0; got {M}.")
+    _require(N > 0, f"panel['y_mit'].shape[1] must be > 0; got {N}.")
+    _require(T > 0, f"panel['y_mit'].shape[2] must be > 0; got {T}.")
+    _require(
+        M_delta == M, f"panel['delta_mj'] must have M={M}; got shape {delta_mj.shape}."
+    )
+    _require(J > 0, f"panel['delta_mj'].shape[1] must be > 0; got {J}.")
+    _require(
+        T_weekend == T,
+        f"panel['is_weekend_t'] must have shape (T,) with T={T}; got {is_weekend_t.shape}.",
+    )
+    _require(
+        season_sin_kt.shape == season_cos_kt.shape,
+        "panel['season_sin_kt'] and panel['season_cos_kt'] must have the same shape; "
+        f"got {season_sin_kt.shape} and {season_cos_kt.shape}.",
+    )
+    _require(K_sin > 0, f"panel['season_sin_kt'].shape[0] must be > 0; got {K_sin}.")
+    _require(
+        T_sin == T,
+        f"panel['season_sin_kt'] must have shape (K, T) with T={T}; got {season_sin_kt.shape}.",
+    )
+    _require(
+        T_cos == T,
+        f"panel['season_cos_kt'] must have shape (K, T) with T={T}; got {season_cos_kt.shape}.",
+    )
+
+    _require_choice_codes_np(y_mit, num_products=J, name="panel['y_mit']")
+    _require_neighbors_m(
+        neighbors_m=panel["neighbors_m"],
+        num_markets=M,
+        num_consumers=N,
+        name="panel['neighbors_m']",
+    )
+    _require_positive_int(panel["lookback"], "panel['lookback']")
+    _require_open_unit_float(panel["decay"], "panel['decay']")
+
+
+def preprocessing_validate_input(
+    y_mit: tf.Tensor,
+    neighbors_m,
+    lookback: int,
+    decay: float,
+) -> None:
+    """Validate inputs used to build deterministic states before MCMC."""
+    _require_integer_tensor(y_mit, "y_mit")
+    _require_tensor_rank(y_mit, 3, "y_mit")
+    _require_static_shape_known(y_mit, "y_mit")
+
+    M = y_mit.shape[0]
+    N = y_mit.shape[1]
+    T = y_mit.shape[2]
+
+    _require_positive_static_dim(M, "y_mit.shape[0]")
+    _require_positive_static_dim(N, "y_mit.shape[1]")
+    _require_positive_static_dim(T, "y_mit.shape[2]")
+
+    _require_positive_int(lookback, "lookback")
+    _require_open_unit_float(decay, "decay")
+
+    _require_neighbors_m(
+        neighbors_m=neighbors_m,
+        num_markets=M,
+        num_consumers=N,
+        name="neighbors_m",
+    )
+
+    y_min = int(tf.reduce_min(y_mit).numpy())
+    _require(
+        y_min >= 0,
+        f"y_mit must have min >= 0; got min={y_min}.",
+    )
+
+
+def observed_data_validate_input(
+    y_mit: tf.Tensor,
+    delta_mj: tf.Tensor,
+    is_weekend_t: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
+    h_mntj: tf.Tensor,
+    p_mntj: tf.Tensor,
+) -> None:
+    """Validate the fixed observed tensors consumed by Bonus2PosteriorTF."""
+    _require_integer_tensor(y_mit, "y_mit")
+    _require_float64_tensor(delta_mj, "delta_mj")
+    _require_integer_tensor(is_weekend_t, "is_weekend_t")
+    _require_float64_tensor(season_sin_kt, "season_sin_kt")
+    _require_float64_tensor(season_cos_kt, "season_cos_kt")
+    _require_float64_tensor(h_mntj, "h_mntj")
+    _require_float64_tensor(p_mntj, "p_mntj")
+
+    _require_tensor_rank(y_mit, 3, "y_mit")
+    _require_tensor_rank(delta_mj, 2, "delta_mj")
+    _require_tensor_rank(is_weekend_t, 1, "is_weekend_t")
+    _require_tensor_rank(season_sin_kt, 2, "season_sin_kt")
+    _require_tensor_rank(season_cos_kt, 2, "season_cos_kt")
+    _require_tensor_rank(h_mntj, 4, "h_mntj")
+    _require_tensor_rank(p_mntj, 4, "p_mntj")
+
+    _require_static_shape_known(y_mit, "y_mit")
+    _require_static_shape_known(delta_mj, "delta_mj")
+    _require_static_shape_known(is_weekend_t, "is_weekend_t")
+    _require_static_shape_known(season_sin_kt, "season_sin_kt")
+    _require_static_shape_known(season_cos_kt, "season_cos_kt")
+    _require_static_shape_known(h_mntj, "h_mntj")
+    _require_static_shape_known(p_mntj, "p_mntj")
+
+    M = y_mit.shape[0]
+    N = y_mit.shape[1]
+    T = y_mit.shape[2]
+    M_delta = delta_mj.shape[0]
+    J = delta_mj.shape[1]
+    T_weekend = is_weekend_t.shape[0]
+    K_sin = season_sin_kt.shape[0]
+    T_sin = season_sin_kt.shape[1]
+    K_cos = season_cos_kt.shape[0]
+    T_cos = season_cos_kt.shape[1]
+
+    _require_positive_static_dim(M, "y_mit.shape[0]")
+    _require_positive_static_dim(N, "y_mit.shape[1]")
+    _require_positive_static_dim(T, "y_mit.shape[2]")
+    _require_positive_static_dim(M_delta, "delta_mj.shape[0]")
+    _require_positive_static_dim(J, "delta_mj.shape[1]")
+    _require_positive_static_dim(T_weekend, "is_weekend_t.shape[0]")
+    _require_positive_static_dim(K_sin, "season_sin_kt.shape[0]")
+    _require_positive_static_dim(T_sin, "season_sin_kt.shape[1]")
+    _require_positive_static_dim(K_cos, "season_cos_kt.shape[0]")
+    _require_positive_static_dim(T_cos, "season_cos_kt.shape[1]")
+
+    _require(
+        M_delta == M,
+        f"delta_mj must have shape (M, J) with M={M}; got {delta_mj.shape}.",
+    )
+    _require(
+        T_weekend == T,
+        f"is_weekend_t must have shape (T,) with T={T}; got {is_weekend_t.shape}.",
+    )
+    _require(
+        season_sin_kt.shape == season_cos_kt.shape,
+        "season_sin_kt and season_cos_kt must have the same shape; "
+        f"got {season_sin_kt.shape} and {season_cos_kt.shape}.",
+    )
+    _require(
+        T_sin == T,
+        f"season_sin_kt must have shape (K, T) with T={T}; got {season_sin_kt.shape}.",
+    )
+    _require(
+        T_cos == T,
+        f"season_cos_kt must have shape (K, T) with T={T}; got {season_cos_kt.shape}.",
+    )
+    _require(
+        h_mntj.shape == (M, N, T, J),
+        f"h_mntj must have shape (M, N, T, J)=({M}, {N}, {T}, {J}); got {h_mntj.shape}.",
+    )
+    _require(
+        p_mntj.shape == (M, N, T, J),
+        f"p_mntj must have shape (M, N, T, J)=({M}, {N}, {T}, {J}); got {p_mntj.shape}.",
+    )
+
+    _require_all_finite(delta_mj, "delta_mj")
+    _require_all_finite(season_sin_kt, "season_sin_kt")
+    _require_all_finite(season_cos_kt, "season_cos_kt")
+    _require_all_finite(h_mntj, "h_mntj")
+    _require_all_finite(p_mntj, "p_mntj")
+
+    _require_all_nonnegative(h_mntj, "h_mntj")
+    _require_all_nonnegative(p_mntj, "p_mntj")
+    _require_all_binary_int(is_weekend_t, "is_weekend_t")
+    _require_choice_codes(y_mit=y_mit, num_products=J, name="y_mit")
+
+
+def posterior_validate_input(posterior_config) -> None:
+    """Validate the posterior config required to construct Bonus2PosteriorTF."""
+    required = [
+        "sigma_z_beta_intercept_j",
+        "sigma_z_beta_habit_j",
+        "sigma_z_beta_peer_j",
+        "sigma_z_beta_weekend_jw",
+        "sigma_z_a_m",
+        "sigma_z_b_m",
+    ]
+    missing = [name for name in required if not hasattr(posterior_config, name)]
+    _require(not missing, "posterior_config missing fields: " + ", ".join(missing))
+
+    _require_positive_float(
+        posterior_config.sigma_z_beta_intercept_j,
+        "posterior_config.sigma_z_beta_intercept_j",
+    )
+    _require_positive_float(
+        posterior_config.sigma_z_beta_habit_j,
+        "posterior_config.sigma_z_beta_habit_j",
+    )
+    _require_positive_float(
+        posterior_config.sigma_z_beta_peer_j,
+        "posterior_config.sigma_z_beta_peer_j",
+    )
+    _require_positive_float(
+        posterior_config.sigma_z_beta_weekend_jw,
+        "posterior_config.sigma_z_beta_weekend_jw",
+    )
+    _require_positive_float(
+        posterior_config.sigma_z_a_m,
+        "posterior_config.sigma_z_a_m",
+    )
+    _require_positive_float(
+        posterior_config.sigma_z_b_m,
+        "posterior_config.sigma_z_b_m",
+    )
+
+
+def sampler_validate_input(sampler_config) -> None:
+    """Validate the sampler and tuning config for the Bonus2 chain."""
+    required = [
+        "num_results",
+        "num_burnin_steps",
+        "chunk_size",
+        "k_beta_intercept",
+        "k_beta_habit",
+        "k_beta_peer",
+        "k_beta_weekend",
+        "k_a",
+        "k_b",
+        "pilot_length",
+        "target_low",
+        "target_high",
+        "max_rounds",
+        "factor",
+    ]
+    missing = [name for name in required if not hasattr(sampler_config, name)]
+    _require(not missing, "sampler_config missing fields: " + ", ".join(missing))
+
+    _require_positive_int(sampler_config.num_results, "sampler_config.num_results")
+    _require_nonnegative_int(
+        sampler_config.num_burnin_steps,
+        "sampler_config.num_burnin_steps",
+    )
+    _require_positive_int(sampler_config.chunk_size, "sampler_config.chunk_size")
+
+    _require_positive_float(
+        sampler_config.k_beta_intercept,
+        "sampler_config.k_beta_intercept",
+    )
+    _require_positive_float(
+        sampler_config.k_beta_habit,
+        "sampler_config.k_beta_habit",
+    )
+    _require_positive_float(
+        sampler_config.k_beta_peer,
+        "sampler_config.k_beta_peer",
+    )
+    _require_positive_float(
+        sampler_config.k_beta_weekend,
+        "sampler_config.k_beta_weekend",
+    )
+    _require_positive_float(sampler_config.k_a, "sampler_config.k_a")
+    _require_positive_float(sampler_config.k_b, "sampler_config.k_b")
+
+    _require_positive_int(
+        sampler_config.pilot_length,
+        "sampler_config.pilot_length",
+    )
+    _require_open_unit_float(
+        sampler_config.target_low,
+        "sampler_config.target_low",
+    )
+    _require_open_unit_float(
+        sampler_config.target_high,
+        "sampler_config.target_high",
+    )
+    _require(
+        sampler_config.target_low < sampler_config.target_high,
+        "sampler_config.target_low must be < sampler_config.target_high; "
+        f"got {sampler_config.target_low} >= {sampler_config.target_high}.",
+    )
+    _require_positive_int(
+        sampler_config.max_rounds,
+        "sampler_config.max_rounds",
+    )
+    _require_gt_one_float(sampler_config.factor, "sampler_config.factor")
+
+
+def seed_validate_input(seed: tf.Tensor) -> None:
+    """Validate the external chain seed tensor."""
+    _require_seed_input(seed, "seed")
+
+
+def run_chain_validate_input(
+    y_mit: tf.Tensor,
+    delta_mj: tf.Tensor,
+    is_weekend_t: tf.Tensor,
+    season_sin_kt: tf.Tensor,
+    season_cos_kt: tf.Tensor,
+    h_mntj: tf.Tensor,
+    p_mntj: tf.Tensor,
+    posterior_config,
+    sampler_config,
+    seed: tf.Tensor,
+) -> None:
+    """Validate all external inputs required by the Bonus2 MCMC chain."""
+    observed_data_validate_input(
+        y_mit=y_mit,
+        delta_mj=delta_mj,
+        is_weekend_t=is_weekend_t,
+        season_sin_kt=season_sin_kt,
+        season_cos_kt=season_cos_kt,
+        h_mntj=h_mntj,
+        p_mntj=p_mntj,
+    )
+    posterior_validate_input(posterior_config)
+    sampler_validate_input(sampler_config)
+    seed_validate_input(seed)

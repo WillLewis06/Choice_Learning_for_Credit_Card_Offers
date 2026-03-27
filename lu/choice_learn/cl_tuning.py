@@ -1,31 +1,30 @@
-"""
-Proposal-scale tuning for the choice-learn + Lu shrinkage sampler.
-
-Tuning runs short pilot chains and multiplicatively adjusts proposal scales until
-the average acceptance rate lies in [target_low, target_high], or max_rounds is
-reached.
-
-Conventions:
-  - step_fn(theta, k) -> (theta_new, acc_inc)
-  - acc_inc is a tf.float64 scalar in [0, 1]
-"""
+"""Proposal-scale tuning for the choice-learn shrinkage sampler."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable
 
 import tensorflow as tf
 
 from lu.choice_learn.cl_updates import (
-    update_alpha,
-    update_E_bar,
-    update_njt,
+    E_bar_one_step,
+    alpha_one_step,
+    njt_one_step,
 )
 
 
-def tune_k(
+def _cl_k0(d: tf.Tensor) -> tf.Tensor:
+    """Return the default random-walk scale for a block of dimension d."""
+
+    return tf.constant(2.38, tf.float64) / tf.sqrt(
+        tf.maximum(d, tf.constant(1.0, tf.float64))
+    )
+
+
+def _tune_block(
     theta0: tf.Tensor,
-    step_fn: Callable[[tf.Tensor, tf.Tensor], tuple[tf.Tensor, tf.Tensor]],
+    step_fn: Callable[[tf.Tensor, tf.Tensor, tf.Tensor], tuple[tf.Tensor, tf.Tensor]],
     k0: tf.Tensor,
     pilot_length: int,
     target_low: float,
@@ -33,27 +32,68 @@ def tune_k(
     max_rounds: int,
     factor: float,
     name: str,
-) -> tf.Tensor:
-    """Tune a scalar proposal scale k for a single parameter block."""
+    seed: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Tune one proposal scale with repeated pilot runs for a single block.
+
+    Shrink, grow, or keep the proposal scale according to whether the pilot
+    acceptance rate falls below, above, or inside the target band.
+    """
+
     theta = theta0
     k = k0
-    factor_t = tf.constant(float(factor), tf.float64)
 
-    for round_id in range(int(max_rounds)):
-        theta_cur = theta
-        acc_sum = tf.constant(0.0, tf.float64)
+    pilot_length_t = tf.constant(pilot_length, dtype=tf.int32)
+    factor_t = tf.constant(factor, dtype=tf.float64)
+    target_low_t = tf.constant(target_low, dtype=tf.float64)
+    target_high_t = tf.constant(target_high, dtype=tf.float64)
 
-        for _ in range(int(pilot_length)):
-            theta_cur, acc_inc = step_fn(theta_cur, k)
-            acc_sum = acc_sum + acc_inc
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def _pilot(
+        theta_in: tf.Tensor,
+        k_in: tf.Tensor,
+        seed_in: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Run a fixed-length pilot chain for one block."""
 
-        acc_rate = float(acc_sum.numpy()) / float(pilot_length)
+        i0 = tf.constant(0, dtype=tf.int32)
+        acc0 = tf.constant(0.0, dtype=tf.float64)
+
+        def cond(i, theta_cur, acc_sum, seed_cur):
+            """Continue until the pilot run reaches its target length."""
+
+            return i < pilot_length_t
+
+        def body(i, theta_cur, acc_sum, seed_cur):
+            """Apply one block update and accumulate acceptance."""
+
+            seeds = tf.random.experimental.stateless_split(seed_cur, num=2)
+            next_seed = seeds[0]
+            step_seed = seeds[1]
+
+            theta_new, acc_inc = step_fn(theta_cur, k_in, step_seed)
+            acc_sum = acc_sum + tf.cast(acc_inc, tf.float64)
+            return i + 1, theta_new, acc_sum, next_seed
+
+        _, theta_out, acc_sum, seed_out = tf.while_loop(
+            cond=cond,
+            body=body,
+            loop_vars=(i0, theta_in, acc0, seed_in),
+            parallel_iterations=1,
+        )
+        return theta_out, acc_sum, seed_out
+
+    for round_id in range(max_rounds):
+        theta_end, acc_sum, seed = _pilot(theta, k, seed)
+        acc_rate = acc_sum / tf.cast(pilot_length_t, tf.float64)
+
         k_before = float(k.numpy())
+        acc_rate_py = float(acc_rate.numpy())
 
-        if acc_rate < target_low:
+        if acc_rate < target_low_t:
             action = "shrink"
             k = k / factor_t
-        elif acc_rate > target_high:
+        elif acc_rate > target_high_t:
             action = "grow"
             k = k * factor_t
         else:
@@ -63,151 +103,166 @@ def tune_k(
 
         print(
             f"[ChoiceLearnShrinkage:Tune:{name}] "
-            f"round={round_id} | k={k_before:.6g}->{k_after:.6g} | acc={acc_rate:.3f} | action={action}"
+            f"round={round_id} | "
+            f"k={k_before:.4f}->{k_after:.4f} | "
+            f"acc={acc_rate_py:.3f} | "
+            f"action={action}"
         )
 
-        theta = theta_cur
+        theta = theta_end
 
         if action == "ok":
             break
 
-    return k
+    return k, theta
 
 
-def tune_shrinkage(shrink):
-    """Tune (k_alpha, k_E_bar, k_njt) using pilot runs without mutating chain RNG.
+def tune_shrinkage(
+    posterior,
+    qjt: tf.Tensor,
+    q0t: tf.Tensor,
+    delta_cl: tf.Tensor,
+    initial_state,
+    shrinkage_config,
+    pilot_length: int,
+    target_low: float,
+    target_high: float,
+    max_rounds: int,
+    factor: float,
+    seed: tf.Tensor,
+):
+    """Tune proposal scales for all continuous choice-learn shrinkage blocks.
 
-    Required fields on `shrink`:
-      - pilot_length, ridge, target_low, target_high, max_rounds, factor_rw, factor_tmh
-      - k_alpha0, k_E_bar0, k_njt0
-      - tune_seed
-      - T
-      - qjt, q0t, delta_cl
-      - alpha, E_bar, njt, gamma, phi  (tf.Variable)
-      - posterior
+    Tune alpha, E_bar, and njt sequentially using short pilot runs, then return
+    the shrinkage config with updated proposal scales.
     """
-    pilot_length = int(shrink.pilot_length)
-    ridge = shrink.ridge
-    target_low = float(shrink.target_low)
-    target_high = float(shrink.target_high)
-    max_rounds = int(shrink.max_rounds)
-    factor_rw = float(shrink.factor_rw)
-    factor_tmh = float(shrink.factor_tmh)
 
-    k_alpha0 = shrink.k_alpha0
-    k_E_bar0 = shrink.k_E_bar0
-    k_njt0 = shrink.k_njt0
-    tune_seed = int(shrink.tune_seed)
+    local_state = initial_state
+    block_seeds = tf.random.experimental.stateless_split(seed, num=3)
 
-    qjt = shrink.qjt
-    q0t = shrink.q0t
-    delta_cl = shrink.delta_cl
-    posterior = shrink.posterior
-
-    # Snapshot the current sampler state; tuning holds non-target blocks fixed.
-    alpha0 = shrink.alpha.read_value()
-    E_bar0 = shrink.E_bar.read_value()
-    njt0 = shrink.njt.read_value()
-    gamma0 = shrink.gamma.read_value()
-    phi0 = shrink.phi.read_value()
-
-    one = tf.constant(1.0, tf.float64)
-    zero = tf.constant(0.0, tf.float64)
-    T_float = tf.constant(float(shrink.T), tf.float64)
-
-    # Dedicated RNGs for tuning (do not use the sampler RNG).
-    rng_alpha = tf.random.Generator.from_seed(tune_seed + 1)
-    rng_E_bar = tf.random.Generator.from_seed(tune_seed + 2)
-    rng_njt = tf.random.Generator.from_seed(tune_seed + 3)
+    k_alpha0 = (
+        tf.constant(shrinkage_config.k_alpha, dtype=tf.float64)
+        if float(shrinkage_config.k_alpha) > 0.0
+        else _cl_k0(tf.constant(1.0, dtype=tf.float64))
+    )
+    k_E_bar0 = (
+        tf.constant(shrinkage_config.k_E_bar, dtype=tf.float64)
+        if float(shrinkage_config.k_E_bar) > 0.0
+        else _cl_k0(tf.constant(1.0, dtype=tf.float64))
+    )
+    k_njt0 = (
+        tf.constant(shrinkage_config.k_njt, dtype=tf.float64)
+        if float(shrinkage_config.k_njt) > 0.0
+        else _cl_k0(tf.cast(tf.shape(delta_cl)[1], tf.float64))
+    )
 
     def step_alpha(
-        theta_alpha: tf.Tensor, k_alpha: tf.Tensor
+        theta_alpha: tf.Tensor,
+        k_alpha: tf.Tensor,
+        step_seed: tf.Tensor,
     ) -> tuple[tf.Tensor, tf.Tensor]:
-        alpha_new, accepted = update_alpha(
+        """Apply one alpha update during tuning."""
+
+        alpha_new, accepted = alpha_one_step(
             posterior=posterior,
-            rng=rng_alpha,
             qjt=qjt,
             q0t=q0t,
             delta_cl=delta_cl,
             alpha=theta_alpha,
-            E_bar=E_bar0,
-            njt=njt0,
+            E_bar=local_state.E_bar,
+            njt=local_state.njt,
             k_alpha=k_alpha,
+            seed=step_seed,
         )
-        acc_inc = tf.where(accepted, one, zero)
-        return alpha_new, acc_inc
+        return alpha_new, accepted
 
-    k_alpha = tune_k(
-        theta0=alpha0,
+    k_alpha_tuned, alpha_end = _tune_block(
+        theta0=local_state.alpha,
         step_fn=step_alpha,
         k0=k_alpha0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_rw,
+        factor=factor,
         name="alpha",
+        seed=block_seeds[0],
     )
 
+    local_state = local_state._replace(alpha=alpha_end)
+
     def step_E_bar(
-        theta_E_bar: tf.Tensor, k_E_bar: tf.Tensor
+        theta_E_bar: tf.Tensor,
+        k_E_bar: tf.Tensor,
+        step_seed: tf.Tensor,
     ) -> tuple[tf.Tensor, tf.Tensor]:
-        E_bar_new, accepted_vec = update_E_bar(
+        """Apply one full E_bar sweep during tuning."""
+
+        E_bar_new, accepted = E_bar_one_step(
             posterior=posterior,
-            rng=rng_E_bar,
             qjt=qjt,
             q0t=q0t,
             delta_cl=delta_cl,
-            alpha=alpha0,
+            alpha=local_state.alpha,
             E_bar=theta_E_bar,
-            njt=njt0,
-            gamma=gamma0,
-            phi=phi0,
+            njt=local_state.njt,
             k_E_bar=k_E_bar,
+            seed=step_seed,
         )
-        acc_inc = tf.reduce_mean(tf.where(accepted_vec, one, zero))
-        return E_bar_new, acc_inc
+        return E_bar_new, accepted
 
-    k_E_bar = tune_k(
-        theta0=E_bar0,
+    k_E_bar_tuned, E_bar_end = _tune_block(
+        theta0=local_state.E_bar,
         step_fn=step_E_bar,
         k0=k_E_bar0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_rw,
+        factor=factor,
         name="E_bar",
+        seed=block_seeds[1],
     )
 
-    def step_njt(theta_njt: tf.Tensor, k_njt: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        njt_new, acc_sum = update_njt(
+    local_state = local_state._replace(E_bar=E_bar_end)
+
+    def step_njt(
+        theta_njt: tf.Tensor,
+        k_njt: tf.Tensor,
+        step_seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        """Apply one full njt sweep during tuning."""
+
+        njt_new, accepted = njt_one_step(
             posterior=posterior,
-            rng=rng_njt,
             qjt=qjt,
             q0t=q0t,
             delta_cl=delta_cl,
-            alpha=alpha0,
-            E_bar=E_bar0,
+            alpha=local_state.alpha,
+            E_bar=local_state.E_bar,
             njt=theta_njt,
-            gamma=gamma0,
-            phi=phi0,
+            gamma=local_state.gamma,
             k_njt=k_njt,
-            ridge=ridge,
+            seed=step_seed,
         )
-        acc_inc = acc_sum / T_float
-        return njt_new, acc_inc
+        return njt_new, accepted
 
-    k_njt = tune_k(
-        theta0=njt0,
+    k_njt_tuned, _ = _tune_block(
+        theta0=local_state.njt,
         step_fn=step_njt,
         k0=k_njt0,
         pilot_length=pilot_length,
         target_low=target_low,
         target_high=target_high,
         max_rounds=max_rounds,
-        factor=factor_tmh,
+        factor=factor,
         name="njt",
+        seed=block_seeds[2],
     )
 
-    return k_alpha, k_E_bar, k_njt
+    return replace(
+        shrinkage_config,
+        k_alpha=float(k_alpha_tuned.numpy()),
+        k_E_bar=float(k_E_bar_tuned.numpy()),
+        k_njt=float(k_njt_tuned.numpy()),
+    )

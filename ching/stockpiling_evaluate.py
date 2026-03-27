@@ -1,11 +1,3 @@
-"""
-ching/stockpiling_evaluate.py
-
-NumPy evaluation utilities for the Phase-3 stockpiling model.
-
-This module assumes inputs have already been validated/normalized upstream.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -13,6 +5,13 @@ from typing import Any
 import numpy as np
 
 PARAM_KEYS = ("beta", "alpha", "v", "fc", "u_scale")
+MCMC_ACCEPT_KEYS = (
+    "beta_accept",
+    "alpha_accept",
+    "v_accept",
+    "fc_accept",
+    "u_scale_accept",
+)
 
 
 def predictive_metrics_from_probs(
@@ -20,16 +19,7 @@ def predictive_metrics_from_probs(
     p_buy_mnjt: np.ndarray,
     eps: float,
 ) -> dict[str, float]:
-    """Compute predictive metrics from predicted buy probabilities.
-
-    Args:
-      a_mnjt: (M,N,J,T) actions in {0,1}
-      p_buy_mnjt: (M,N,J,T) predicted probabilities in [0,1]
-      eps: numerical clipping constant for log-loss
-
-    Returns:
-      dict with keys: nll_per_obs, brier, rmse_prob, buy_rate_emp, buy_rate_pred
-    """
+    """Compute predictive metrics from predicted buy probabilities."""
     a = np.asarray(a_mnjt, dtype=np.float64)
     p = np.asarray(p_buy_mnjt, dtype=np.float64)
 
@@ -52,15 +42,7 @@ def baseline_metrics_from_actions(
     a_mnjt: np.ndarray,
     eps: float,
 ) -> dict[str, float]:
-    """Baseline model: constant probability p0 equal to empirical buy rate.
-
-    Args:
-      a_mnjt: (M,N,J,T) actions in {0,1}
-      eps: numerical clipping constant for log-loss
-
-    Returns:
-      dict with keys: p0, nll_per_obs, brier, rmse_prob, buy_rate_emp, buy_rate_pred
-    """
+    """Compute baseline metrics using the empirical mean buy rate."""
     a = np.asarray(a_mnjt, dtype=np.float64)
     buy_rate_emp = float(np.mean(a))
 
@@ -84,27 +66,13 @@ def by_price_state_summary(
     p_buy_mnjt: np.ndarray,
     s_mjt: np.ndarray,
 ) -> dict[str, Any]:
-    """By-price-state buy rates.
-
-    Aggregation:
-      - Sum over consumers first -> (M,J,T) totals
-      - Bin by observed price state s in s_mjt
-      - Report state-level empirical and predicted buy rates, and RMSE across states
-
-    Returns:
-      {
-        "emp": {state: rate, ...},
-        "pred": {state: rate, ...},
-        "rmse": float
-      }
-    """
+    """Summarize empirical and predicted buy rates by observed price state."""
     a = np.asarray(a_mnjt, dtype=np.float64)
     p = np.asarray(p_buy_mnjt, dtype=np.float64)
     st = np.asarray(s_mjt, dtype=np.int64)
 
-    M, N, J, T = a.shape
+    _, N, _, _ = a.shape
 
-    # Aggregate over consumers: (M,J,T)
     a_sum_mjt = a.sum(axis=1)
     p_sum_mjt = p.sum(axis=1)
 
@@ -116,9 +84,7 @@ def by_price_state_summary(
         return {"emp": {}, "pred": {}, "rmse": float("nan")}
 
     S_obs = int(st_flat.max()) + 1
-    counts = np.bincount(st_flat, minlength=S_obs).astype(
-        np.float64
-    )  # #(m,j,t) in state
+    counts = np.bincount(st_flat, minlength=S_obs).astype(np.float64)
     den = counts * float(N)
 
     emp_num = np.bincount(st_flat, weights=a_sum_flat, minlength=S_obs).astype(
@@ -155,25 +121,57 @@ def parameter_metrics(
     """Compare true vs fitted constrained parameters for standard Phase-3 keys."""
     out: dict[str, dict[str, float]] = {}
 
-    for k in PARAM_KEYS:
-        if k not in theta_true or k not in theta_hat:
+    for key in PARAM_KEYS:
+        if key not in theta_true or key not in theta_hat:
             raise ValueError(
-                f"parameter_metrics: missing key '{k}' in theta_true/theta_hat"
+                f"parameter_metrics: missing key '{key}' in theta_true/theta_hat"
             )
-        true = np.asarray(theta_true[k], dtype=np.float64)
-        hat = np.asarray(theta_hat[k], dtype=np.float64)
 
-        d = (hat - true).astype(np.float64, copy=False)
-        rmse = float(np.sqrt(np.mean(d * d)))
+        true = np.asarray(theta_true[key], dtype=np.float64)
+        hat = np.asarray(theta_hat[key], dtype=np.float64)
 
-        mt = float(np.mean(true))
-        mh = float(np.mean(hat))
-        out[k] = {
+        diff = hat - true
+        rmse = float(np.sqrt(np.mean(diff * diff)))
+        mean_true = float(np.mean(true))
+        mean_hat = float(np.mean(hat))
+
+        out[key] = {
             "rmse": rmse,
-            "mean_true": mt,
-            "mean_hat": mh,
-            "bias": mh - mt,
+            "mean_true": mean_true,
+            "mean_hat": mean_hat,
+            "bias": mean_hat - mean_true,
         }
+
+    return out
+
+
+def _normalize_mcmc_summary(mcmc: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the refactored MCMC summary schema."""
+    if "n_saved" not in mcmc:
+        raise ValueError("evaluate_stockpiling: mcmc must contain key 'n_saved'.")
+
+    out: dict[str, Any] = {"n_saved": int(mcmc["n_saved"])}
+    if out["n_saved"] <= 0:
+        raise ValueError(
+            f"evaluate_stockpiling: mcmc['n_saved'] must be > 0; got {out['n_saved']}."
+        )
+
+    accept_rates: dict[str, float] = {}
+    for key in MCMC_ACCEPT_KEYS:
+        if key not in mcmc:
+            raise ValueError(
+                "evaluate_stockpiling: mcmc must contain acceptance key " f"'{key}'."
+            )
+        accept_rates[key] = float(mcmc[key])
+
+    out["accept_rates"] = accept_rates
+
+    optional_scalar_keys = ("num_chunks", "joint_logpost_last")
+    for key in optional_scalar_keys:
+        if key in mcmc:
+            out[key] = (
+                float(mcmc[key]) if key == "joint_logpost_last" else int(mcmc[key])
+            )
 
     return out
 
@@ -188,27 +186,7 @@ def evaluate_stockpiling(
     mcmc: dict[str, Any] | None,
     eps: float,
 ) -> dict[str, Any]:
-    """Evaluate predictive fit and optional parameter recovery / MCMC diagnostics.
-
-    Args:
-      a_mnjt: (M,N,J,T) observed purchases
-      p_buy_hat_mnjt: (M,N,J,T) fitted predictive probabilities
-      s_mjt: (M,J,T) price states, or None to skip by-state summary
-      theta_hat: fitted parameters dict, or None
-      theta_true: true parameters dict, or None
-      p_buy_oracle_mnjt: oracle predictive probabilities, or None
-      mcmc: optional MCMC diagnostics dict with required keys {"accept","n_saved"}
-      eps: numerical clipping constant for log-loss
-
-    Returns:
-      dict with keys:
-        - shape
-        - models
-        - deltas
-        - by_price_state (optional)
-        - param (optional)
-        - mcmc (optional)
-    """
+    """Evaluate predictive fit and optional parameter recovery / MCMC diagnostics."""
     a = np.asarray(a_mnjt, dtype=np.float64)
     p_hat = np.asarray(p_buy_hat_mnjt, dtype=np.float64)
 
@@ -221,25 +199,25 @@ def evaluate_stockpiling(
     }
 
     if p_buy_oracle_mnjt is not None:
-        p_or = np.asarray(p_buy_oracle_mnjt, dtype=np.float64)
-        models["oracle"] = predictive_metrics_from_probs(a, p_or, eps)
+        p_oracle = np.asarray(p_buy_oracle_mnjt, dtype=np.float64)
+        models["oracle"] = predictive_metrics_from_probs(a, p_oracle, eps)
 
-    base = models["baseline"]
-    fit = models["fitted"]
+    baseline = models["baseline"]
+    fitted = models["fitted"]
 
     deltas: dict[str, dict[str, float]] = {
         "fitted_vs_baseline": {
-            "delta_nll": float(base["nll_per_obs"] - fit["nll_per_obs"]),
-            "delta_rmse": float(base["rmse_prob"] - fit["rmse_prob"]),
-            "delta_brier": float(base["brier"] - fit["brier"]),
+            "delta_nll": float(baseline["nll_per_obs"] - fitted["nll_per_obs"]),
+            "delta_rmse": float(baseline["rmse_prob"] - fitted["rmse_prob"]),
+            "delta_brier": float(baseline["brier"] - fitted["brier"]),
         }
     }
     if "oracle" in models:
-        ora = models["oracle"]
+        oracle = models["oracle"]
         deltas["fitted_vs_oracle"] = {
-            "delta_nll": float(fit["nll_per_obs"] - ora["nll_per_obs"]),
-            "delta_rmse": float(fit["rmse_prob"] - ora["rmse_prob"]),
-            "delta_brier": float(fit["brier"] - ora["brier"]),
+            "delta_nll": float(fitted["nll_per_obs"] - oracle["nll_per_obs"]),
+            "delta_rmse": float(fitted["rmse_prob"] - oracle["rmse_prob"]),
+            "delta_brier": float(fitted["brier"] - oracle["brier"]),
         }
 
     out: dict[str, Any] = {
@@ -259,25 +237,19 @@ def evaluate_stockpiling(
         out["param"] = parameter_metrics(theta_true, theta_hat)
 
     if mcmc is not None:
-        if "accept" not in mcmc or "n_saved" not in mcmc:
-            raise ValueError(
-                "evaluate_stockpiling: mcmc must contain keys {'accept','n_saved'}"
-            )
-        accept_rates = mcmc["accept"]
-        n_saved = mcmc["n_saved"]
-        out["mcmc"] = {"n_saved": n_saved, "accept_rates": accept_rates}
+        out["mcmc"] = _normalize_mcmc_summary(mcmc)
 
     return out
 
 
 def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
     """Format evaluation output into a compact text report."""
-    shp = eval_out["shape"]
+    shape = eval_out["shape"]
     models = eval_out["models"]
     deltas = eval_out["deltas"]
-    by_state = eval_out.get("by_price_state", None)
-    params = eval_out.get("param", None)
-    mcmc = eval_out.get("mcmc", None)
+    by_state = eval_out.get("by_price_state")
+    params = eval_out.get("param")
+    mcmc = eval_out.get("mcmc")
 
     def f6(x: float) -> str:
         return f"{x:>10.6f}"
@@ -286,9 +258,8 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
         return f"{x:>8.4f}"
 
     lines: list[str] = []
-
     lines.append(
-        f"data: M={shp['M']} N={shp['N']} J={shp['J']} T={shp['T']} | n_obs={shp['n_obs']}"
+        f"data: M={shape['M']} N={shape['N']} J={shape['J']} T={shape['T']} | n_obs={shape['n_obs']}"
     )
     lines.append("")
 
@@ -302,13 +273,13 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
     lines.append(header)
     lines.append("-" * len(header))
 
-    def row(tag: str, d: dict[str, Any]) -> str:
+    def row(tag: str, metrics: dict[str, Any]) -> str:
         return (
             f"{tag:<10}"
-            f"{f6(float(d['nll_per_obs']))} "
-            f"{f6(float(d['rmse_prob']))} "
-            f"{f4(float(d['buy_rate_emp']))} "
-            f"{f4(float(d['buy_rate_pred']))}"
+            f"{f6(float(metrics['nll_per_obs']))} "
+            f"{f6(float(metrics['rmse_prob']))} "
+            f"{f4(float(metrics['buy_rate_emp']))} "
+            f"{f4(float(metrics['buy_rate_pred']))}"
         )
 
     lines.append(row("baseline", models["baseline"]))
@@ -319,13 +290,13 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
     dvb = deltas["fitted_vs_baseline"]
     lines.append("")
     lines.append(
-        f"gain vs baseline: Δnll={dvb['delta_nll']:.6f} | Δrmse={dvb['delta_rmse']:.6f}"
+        f"gain vs baseline: Δnll={dvb['delta_nll']:.6f} | Δrmse={dvb['delta_rmse']:.6f} | Δbrier={dvb['delta_brier']:.6f}"
     )
 
     if "fitted_vs_oracle" in deltas:
         dvo = deltas["fitted_vs_oracle"]
         lines.append(
-            f"fitted - oracle: Δnll={dvo['delta_nll']:.6f} | Δrmse={dvo['delta_rmse']:.6f}"
+            f"fitted - oracle: Δnll={dvo['delta_nll']:.6f} | Δrmse={dvo['delta_rmse']:.6f} | Δbrier={dvo['delta_brier']:.6f}"
         )
 
     if by_state is not None:
@@ -335,17 +306,21 @@ def format_evaluation_summary(eval_out: dict[str, Any]) -> str:
     if params is not None:
         lines.append("")
         lines.append("parameter recovery:")
-        for k in PARAM_KEYS:
-            d = params[k]
+        for key in PARAM_KEYS:
+            d = params[key]
             lines.append(
-                f"  {k:<8} rmse={d['rmse']:.6f} | mean_true={d['mean_true']:.6f} | mean_hat={d['mean_hat']:.6f}"
+                f"  {key:<8} rmse={d['rmse']:.6f} | mean_true={d['mean_true']:.6f} | mean_hat={d['mean_hat']:.6f} | bias={d['bias']:.6f}"
             )
 
     if mcmc is not None:
         lines.append("")
-        lines.append(f"mcmc: n_saved={mcmc['n_saved']}")
-        acc = mcmc["accept_rates"]
-        for k in sorted(acc.keys()):
-            lines.append(f"  accept[{k}]={float(acc[k]):.4f}")
+        line = f"mcmc: n_saved={mcmc['n_saved']}"
+        if "num_chunks" in mcmc:
+            line += f" | num_chunks={mcmc['num_chunks']}"
+        if "joint_logpost_last" in mcmc:
+            line += f" | joint_logpost_last={float(mcmc['joint_logpost_last']):.6f}"
+        lines.append(line)
+        for key in MCMC_ACCEPT_KEYS:
+            lines.append(f"  {key}={float(mcmc['accept_rates'][key]):.4f}")
 
     return "\n".join(lines)
