@@ -1,26 +1,12 @@
 """Structural model utilities for the Ching-style stockpiling sampler.
 
-This module keeps the model layer separate from the posterior and sampler layers.
-It provides:
-  - parameter transforms from unconstrained z-space to constrained theta,
-  - inventory-grid precomputations,
-  - flow-utility construction,
-  - Bellman fixed-point solution for the binary buy decision,
-  - optional forward simulation given solved CCPs.
-
-Shapes:
-  m = market, n = consumer, j = product, s = price state, i = inventory state
-
-  u_mj:          (M, J)
-  price_vals_mj: (M, J, S)
-  P_price_mj:    (M, J, S, S)
-  lambda_mn:     (M, N)
-
-  beta:    ()
-  alpha:   (J,)
-  v:       (J,)
-  fc:      (J,)
-  u_scale: (M,)
+This module provides the model-side building blocks used by the posterior and
+sampler layers:
+- unconstrained-to-constrained parameter transforms,
+- inventory-grid precomputations,
+- flow-utility construction,
+- Bellman fixed-point solution,
+- forward simulation from solved CCPs.
 """
 
 from __future__ import annotations
@@ -39,17 +25,19 @@ __all__ = [
     "unconstrained_to_theta",
 ]
 
-ONE_F64 = tf.constant(1.0, dtype=tf.float64)
-
 # (I_vals, stockout_mask, at_cap_mask, idx_down, idx_up)
 InventoryMaps = tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
-    """Map unconstrained sampler state into constrained structural parameters."""
+    """Map unconstrained sampler state to constrained structural parameters.
+
+    Any leading sample dimensions are preserved, so this transform can be used
+    on a single chain state or on a retained stack of draws.
+    """
     return {
-        "beta": tf.reshape(tf.sigmoid(z["z_beta"]), ()),
+        "beta": tf.sigmoid(z["z_beta"]),
         "alpha": tf.exp(z["z_alpha"]),
         "v": tf.exp(z["z_v"]),
         "fc": tf.exp(z["z_fc"]),
@@ -57,37 +45,17 @@ def unconstrained_to_theta(z: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
     }
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
-def _normalize_theta(theta: dict[str, tf.Tensor]) -> dict[str, tf.Tensor]:
-    """Normalize theta to the shapes expected by the model core."""
-    return {
-        "beta": tf.reshape(theta["beta"], ()),
-        "alpha": theta["alpha"],
-        "v": theta["v"],
-        "fc": theta["fc"],
-        "u_scale": theta["u_scale"],
-    }
-
-
 def build_inventory_maps(I_max: int) -> InventoryMaps:
-    """Precompute inventory-grid masks and clipped transition indices."""
-    I_vals = tf.range(I_max + 1, dtype=tf.int32)
-    stockout_mask = tf.cast(tf.equal(I_vals, 0), tf.float64)
-    at_cap_mask = tf.cast(tf.equal(I_vals, I_max), tf.float64)
-    idx_down = tf.maximum(I_vals - 1, 0)
-    idx_up = tf.minimum(I_vals + 1, I_max)
-    return I_vals, stockout_mask, at_cap_mask, idx_down, idx_up
+    """Build inventory-grid masks and clipped transition indices."""
+    i_vals = tf.range(I_max + 1, dtype=tf.int32)
+    stockout_mask = tf.cast(tf.equal(i_vals, 0), tf.float64)
+    at_cap_mask = tf.cast(tf.equal(i_vals, I_max), tf.float64)
+    idx_down = tf.maximum(i_vals - 1, 0)
+    idx_up = tf.minimum(i_vals + 1, I_max)
+    return i_vals, stockout_mask, at_cap_mask, idx_down, idx_up
 
 
-def _unpack_maps(
-    maps: InventoryMaps,
-) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Unpack the precomputed inventory maps."""
-    I_vals, stockout_mask, at_cap_mask, idx_down, idx_up = maps
-    return I_vals, stockout_mask, at_cap_mask, idx_down, idx_up
-
-
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def make_flow_utilities(
     u_mj: tf.Tensor,
     price_vals_mj: tf.Tensor,
@@ -96,22 +64,21 @@ def make_flow_utilities(
     waste_cost: tf.Tensor,
     maps: InventoryMaps,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    """Construct no-buy and buy flow utilities on the full state grid."""
-    _, stockout_mask, at_cap_mask, _, _ = _unpack_maps(maps)
+    """Construct no-buy and buy flow utilities on the full state grid.
+
+    Returns:
+      u0: (M, N, J, S, I) no-buy flow utility.
+      u1: (M, N, J, S, I) buy flow utility.
+    """
+    _, stockout_mask, at_cap_mask, _, _ = maps
 
     alpha_j = theta["alpha"]
     v_j = theta["v"]
     fc_j = theta["fc"]
     u_scale_m = theta["u_scale"]
 
-    M = tf.shape(u_mj)[0]
-    N = tf.shape(lambda_mn)[1]
-    J = tf.shape(u_mj)[1]
-    S = tf.shape(price_vals_mj)[2]
-    I = tf.shape(stockout_mask)[0]
-
-    stockout_1111I = stockout_mask[None, None, None, None, :]
-    at_cap_1111I = at_cap_mask[None, None, None, None, :]
+    stockout_1111i = stockout_mask[None, None, None, None, :]
+    at_cap_1111i = at_cap_mask[None, None, None, None, :]
 
     u_eff_m1j11 = (u_scale_m[:, None] * u_mj)[:, None, :, None, None]
     alpha_11j11 = alpha_j[None, None, :, None, None]
@@ -119,61 +86,61 @@ def make_flow_utilities(
     price_m1js1 = price_vals_mj[:, None, :, :, None]
 
     base_buy_m1js1 = u_eff_m1j11 - alpha_11j11 * price_m1js1 - fc_11j11
-    waste_term_mn111I = (
-        waste_cost * (ONE_F64 - lambda_mn)[:, :, None, None, None] * at_cap_1111I
+    waste_term_mn111i = (
+        waste_cost * (1.0 - lambda_mn)[:, :, None, None, None] * at_cap_1111i
     )
-    u1 = base_buy_m1js1 - waste_term_mn111I
+    u1 = base_buy_m1js1 - waste_term_mn111i
 
-    u0_11j1I = -v_j[None, None, :, None, None] * stockout_1111I
-    u0 = tf.broadcast_to(u0_11j1I, tf.stack([M, N, J, S, I]))
+    u0_11j1i = -v_j[None, None, :, None, None] * stockout_1111i
+    u0 = tf.broadcast_to(u0_11j1i, tf.shape(u1))
     return u0, u1
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def expected_over_next_price(V: tf.Tensor, P_price_mj: tf.Tensor) -> tf.Tensor:
     """Average continuation values over next-period price states."""
     return tf.einsum("mjsr,mnjri->mnjsi", P_price_mj, V)
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def expected_over_next_inv_no_buy(
     cont_s: tf.Tensor,
     p_c0_mn111: tf.Tensor,
     p_c1_mn111: tf.Tensor,
     idx_down: tf.Tensor,
 ) -> tf.Tensor:
-    """Average continuation values over next inventory when a=0."""
+    """Average continuation values over next inventory conditional on no-buy."""
     cont_c0 = cont_s
     cont_c1 = tf.gather(cont_s, idx_down, axis=4)
     return p_c0_mn111 * cont_c0 + p_c1_mn111 * cont_c1
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def expected_over_next_inv_buy(
     cont_s: tf.Tensor,
     p_c0_mn111: tf.Tensor,
     p_c1_mn111: tf.Tensor,
     idx_up: tf.Tensor,
 ) -> tf.Tensor:
-    """Average continuation values over next inventory when a=1."""
+    """Average continuation values over next inventory conditional on buy."""
     cont_c0 = tf.gather(cont_s, idx_up, axis=4)
     cont_c1 = cont_s
     return p_c0_mn111 * cont_c0 + p_c1_mn111 * cont_c1
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def logsumexp_q(q0: tf.Tensor, q1: tf.Tensor) -> tf.Tensor:
     """Compute log(exp(q0) + exp(q1)) elementwise."""
     return q0 + tf.nn.softplus(q1 - q0)
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def ccp_from_q(q0: tf.Tensor, q1: tf.Tensor) -> tf.Tensor:
     """Return the buy probability under the binary logit decision rule."""
     return tf.sigmoid(q1 - q0)
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def bellman_update(
     V: tf.Tensor,
     u0: tf.Tensor,
@@ -185,19 +152,18 @@ def bellman_update(
     idx_down: tf.Tensor,
     idx_up: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Apply one Bellman operator update and return V_new, q0, q1."""
+    """Apply one Bellman operator step and return V_new, q0, and q1."""
     cont_s = expected_over_next_price(V, P_price_mj)
     cont0 = expected_over_next_inv_no_buy(cont_s, p_c0_mn111, p_c1_mn111, idx_down)
     cont1 = expected_over_next_inv_buy(cont_s, p_c0_mn111, p_c1_mn111, idx_up)
 
-    beta_11111 = tf.reshape(beta, (1, 1, 1, 1, 1))
-    q0 = u0 + beta_11111 * cont0
-    q1 = u1 + beta_11111 * cont1
+    q0 = u0 + tf.reshape(beta, (1, 1, 1, 1, 1)) * cont0
+    q1 = u1 + tf.reshape(beta, (1, 1, 1, 1, 1)) * cont1
     V_new = logsumexp_q(q0, q1)
     return V_new, q0, q1
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def solve_value_function(
     u0: tf.Tensor,
     u1: tf.Tensor,
@@ -210,13 +176,12 @@ def solve_value_function(
     tol: float,
     max_iter: int,
 ) -> tf.Tensor:
-    """Solve the Bellman fixed point by iteration."""
+    """Solve the Bellman fixed point by value-function iteration."""
     V0 = tf.zeros_like(u0)
     max_diff0 = tf.constant(float("inf"), dtype=tf.float64)
-    tol_t = tf.constant(tol, dtype=tf.float64)
 
     def cond_fn(_: tf.Tensor, max_diff: tf.Tensor) -> tf.Tensor:
-        return max_diff > tol_t
+        return max_diff > tol
 
     def body_fn(V_prev: tf.Tensor, _: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
         V_new, _, _ = bellman_update(
@@ -242,7 +207,7 @@ def solve_value_function(
     return V_final
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def solve_ccp_buy(
     u_mj: tf.Tensor,
     price_vals_mj: tf.Tensor,
@@ -255,16 +220,16 @@ def solve_ccp_buy(
     max_iter: int,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Solve the buy CCPs and associated choice-specific values."""
-    theta_use = _normalize_theta(theta)
-    _, _, _, idx_down, idx_up = _unpack_maps(maps)
+    _, _, _, idx_down, idx_up = maps
 
     p_c1_mn111 = lambda_mn[:, :, None, None, None]
-    p_c0_mn111 = (ONE_F64 - lambda_mn)[:, :, None, None, None]
+    p_c0_mn111 = (1.0 - lambda_mn)[:, :, None, None, None]
+    beta = tf.reshape(theta["beta"], ())
 
     u0, u1 = make_flow_utilities(
         u_mj=u_mj,
         price_vals_mj=price_vals_mj,
-        theta=theta_use,
+        theta=theta,
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
         maps=maps,
@@ -273,7 +238,7 @@ def solve_ccp_buy(
     V_final = solve_value_function(
         u0=u0,
         u1=u1,
-        beta=theta_use["beta"],
+        beta=beta,
         P_price_mj=P_price_mj,
         p_c0_mn111=p_c0_mn111,
         p_c1_mn111=p_c1_mn111,
@@ -287,7 +252,7 @@ def solve_ccp_buy(
         V=V_final,
         u0=u0,
         u1=u1,
-        beta=theta_use["beta"],
+        beta=beta,
         P_price_mj=P_price_mj,
         p_c0_mn111=p_c0_mn111,
         p_c1_mn111=p_c1_mn111,
@@ -298,7 +263,7 @@ def solve_ccp_buy(
     return ccp_buy, q0, q1
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def simulate_purchases_given_ccp(
     ccp_buy: tf.Tensor,
     s_mjt: tf.Tensor,
@@ -314,8 +279,8 @@ def simulate_purchases_given_ccp(
       s_mjt: (M, J, T) observed price-state sequence.
       lambda_mn: (M, N) consumption probabilities.
       pi_I0: (I,) initial inventory distribution.
-      I_max: maximum inventory level.
-      seed: (2,) int32 stateless seed.
+      I_max: Maximum inventory level.
+      seed: (2,) stateless RNG seed.
 
     Returns:
       a_mnjt: (M, N, J, T) purchases.
@@ -327,9 +292,9 @@ def simulate_purchases_given_ccp(
     J = tf.shape(ccp_buy)[2]
     T = tf.shape(s_mjt)[2]
 
-    seed = tf.convert_to_tensor(seed, dtype=tf.int32)
     init_seed, loop_seed = tf.unstack(
-        tf.random.experimental.stateless_split(seed, num=2), axis=0
+        tf.random.experimental.stateless_split(seed, num=2),
+        axis=0,
     )
 
     cdf = tf.cumsum(pi_I0)
@@ -362,7 +327,12 @@ def simulate_purchases_given_ccp(
         c_acc: tf.TensorArray,
         seed_curr: tf.Tensor,
     ) -> tuple[
-        tf.Tensor, tf.Tensor, tf.TensorArray, tf.TensorArray, tf.TensorArray, tf.Tensor
+        tf.Tensor,
+        tf.Tensor,
+        tf.TensorArray,
+        tf.TensorArray,
+        tf.TensorArray,
+        tf.Tensor,
     ]:
         seeds = tf.random.experimental.stateless_split(seed_curr, num=3)
         next_seed = seeds[0]

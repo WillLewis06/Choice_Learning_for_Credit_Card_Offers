@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import tensorflow as tf
+
+from lu.choice_learn.cl_posterior import ChoiceLearnPosteriorConfig
+
+if TYPE_CHECKING:
+    from lu.choice_learn.cl_shrinkage import ChoiceLearnShrinkageConfig
 
 
 def _require(condition: bool, message: str) -> None:
@@ -67,13 +73,6 @@ def _require_open_unit_float(x, name: str) -> None:
     _require(0.0 < float(x) < 1.0, f"{name} must satisfy 0 < {name} < 1; got {x}.")
 
 
-def _require_gt_one_float(x, name: str) -> None:
-    """Require a finite real scalar strictly greater than one."""
-
-    _require_finite_float(x, name)
-    _require(float(x) > 1.0, f"{name} must be > 1; got {x}.")
-
-
 def _require_tensor_input(x, name: str) -> None:
     """Require a TensorFlow tensor input."""
 
@@ -88,7 +87,8 @@ def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
 
     _require_tensor_input(x, name)
     _require(
-        x.dtype == tf.float64, f"{name} must have dtype tf.float64; got {x.dtype}."
+        x.dtype == tf.float64,
+        f"{name} must have dtype tf.float64; got {x.dtype}.",
     )
 
 
@@ -98,16 +98,6 @@ def _require_rank(x: tf.Tensor, rank: int, name: str) -> None:
     _require(
         x.shape.rank == rank,
         f"{name} must have rank {rank}; got rank {x.shape.rank}.",
-    )
-
-
-def _require_static_shape(x: tf.Tensor, shape: tuple[int, ...], name: str) -> None:
-    """Require an exact static tensor shape."""
-
-    actual = x.shape.as_list()
-    _require(
-        actual == list(shape),
-        f"{name} must have shape {shape}; got {tuple(actual) if actual is not None else x.shape}.",
     )
 
 
@@ -126,7 +116,7 @@ def _require_all_nonnegative(x: tf.Tensor, name: str) -> None:
 
 
 def _require_seed_input(seed: tf.Tensor, name: str) -> None:
-    """Require a stateless RNG seed tensor of shape (2,)."""
+    """Require a stateless TensorFlow RNG seed of shape ``(2,)``."""
 
     _require_tensor_input(seed, name)
     _require(
@@ -136,10 +126,7 @@ def _require_seed_input(seed: tf.Tensor, name: str) -> None:
     _require_rank(seed, 1, name)
 
     shape = seed.shape.as_list()
-    _require(
-        shape[0] == 2,
-        f"{name} must have shape (2,); got {tuple(shape)}.",
-    )
+    _require(shape == [2], f"{name} must have shape (2,); got {tuple(shape)}.")
 
     ok = bool(tf.reduce_all(seed >= tf.zeros([2], dtype=seed.dtype)).numpy())
     _require(ok, f"{name} must contain only nonnegative values.")
@@ -150,7 +137,7 @@ def observed_data_validate_input(
     qjt: tf.Tensor,
     q0t: tf.Tensor,
 ) -> None:
-    """Validate the observed choice-learn shrinkage inputs."""
+    """Validate the observed tensors used by the shrinkage sampler."""
 
     _require_float64_tensor(delta_cl, "delta_cl")
     _require_float64_tensor(qjt, "qjt")
@@ -164,6 +151,8 @@ def observed_data_validate_input(
     qjt_shape = qjt.shape.as_list()
     q0t_shape = q0t.shape.as_list()
 
+    # Static shapes are required because the sampler logic assumes fixed market
+    # and product dimensions throughout the compiled chain.
     _require(
         all(dim is not None for dim in delta_shape),
         f"delta_cl must have static shape (T, J); got {delta_cl.shape}.",
@@ -200,28 +189,10 @@ def observed_data_validate_input(
     _require_all_nonnegative(q0t, "q0t")
 
 
-def posterior_validate_input(posterior_config) -> None:
-    """Validate the posterior config required to construct ChoiceLearnPosteriorTF."""
-
-    required = [
-        "eps",
-        "alpha_mean",
-        "alpha_var",
-        "E_bar_mean",
-        "E_bar_var",
-        "T0_sq",
-        "T1_sq",
-        "a_phi",
-        "b_phi",
-    ]
-    missing = [name for name in required if not hasattr(posterior_config, name)]
-    _require(not missing, "posterior_config missing fields: " + ", ".join(missing))
-
-    _require_finite_float(posterior_config.eps, "posterior_config.eps")
-    _require(
-        0.0 < float(posterior_config.eps) < 0.5,
-        f"posterior_config.eps must satisfy 0 < eps < 0.5; got {posterior_config.eps}.",
-    )
+def posterior_validate_input(
+    posterior_config: ChoiceLearnPosteriorConfig,
+) -> None:
+    """Validate a ``ChoiceLearnPosteriorConfig`` instance."""
 
     _require_finite_float(posterior_config.alpha_mean, "posterior_config.alpha_mean")
     _require_finite_float(posterior_config.E_bar_mean, "posterior_config.E_bar_mean")
@@ -231,6 +202,8 @@ def posterior_validate_input(posterior_config) -> None:
 
     _require_positive_float(posterior_config.T0_sq, "posterior_config.T0_sq")
     _require_positive_float(posterior_config.T1_sq, "posterior_config.T1_sq")
+
+    # The slab variance must exceed the spike variance.
     _require(
         float(posterior_config.T1_sq) > float(posterior_config.T0_sq),
         "posterior_config.T1_sq must be > posterior_config.T0_sq; "
@@ -241,24 +214,10 @@ def posterior_validate_input(posterior_config) -> None:
     _require_positive_float(posterior_config.b_phi, "posterior_config.b_phi")
 
 
-def shrinkage_validate_input(shrinkage_config) -> None:
-    """Validate the sampler and tuning config for the choice-learn chain."""
-
-    required = [
-        "num_results",
-        "num_burnin_steps",
-        "chunk_size",
-        "k_alpha",
-        "k_E_bar",
-        "k_njt",
-        "pilot_length",
-        "target_low",
-        "target_high",
-        "max_rounds",
-        "factor",
-    ]
-    missing = [name for name in required if not hasattr(shrinkage_config, name)]
-    _require(not missing, "shrinkage_config missing fields: " + ", ".join(missing))
+def shrinkage_validate_input(
+    shrinkage_config: ChoiceLearnShrinkageConfig,
+) -> None:
+    """Validate the sampler and tuning configuration for the shrinkage chain."""
 
     _require_positive_int(shrinkage_config.num_results, "shrinkage_config.num_results")
     _require_nonnegative_int(
@@ -272,11 +231,19 @@ def shrinkage_validate_input(shrinkage_config) -> None:
     _require_positive_float(shrinkage_config.k_njt, "shrinkage_config.k_njt")
 
     _require_positive_int(
-        shrinkage_config.pilot_length, "shrinkage_config.pilot_length"
+        shrinkage_config.pilot_length,
+        "shrinkage_config.pilot_length",
     )
-    _require_positive_int(shrinkage_config.max_rounds, "shrinkage_config.max_rounds")
+    _require_positive_int(
+        shrinkage_config.max_rounds,
+        "shrinkage_config.max_rounds",
+    )
 
-    _require_open_unit_float(shrinkage_config.target_low, "shrinkage_config.target_low")
+    # These are acceptance-rate targets for proposal tuning.
+    _require_open_unit_float(
+        shrinkage_config.target_low,
+        "shrinkage_config.target_low",
+    )
     _require_open_unit_float(
         shrinkage_config.target_high,
         "shrinkage_config.target_high",
@@ -287,24 +254,22 @@ def shrinkage_validate_input(shrinkage_config) -> None:
         f"got {shrinkage_config.target_low} >= {shrinkage_config.target_high}.",
     )
 
-    _require_gt_one_float(shrinkage_config.factor, "shrinkage_config.factor")
-
-
-def seed_validate_input(seed: tf.Tensor) -> None:
-    """Validate the external chain seed tensor."""
-
-    _require_seed_input(seed, "seed")
+    _require_finite_float(shrinkage_config.factor, "shrinkage_config.factor")
+    _require(
+        float(shrinkage_config.factor) > 1.0,
+        f"shrinkage_config.factor must be > 1; got {shrinkage_config.factor}.",
+    )
 
 
 def run_chain_validate_input(
     delta_cl: tf.Tensor,
     qjt: tf.Tensor,
     q0t: tf.Tensor,
-    posterior_config,
-    shrinkage_config,
+    posterior_config: ChoiceLearnPosteriorConfig,
+    shrinkage_config: ChoiceLearnShrinkageConfig,
     seed: tf.Tensor,
 ) -> None:
-    """Validate the full external input set required by run_chain."""
+    """Validate the full external input set required by ``run_chain``."""
 
     observed_data_validate_input(
         delta_cl=delta_cl,
@@ -313,4 +278,7 @@ def run_chain_validate_input(
     )
     posterior_validate_input(posterior_config)
     shrinkage_validate_input(shrinkage_config)
-    seed_validate_input(seed)
+
+    # The chain uses stateless TensorFlow RNG throughout, so the external seed
+    # must match TensorFlow's expected two-integer format.
+    _require_seed_input(seed, "seed")

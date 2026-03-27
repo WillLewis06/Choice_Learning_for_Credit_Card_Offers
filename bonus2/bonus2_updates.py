@@ -1,21 +1,12 @@
-"""
-bonus2_updates.py
+"""One-step MCMC updates for the Bonus Q2 sampler.
 
-One-step MCMC updates for the Bonus Q2 sampler.
-
-Design
-- Each parameter block is updated with a TFP random-walk Metropolis step.
-- Proposal mechanics are delegated to tfp.mcmc.RandomWalkMetropolis.
-- Each one-step function evaluates an explicit compiled block log-posterior on the
-  Bonus2PosteriorTF object.
-- Randomness is driven by stateless seeds so the updates are compatible with
-  jit_compile=True.
-
-This module performs no input validation.
-All tensors are assumed to have already been validated and normalized upstream.
+This module provides one random-walk Metropolis step per parameter block using
+TensorFlow Probability. Input validation is handled elsewhere.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -24,14 +15,37 @@ from bonus2.bonus2_posterior import Bonus2PosteriorTF
 
 
 def _make_rw_kernel(
-    target_log_prob_fn,
+    target_log_prob_fn: Callable[[tf.Tensor], tf.Tensor],
     scale: tf.Tensor,
 ) -> tfp.mcmc.RandomWalkMetropolis:
-    """Construct a Gaussian random-walk Metropolis kernel."""
+    """Build a Gaussian random-walk Metropolis kernel."""
     return tfp.mcmc.RandomWalkMetropolis(
         target_log_prob_fn=target_log_prob_fn,
         new_state_fn=tfp.mcmc.random_walk_normal_fn(scale=scale),
     )
+
+
+def _rw_metropolis_one_step(
+    target_log_prob_fn: Callable[[tf.Tensor], tf.Tensor],
+    current_state: tf.Tensor,
+    scale: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Run one random-walk Metropolis step and return the new state."""
+    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=scale)
+    kernel_results = kernel.bootstrap_results(current_state)
+    seed = tf.random.uniform(
+        shape=(2,),
+        minval=0,
+        maxval=2**31 - 1,
+        dtype=tf.int32,
+    )
+    new_state, kernel_results = kernel.one_step(
+        current_state=current_state,
+        previous_kernel_results=kernel_results,
+        seed=seed,
+    )
+    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
+    return new_state, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -44,7 +58,6 @@ def beta_intercept_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_beta_intercept: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_beta_intercept_j."""
 
@@ -58,18 +71,11 @@ def beta_intercept_one_step(
             z_b_m=z_b_m,
         )
 
-    kernel = _make_rw_kernel(
-        target_log_prob_fn=target_log_prob_fn, scale=k_beta_intercept
-    )
-    kernel_results = kernel.bootstrap_results(z_beta_intercept_j)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_beta_intercept_j,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_beta_intercept,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -82,7 +88,6 @@ def beta_habit_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_beta_habit: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_beta_habit_j."""
 
@@ -96,16 +101,11 @@ def beta_habit_one_step(
             z_b_m=z_b_m,
         )
 
-    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta_habit)
-    kernel_results = kernel.bootstrap_results(z_beta_habit_j)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_beta_habit_j,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_beta_habit,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -118,7 +118,6 @@ def beta_peer_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_beta_peer: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_beta_peer_j."""
 
@@ -132,16 +131,11 @@ def beta_peer_one_step(
             z_b_m=z_b_m,
         )
 
-    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_beta_peer)
-    kernel_results = kernel.bootstrap_results(z_beta_peer_j)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_beta_peer_j,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_beta_peer,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -154,7 +148,6 @@ def beta_weekend_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_beta_weekend: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_beta_weekend_jw."""
 
@@ -168,18 +161,11 @@ def beta_weekend_one_step(
             z_b_m=z_b_m,
         )
 
-    kernel = _make_rw_kernel(
-        target_log_prob_fn=target_log_prob_fn, scale=k_beta_weekend
-    )
-    kernel_results = kernel.bootstrap_results(z_beta_weekend_jw)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_beta_weekend_jw,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_beta_weekend,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -192,7 +178,6 @@ def a_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_a: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_a_m."""
 
@@ -206,16 +191,11 @@ def a_one_step(
             z_b_m=z_b_m,
         )
 
-    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_a)
-    kernel_results = kernel.bootstrap_results(z_a_m)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_a_m,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_a,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted
 
 
 @tf.function(jit_compile=True, reduce_retracing=True)
@@ -228,7 +208,6 @@ def b_one_step(
     z_a_m: tf.Tensor,
     z_b_m: tf.Tensor,
     k_b: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Perform one Metropolis update for z_b_m."""
 
@@ -242,13 +221,8 @@ def b_one_step(
             z_b_m=z_block,
         )
 
-    kernel = _make_rw_kernel(target_log_prob_fn=target_log_prob_fn, scale=k_b)
-    kernel_results = kernel.bootstrap_results(z_b_m)
-    z_new, kernel_results = kernel.one_step(
+    return _rw_metropolis_one_step(
+        target_log_prob_fn=target_log_prob_fn,
         current_state=z_b_m,
-        previous_kernel_results=kernel_results,
-        seed=seed,
+        scale=k_b,
     )
-
-    accepted = tf.cast(kernel_results.is_accepted, tf.float64)
-    return z_new, accepted

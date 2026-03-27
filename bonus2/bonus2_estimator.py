@@ -1,20 +1,4 @@
-"""
-bonus2_estimator.py
-
-TFP-based MCMC runner for the Bonus Q2 estimator.
-
-Design
-- Deterministic states are built once from observed choices before posterior creation.
-- Posterior evaluation is delegated to Bonus2PosteriorTF.
-- One full MCMC transition is a custom TFP TransitionKernel that performs one
-  RW-MH update for each Bonus2 parameter block.
-- Sampling is run in compiled chunks through tfp.mcmc.sample_chain.
-- Diagnostics are reported at the chunk level.
-- Posterior summaries are based on posterior means, not the last draw.
-
-This module performs no input validation beyond calling the dedicated validation
-module entrypoints.
-"""
+"""Run MCMC estimation for the Bonus Q2 model."""
 
 from __future__ import annotations
 
@@ -33,7 +17,7 @@ from bonus2 import bonus2_updates as updates
 
 @dataclass(frozen=True)
 class Bonus2SamplerConfig:
-    """Sampler and tuning configuration for the Bonus2 chain."""
+    """Store MCMC run lengths and proposal scales."""
 
     num_results: int
     num_burnin_steps: int
@@ -46,16 +30,10 @@ class Bonus2SamplerConfig:
     k_a: float
     k_b: float
 
-    pilot_length: int
-    target_low: float
-    target_high: float
-    max_rounds: int
-    factor: float
-
 
 @dataclass(frozen=True)
 class Bonus2InitConfig:
-    """Scalar initialization values used to build the initial unconstrained state."""
+    """Store scalar initialization values for the chain state."""
 
     init_beta_intercept: float
     init_beta_habit: float
@@ -67,7 +45,7 @@ class Bonus2InitConfig:
 
 
 class Bonus2State(NamedTuple):
-    """Chain state for the Bonus2 sampler."""
+    """Store the full Bonus Q2 chain state."""
 
     z_beta_intercept_j: tf.Tensor
     z_beta_habit_j: tf.Tensor
@@ -78,7 +56,7 @@ class Bonus2State(NamedTuple):
 
 
 class Bonus2HybridKernelResults(NamedTuple):
-    """Diagnostics emitted by one full Bonus2 hybrid transition."""
+    """Store per-block acceptance indicators for one full transition."""
 
     beta_intercept_accept: tf.Tensor
     beta_habit_accept: tf.Tensor
@@ -89,7 +67,7 @@ class Bonus2HybridKernelResults(NamedTuple):
 
 
 class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
-    """One full Bonus2 MCMC transition made of six RW-MH block updates."""
+    """Run one full Bonus Q2 transition with six RW-MH block updates."""
 
     def __init__(
         self,
@@ -121,6 +99,8 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
         self,
         init_state: Bonus2State,
     ) -> Bonus2HybridKernelResults:
+        """Build initial kernel diagnostics."""
+        del init_state
         zero = tf.constant(0.0, dtype=tf.float64)
         return Bonus2HybridKernelResults(
             beta_intercept_accept=zero,
@@ -135,11 +115,11 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
         self,
         current_state: Bonus2State,
         previous_kernel_results: Bonus2HybridKernelResults,
-        seed: tf.Tensor,
+        seed: tf.Tensor | None = None,
     ) -> tuple[Bonus2State, Bonus2HybridKernelResults]:
+        """Run one full sequential block update."""
         del previous_kernel_results
-
-        seeds = tf.random.experimental.stateless_split(seed, num=6)
+        del seed
 
         z_beta_intercept_j, beta_intercept_accept = updates.beta_intercept_one_step(
             posterior=self.posterior,
@@ -150,7 +130,6 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=current_state.z_a_m,
             z_b_m=current_state.z_b_m,
             k_beta_intercept=self.k_beta_intercept,
-            seed=seeds[0],
         )
 
         z_beta_habit_j, beta_habit_accept = updates.beta_habit_one_step(
@@ -162,7 +141,6 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=current_state.z_a_m,
             z_b_m=current_state.z_b_m,
             k_beta_habit=self.k_beta_habit,
-            seed=seeds[1],
         )
 
         z_beta_peer_j, beta_peer_accept = updates.beta_peer_one_step(
@@ -174,7 +152,6 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=current_state.z_a_m,
             z_b_m=current_state.z_b_m,
             k_beta_peer=self.k_beta_peer,
-            seed=seeds[2],
         )
 
         z_beta_weekend_jw, beta_weekend_accept = updates.beta_weekend_one_step(
@@ -186,7 +163,6 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=current_state.z_a_m,
             z_b_m=current_state.z_b_m,
             k_beta_weekend=self.k_beta_weekend,
-            seed=seeds[3],
         )
 
         z_a_m, a_accept = updates.a_one_step(
@@ -198,7 +174,6 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=current_state.z_a_m,
             z_b_m=current_state.z_b_m,
             k_a=self.k_a,
-            seed=seeds[4],
         )
 
         z_b_m, b_accept = updates.b_one_step(
@@ -210,26 +185,26 @@ class Bonus2HybridKernel(tfp.mcmc.TransitionKernel):
             z_a_m=z_a_m,
             z_b_m=current_state.z_b_m,
             k_b=self.k_b,
-            seed=seeds[5],
         )
 
-        next_state = Bonus2State(
-            z_beta_intercept_j=z_beta_intercept_j,
-            z_beta_habit_j=z_beta_habit_j,
-            z_beta_peer_j=z_beta_peer_j,
-            z_beta_weekend_jw=z_beta_weekend_jw,
-            z_a_m=z_a_m,
-            z_b_m=z_b_m,
+        return (
+            Bonus2State(
+                z_beta_intercept_j=z_beta_intercept_j,
+                z_beta_habit_j=z_beta_habit_j,
+                z_beta_peer_j=z_beta_peer_j,
+                z_beta_weekend_jw=z_beta_weekend_jw,
+                z_a_m=z_a_m,
+                z_b_m=z_b_m,
+            ),
+            Bonus2HybridKernelResults(
+                beta_intercept_accept=beta_intercept_accept,
+                beta_habit_accept=beta_habit_accept,
+                beta_peer_accept=beta_peer_accept,
+                beta_weekend_accept=beta_weekend_accept,
+                a_accept=a_accept,
+                b_accept=b_accept,
+            ),
         )
-        results = Bonus2HybridKernelResults(
-            beta_intercept_accept=beta_intercept_accept,
-            beta_habit_accept=beta_habit_accept,
-            beta_peer_accept=beta_peer_accept,
-            beta_weekend_accept=beta_weekend_accept,
-            a_accept=a_accept,
-            b_accept=b_accept,
-        )
-        return next_state, results
 
 
 def build_initial_state(
@@ -238,7 +213,7 @@ def build_initial_state(
     num_harmonics: int,
     init_config: Bonus2InitConfig,
 ) -> Bonus2State:
-    """Build the initial unconstrained state from scalar initialization values."""
+    """Build the initial chain state from scalar initial values."""
     z_beta_intercept_j = tf.fill(
         [num_products],
         tf.constant(init_config.init_beta_intercept, dtype=tf.float64),
@@ -282,12 +257,12 @@ def build_initial_state(
 
 
 def _num_chunks(total_steps: int, chunk_size: int) -> int:
-    """Return the number of chunks needed for a total step count."""
+    """Return the number of chunks required for a total step count."""
     return (total_steps + chunk_size - 1) // chunk_size
 
 
 def _last_state(samples: Bonus2State) -> Bonus2State:
-    """Extract the terminal state from one sampled chunk."""
+    """Extract the terminal draw from one sampled chunk."""
     return Bonus2State(
         z_beta_intercept_j=samples.z_beta_intercept_j[-1],
         z_beta_habit_j=samples.z_beta_habit_j[-1],
@@ -299,7 +274,7 @@ def _last_state(samples: Bonus2State) -> Bonus2State:
 
 
 def _concat_sample_chunks(sample_chunks: list[Bonus2State]) -> Bonus2State:
-    """Concatenate retained sample chunks along the sample axis."""
+    """Concatenate retained sample chunks along the draw axis."""
     return Bonus2State(
         z_beta_intercept_j=tf.concat(
             [chunk.z_beta_intercept_j for chunk in sample_chunks],
@@ -334,16 +309,15 @@ def _trace_fn(
     kernel_results: Bonus2HybridKernelResults,
 ) -> dict[str, tf.Tensor]:
     """Build the per-draw trace recorded by sample_chain."""
-    joint_logpost = posterior.joint_logpost(
-        z_beta_intercept_j=current_state.z_beta_intercept_j,
-        z_beta_habit_j=current_state.z_beta_habit_j,
-        z_beta_peer_j=current_state.z_beta_peer_j,
-        z_beta_weekend_jw=current_state.z_beta_weekend_jw,
-        z_a_m=current_state.z_a_m,
-        z_b_m=current_state.z_b_m,
-    )
     return {
-        "joint_logpost": joint_logpost,
+        "joint_logpost": posterior.joint_logpost(
+            z_beta_intercept_j=current_state.z_beta_intercept_j,
+            z_beta_habit_j=current_state.z_beta_habit_j,
+            z_beta_peer_j=current_state.z_beta_peer_j,
+            z_beta_weekend_jw=current_state.z_beta_weekend_jw,
+            z_a_m=current_state.z_a_m,
+            z_b_m=current_state.z_b_m,
+        ),
         "beta_intercept_accept": kernel_results.beta_intercept_accept,
         "beta_habit_accept": kernel_results.beta_habit_accept,
         "beta_peer_accept": kernel_results.beta_peer_accept,
@@ -374,23 +348,6 @@ def _run_chunk(
     return samples, trace, final_kernel_results
 
 
-def _tune_sampler_config(
-    posterior: posterior_lib.Bonus2PosteriorTF,
-    initial_state: Bonus2State,
-    sampler_config: Bonus2SamplerConfig,
-    seed: tf.Tensor,
-) -> Bonus2SamplerConfig:
-    """Placeholder tuning hook.
-
-    The tuning module has not been integrated yet. For now the supplied proposal
-    scales are used unchanged.
-    """
-    del posterior
-    del initial_state
-    del seed
-    return sampler_config
-
-
 def run_chain(
     y_mit: tf.Tensor,
     delta_mj: tf.Tensor,
@@ -403,31 +360,25 @@ def run_chain(
     posterior_config: posterior_lib.Bonus2PosteriorConfig,
     sampler_config: Bonus2SamplerConfig,
     init_config: Bonus2InitConfig,
-    seed: tf.Tensor,
 ) -> tuple[Bonus2State, list[diagnostics.Bonus2ChunkSummary]]:
-    """Run the full Bonus2 MCMC chain and return retained samples plus chunk summaries."""
-    validate_input.preprocessing_validate_input(
-        y_mit=y_mit,
-        neighbors_m=neighbors_m,
-        lookback=lookback,
-        decay=decay,
-    )
+    """Run the full Bonus Q2 MCMC chain."""
+    y_mit = tf.convert_to_tensor(y_mit, dtype=tf.int32)
+    delta_mj = tf.convert_to_tensor(delta_mj, dtype=tf.float64)
+    is_weekend_t = tf.convert_to_tensor(is_weekend_t, dtype=tf.int32)
+    season_sin_kt = tf.convert_to_tensor(season_sin_kt, dtype=tf.float64)
+    season_cos_kt = tf.convert_to_tensor(season_cos_kt, dtype=tf.float64)
 
-    num_markets = int(y_mit.shape[0])
-    num_consumers = int(y_mit.shape[1])
-    num_periods = int(y_mit.shape[2])
-    num_products = int(delta_mj.shape[1])
-    num_harmonics = int(season_sin_kt.shape[0])
-
-    del num_consumers
-    del num_periods
+    num_markets = int(tf.shape(y_mit)[0].numpy())
+    num_consumers = int(tf.shape(y_mit)[1].numpy())
+    num_products = int(tf.shape(delta_mj)[1].numpy())
+    num_harmonics = int(tf.shape(season_sin_kt)[0].numpy())
 
     peer_adj_m = model.build_peer_adjacency(
         neighbors_m=neighbors_m,
-        n_consumers=int(y_mit.shape[1]),
+        n_consumers=num_consumers,
     )
-    _, h_mntj, p_mntj = model.build_deterministic_states(
-        y_mit=tf.convert_to_tensor(y_mit, dtype=tf.int32),
+    h_mntj, p_mntj = model.build_deterministic_states(
+        y_mit=y_mit,
         n_products=tf.constant(num_products, dtype=tf.int32),
         peer_adj_m=peer_adj_m,
         lookback=tf.constant(lookback, dtype=tf.int32),
@@ -435,76 +386,63 @@ def run_chain(
     )
 
     validate_input.run_chain_validate_input(
-        y_mit=tf.convert_to_tensor(y_mit, dtype=tf.int32),
-        delta_mj=tf.convert_to_tensor(delta_mj, dtype=tf.float64),
-        is_weekend_t=tf.convert_to_tensor(is_weekend_t, dtype=tf.int32),
-        season_sin_kt=tf.convert_to_tensor(season_sin_kt, dtype=tf.float64),
-        season_cos_kt=tf.convert_to_tensor(season_cos_kt, dtype=tf.float64),
+        y_mit=y_mit,
+        delta_mj=delta_mj,
+        is_weekend_t=is_weekend_t,
+        season_sin_kt=season_sin_kt,
+        season_cos_kt=season_cos_kt,
         h_mntj=h_mntj,
         p_mntj=p_mntj,
         posterior_config=posterior_config,
         sampler_config=sampler_config,
-        seed=seed,
     )
 
-    posterior_inputs: posterior_lib.Bonus2PosteriorInputs = {
-        "y_mit": tf.convert_to_tensor(y_mit, dtype=tf.int32),
-        "delta_mj": tf.convert_to_tensor(delta_mj, dtype=tf.float64),
-        "is_weekend_t": tf.convert_to_tensor(is_weekend_t, dtype=tf.int32),
-        "season_sin_kt": tf.convert_to_tensor(season_sin_kt, dtype=tf.float64),
-        "season_cos_kt": tf.convert_to_tensor(season_cos_kt, dtype=tf.float64),
-        "h_mntj": h_mntj,
-        "p_mntj": p_mntj,
-    }
     posterior = posterior_lib.Bonus2PosteriorTF(
         config=posterior_config,
-        inputs=posterior_inputs,
+        inputs={
+            "y_mit": y_mit,
+            "delta_mj": delta_mj,
+            "is_weekend_t": is_weekend_t,
+            "season_sin_kt": season_sin_kt,
+            "season_cos_kt": season_cos_kt,
+            "h_mntj": h_mntj,
+            "p_mntj": p_mntj,
+        },
     )
 
-    initial_state = build_initial_state(
+    current_state = build_initial_state(
         num_markets=num_markets,
         num_products=num_products,
         num_harmonics=num_harmonics,
         init_config=init_config,
     )
-
-    tune_seed, sample_seed = tf.unstack(
-        tf.random.experimental.stateless_split(seed, num=2),
-        axis=0,
-    )
-    tuned_sampler_config = _tune_sampler_config(
-        posterior=posterior,
-        initial_state=initial_state,
-        sampler_config=sampler_config,
-        seed=tune_seed,
-    )
-
     kernel = Bonus2HybridKernel(
         posterior=posterior,
-        config=tuned_sampler_config,
+        config=sampler_config,
     )
-    kernel_results = kernel.bootstrap_results(initial_state)
-    current_state = initial_state
+    kernel_results = kernel.bootstrap_results(current_state)
 
     num_burnin_chunks = _num_chunks(
-        total_steps=tuned_sampler_config.num_burnin_steps,
-        chunk_size=tuned_sampler_config.chunk_size,
+        total_steps=sampler_config.num_burnin_steps,
+        chunk_size=sampler_config.chunk_size,
     )
     num_result_chunks = _num_chunks(
-        total_steps=tuned_sampler_config.num_results,
-        chunk_size=tuned_sampler_config.chunk_size,
+        total_steps=sampler_config.num_results,
+        chunk_size=sampler_config.chunk_size,
     )
     total_chunks = num_burnin_chunks + num_result_chunks
-
-    chunk_seeds = tf.random.experimental.stateless_split(
-        sample_seed,
-        num=total_chunks,
+    base_seed = tf.random.uniform(
+        shape=(2,),
+        minval=0,
+        maxval=2**31 - 1,
+        dtype=tf.int32,
     )
+    chunk_seeds = tf.random.experimental.stateless_split(base_seed, num=total_chunks)
 
-    burnin_remaining = tuned_sampler_config.num_burnin_steps
     seed_index = 0
+    burnin_remaining = sampler_config.num_burnin_steps
     while burnin_remaining > 0:
-        num_steps = min(tuned_sampler_config.chunk_size, burnin_remaining)
+        num_steps = min(sampler_config.chunk_size, burnin_remaining)
         samples, _, kernel_results = _run_chunk(
             kernel=kernel,
             current_state=current_state,
@@ -519,10 +457,10 @@ def run_chain(
     retained_chunks: list[Bonus2State] = []
     summaries: list[diagnostics.Bonus2ChunkSummary] = []
 
-    result_remaining = tuned_sampler_config.num_results
+    result_remaining = sampler_config.num_results
     chunk_idx = 0
     while result_remaining > 0:
-        num_steps = min(tuned_sampler_config.chunk_size, result_remaining)
+        num_steps = min(sampler_config.chunk_size, result_remaining)
         samples, trace, kernel_results = _run_chunk(
             kernel=kernel,
             current_state=current_state,
@@ -561,22 +499,16 @@ def run_chain(
         chunk_idx += 1
 
     diagnostics.report_run_summary(summaries)
-    retained_samples = _concat_sample_chunks(retained_chunks)
-    return retained_samples, summaries
+    return _concat_sample_chunks(retained_chunks), summaries
 
 
 def summarize_samples(samples: Bonus2State) -> dict[str, tf.Tensor]:
-    """Summarize retained samples by posterior means on the structural parameter scale."""
-    mean_state = {
-        "z_beta_intercept_j": tf.reduce_mean(samples.z_beta_intercept_j, axis=0),
-        "z_beta_habit_j": tf.reduce_mean(samples.z_beta_habit_j, axis=0),
-        "z_beta_peer_j": tf.reduce_mean(samples.z_beta_peer_j, axis=0),
-        "z_beta_weekend_jw": tf.reduce_mean(samples.z_beta_weekend_jw, axis=0),
-        "z_a_m": tf.reduce_mean(samples.z_a_m, axis=0),
-        "z_b_m": tf.reduce_mean(samples.z_b_m, axis=0),
+    """Summarize retained samples by posterior means."""
+    return {
+        "beta_intercept_j": tf.reduce_mean(samples.z_beta_intercept_j, axis=0),
+        "beta_habit_j": tf.reduce_mean(samples.z_beta_habit_j, axis=0),
+        "beta_peer_j": tf.reduce_mean(samples.z_beta_peer_j, axis=0),
+        "beta_weekend_jw": tf.reduce_mean(samples.z_beta_weekend_jw, axis=0),
+        "a_m": tf.reduce_mean(samples.z_a_m, axis=0),
+        "b_m": tf.reduce_mean(samples.z_b_m, axis=0),
     }
-    theta_hat = model.unconstrained_to_theta(mean_state)
-    theta_hat["weekend_lift_hat"] = (
-        theta_hat["beta_weekend_jw"][:, 1] - theta_hat["beta_weekend_jw"][:, 0]
-    )
-    return theta_hat

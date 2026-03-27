@@ -1,10 +1,4 @@
-"""
-Phase 1-2 orchestration for:
-- feature-based Zhang choice model (baseline utilities)
-- choice-learn market-shock recovery with the refactored shrinkage runner
-
-This file is Phase-3 agnostic.
-"""
+"""Phase 1-2 orchestration for the Zhang baseline model and Lu shrinkage sampler."""
 
 from __future__ import annotations
 
@@ -16,7 +10,10 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
 import tensorflow as tf
 
-from datasets.zhang_with_lu_dgp import generate_choice_learn_market_shocks_dgp
+from datasets.zhang_with_lu_dgp import (
+    generate_choice_learn_market_shocks_dgp,
+    probs_with_outside,
+)
 from lu.choice_learn.cl_posterior import ChoiceLearnPosteriorConfig
 from lu.choice_learn.cl_shrinkage import (
     ChoiceLearnShrinkageConfig,
@@ -26,44 +23,28 @@ from lu.choice_learn.cl_shrinkage import (
 from zhang.featurebased import BaseFeatureBasedDeepHalo
 
 
-# -----------------------------
-# Helpers (shared)
-# -----------------------------
-
-
 def build_items_tensor(xj: np.ndarray) -> tf.Tensor:
-    """
-    Convert product features xj into a single-items tensor for the choice model.
+    """Build the single-menu item tensor used by the feature-based Zhang model."""
 
-    Expected:
-      xj: (J, d_x) or (J,)
-
-    Returns:
-      items_one: (1, J, d_x)
-    """
-    x = np.asarray(xj, dtype=np.float32)
+    x = np.asarray(xj)
     if x.ndim == 1:
         x = x[:, None]
     elif x.ndim != 2:
         raise ValueError(f"xj must be 1D or 2D. Got shape {x.shape}.")
 
-    items = tf.convert_to_tensor(x, dtype=tf.float32)
-    return items[None, :, :]
+    return tf.constant(x[None, :, :], dtype=tf.float32)
 
 
 def build_choice_index_tensor(qj_base: np.ndarray) -> tf.Tensor:
-    """
-    Convert base-market inside-good counts into a vector of chosen item indices.
+    """Expand inside-good baseline counts into repeated chosen item indices.
 
-    Expected:
-      qj_base: (J,) integer counts
-
-    Returns:
-      choices: (sum_j qj_base[j],) int32 indices in [0, J)
+    This uses only inside-good counts. The resulting training target is therefore
+    conditional on an inside choice being observed.
     """
+
     q = np.asarray(qj_base, dtype=np.int64)
-    idx = np.repeat(np.arange(q.shape[0], dtype=np.int64), q)
-    return tf.convert_to_tensor(idx, dtype=tf.int32)
+    chosen_indices = np.repeat(np.arange(q.shape[0], dtype=np.int64), q)
+    return tf.constant(chosen_indices, dtype=tf.int32)
 
 
 def make_training_dataset(
@@ -72,64 +53,46 @@ def make_training_dataset(
     batch_size: int,
     shuffle_buffer: int,
 ) -> tf.data.Dataset:
-    """Build a tf.data dataset of (items_batch, choice_index_batch) pairs."""
+    """Build repeated-menu minibatches of ``(items_batch, choice_batch)`` pairs."""
+
     ds = tf.data.Dataset.from_tensor_slices(choices)
     ds = ds.shuffle(buffer_size=shuffle_buffer, reshuffle_each_iteration=True)
     ds = ds.batch(batch_size, drop_remainder=False)
 
-    def to_xy(y_batch: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        b = tf.shape(y_batch)[0]
-        x_batch = tf.tile(items_one, multiples=[b, 1, 1])
-        return x_batch, y_batch
+    def to_xy(choice_batch: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        """Tile the same item set across the current batch of observed choices."""
+
+        batch_size_now = tf.shape(choice_batch)[0]
+        items_batch = tf.tile(items_one, multiples=[batch_size_now, 1, 1])
+        return items_batch, choice_batch
 
     ds = ds.map(to_xy, num_parallel_calls=tf.data.AUTOTUNE)
     return ds.prefetch(tf.data.AUTOTUNE)
 
 
-def probs_with_outside(u: np.ndarray) -> tuple[np.ndarray, float]:
-    """
-    Convert inside-good utilities into logit probabilities with an outside option.
-
-    Outside utility is normalized to 0.
-    """
-    u = np.asarray(u, dtype=np.float64)
-    m = max(0.0, float(np.max(u)))
-    exp_inside = np.exp(u - m)
-    exp_out = math.exp(-m)
-    denom = exp_out + float(np.sum(exp_inside))
-    return exp_inside / denom, float(exp_out / denom)
-
-
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
-    """Root-mean-square error."""
-    d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
-    return float(np.sqrt(np.mean(d * d)))
+    """Return the root-mean-square error between two arrays."""
+
+    diff = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+    return float(np.sqrt(np.mean(diff * diff)))
 
 
 def corr(a: np.ndarray, b: np.ndarray) -> float:
-    """Correlation for two arrays after flattening."""
-    a = np.asarray(a, dtype=np.float64).ravel()
-    b = np.asarray(b, dtype=np.float64).ravel()
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
-    return float(np.sum(a * b) / denom) if denom > 0.0 else float("nan")
+    """Return the correlation between two arrays after flattening."""
 
+    a_flat = np.asarray(a, dtype=np.float64).ravel()
+    b_flat = np.asarray(b, dtype=np.float64).ravel()
 
-def _to_numpy_results(results: dict[str, object]) -> dict[str, object]:
-    """Convert tensor-valued result entries into NumPy-backed output."""
-    out: dict[str, object] = {}
-    for key, value in results.items():
-        if isinstance(value, tf.Tensor):
-            out[key] = value.numpy()
-        else:
-            out[key] = value
-    return out
+    a_centered = a_flat - a_flat.mean()
+    b_centered = b_flat - b_flat.mean()
 
+    denom = float(
+        np.sqrt(np.sum(a_centered * a_centered) * np.sum(b_centered * b_centered))
+    )
+    if denom <= 0.0:
+        return float("nan")
 
-# -----------------------------
-# Phase 1: choice model
-# -----------------------------
+    return float(np.sum(a_centered * b_centered) / denom)
 
 
 def run_choice_model(
@@ -155,13 +118,8 @@ def run_choice_model(
     learning_rate: float,
     shuffle_buffer: int,
 ) -> dict[str, object]:
-    """
-    Phase 1: simulate a market and train a feature-based choice model.
+    """Simulate baseline data and fit the feature-based Zhang choice model."""
 
-    Returns:
-      - dgp: dict of simulated objects
-      - delta_hat: (J,) estimated utilities from the trained model
-    """
     dgp = generate_choice_learn_market_shocks_dgp(
         seed=seed,
         num_markets=num_markets,
@@ -179,11 +137,8 @@ def run_choice_model(
         sd_u=sd_u,
     )
 
-    xj = dgp["xj"]
-    qj_base = dgp["qj_base"]
-
-    items_one = build_items_tensor(xj)
-    choices = build_choice_index_tensor(qj_base)
+    items_one = build_items_tensor(dgp["xj"])
+    choices = build_choice_index_tensor(dgp["qj_base"])
 
     ds_train = make_training_dataset(
         items_one=items_one,
@@ -207,7 +162,10 @@ def run_choice_model(
     model.fit(ds_train, epochs=epochs, verbose=2)
     delta_hat = model(items_one, training=False).numpy()[0]
 
-    return {"dgp": dgp, "delta_hat": delta_hat}
+    return {
+        "dgp": dgp,
+        "delta_hat": delta_hat,
+    }
 
 
 def print_choice_model_diagnostics(
@@ -221,31 +179,36 @@ def print_choice_model_diagnostics(
     eval_include_outside: bool,
     eval_against_empirical: bool,
 ) -> None:
-    """Print Phase-1 diagnostics comparing baseline model probabilities to truth."""
+    """Print baseline-model diagnostics against truth and empirical shares."""
+
     p_hat, p0_hat = probs_with_outside(delta_hat)
 
     print("")
     print("============================================================")
     print("PHASE 1: BASELINE CHOICE MODEL")
     print("============================================================")
-
     print(f"N_base: {N_base} | N_inside: {int(qj_base.sum())} | N_outside: {q0_base}")
     print(f"rmse_prob_inside_vs_true: {rmse(p_hat, p_base):.6f}")
 
     if eval_include_outside:
         print(
-            f"rmse_prob_all_vs_true:    {rmse(np.r_[p0_hat, p_hat], np.r_[p0_base, p_base]):.6f}"
+            f"rmse_prob_all_vs_true:    "
+            f"{rmse(np.r_[p0_hat, p_hat], np.r_[p0_base, p_base]):.6f}"
         )
 
     if eval_against_empirical:
-        s_hat = qj_base / float(N_base)
-        s0_hat = q0_base / float(N_base)
-        print(f"rmse_prob_inside_vs_share:{rmse(p_hat, s_hat):.6f}")
+        share_inside = qj_base / float(N_base)
+        share_outside = q0_base / float(N_base)
+
+        print(f"rmse_prob_inside_vs_share:{rmse(p_hat, share_inside):.6f}")
         if eval_include_outside:
             print(
-                f"rmse_prob_all_vs_share:   {rmse(np.r_[p0_hat, p_hat], np.r_[s0_hat, s_hat]):.6f}"
+                f"rmse_prob_all_vs_share:   "
+                f"{rmse(np.r_[p0_hat, p_hat], np.r_[share_outside, share_inside]):.6f}"
             )
 
+    # Compare centered utilities because logits are identified only up to a
+    # location normalization.
     print(
         "utility recovery (centered): "
         f"corr={corr(delta_hat - delta_hat.mean(), delta_true - delta_true.mean()):.4f} "
@@ -253,44 +216,13 @@ def print_choice_model_diagnostics(
     )
 
 
-# -----------------------------
-# Phase 2: market shock estimator
-# -----------------------------
-
-
-def run_market_shock_estimator(
-    delta_cl: tf.Tensor,
-    qjt: tf.Tensor,
-    q0t: tf.Tensor,
-    posterior_config: ChoiceLearnPosteriorConfig,
-    shrinkage_config: ChoiceLearnShrinkageConfig,
-    seed: tf.Tensor,
-) -> dict[str, object]:
-    """
-    Phase 2: recover market shocks with the refactored choice-learn shrinkage sampler.
-
-    Inputs must be float64 tensors with static shapes:
-      - delta_cl: (T, J)
-      - qjt:      (T, J)
-      - q0t:      (T,)
-    """
-    samples = run_chain(
-        delta_cl=delta_cl,
-        qjt=qjt,
-        q0t=q0t,
-        posterior_config=posterior_config,
-        shrinkage_config=shrinkage_config,
-        seed=seed,
-    )
-    return _to_numpy_results(summarize_samples(samples))
-
-
 def print_market_shock_diagnostics(
     delta_hat: np.ndarray,
     dgp: dict[str, object],
-    res: dict[str, object],
+    summary: dict[str, tf.Tensor],
 ) -> None:
-    """Print Phase-2 diagnostics comparing baseline vs posterior-mean vs oracle."""
+    """Print shock-recovery diagnostics for the Lu-style shrinkage stage."""
+
     qjt = np.asarray(dgp["qjt_shock"], dtype=np.float64)
     q0t = np.asarray(dgp["q0t_shock"], dtype=np.float64)
 
@@ -299,31 +231,40 @@ def print_market_shock_diagnostics(
     njt_true = np.asarray(dgp["njt_true"], dtype=np.float64)
     E_true = E_bar_true[:, None] + njt_true
 
-    alpha_hat = float(np.asarray(res["alpha_hat"], dtype=np.float64))
-    E_bar_hat = np.asarray(res["E_bar_hat"], dtype=np.float64)
-    njt_hat = np.asarray(res["njt_hat"], dtype=np.float64)
-    gamma_hat = np.asarray(res["gamma_hat"], dtype=np.float64)
-    E_hat = np.asarray(res["E_hat"], dtype=np.float64)
+    delta_hat = np.asarray(delta_hat, dtype=np.float64)
+    alpha_hat = float(np.asarray(summary["alpha_hat"], dtype=np.float64))
+    E_bar_hat = np.asarray(summary["E_bar_hat"], dtype=np.float64)
+    njt_hat = np.asarray(summary["njt_hat"], dtype=np.float64)
+    gamma_hat = np.asarray(summary["gamma_hat"], dtype=np.float64)
+    E_hat = np.asarray(summary["E_hat"], dtype=np.float64)
 
-    T = qjt.shape[0]
+    num_markets = qjt.shape[0]
 
     nll_base = 0.0
     nll_post = 0.0
     nll_oracle = 0.0
 
+    # Baseline-only NLL uses the Zhang baseline logits with no shock correction.
     p_base_j, p_base_0 = probs_with_outside(delta_hat)
 
-    for t in range(T):
+    for market_index in range(num_markets):
+        # Posterior-mean NLL uses the recovered mean market and product shocks.
         p_post_j, p_post_0 = probs_with_outside(
-            alpha_hat * delta_hat + E_bar_hat[t] + njt_hat[t]
+            alpha_hat * delta_hat + E_bar_hat[market_index] + njt_hat[market_index]
         )
-        p_orac_j, p_orac_0 = probs_with_outside(
-            delta_true + E_bar_true[t] + njt_true[t]
+        p_oracle_j, p_oracle_0 = probs_with_outside(
+            delta_true + E_bar_true[market_index] + njt_true[market_index]
         )
 
-        nll_base -= np.sum(qjt[t] * np.log(p_base_j)) + q0t[t] * math.log(p_base_0)
-        nll_post -= np.sum(qjt[t] * np.log(p_post_j)) + q0t[t] * math.log(p_post_0)
-        nll_oracle -= np.sum(qjt[t] * np.log(p_orac_j)) + q0t[t] * math.log(p_orac_0)
+        nll_base -= np.sum(qjt[market_index] * np.log(p_base_j)) + q0t[
+            market_index
+        ] * math.log(p_base_0)
+        nll_post -= np.sum(qjt[market_index] * np.log(p_post_j)) + q0t[
+            market_index
+        ] * math.log(p_post_0)
+        nll_oracle -= np.sum(qjt[market_index] * np.log(p_oracle_j)) + q0t[
+            market_index
+        ] * math.log(p_oracle_0)
 
     print("")
     print("============================================================")
@@ -352,18 +293,13 @@ def print_market_shock_diagnostics(
     )
     print("")
     print("Average NLL per market:")
-    print(f"  baseline-only:   {nll_base / T:.3f}")
-    print(f"  posterior-mean:  {nll_post / T:.3f}")
-    print(f"  oracle (truth):  {nll_oracle / T:.3f}")
-
-
-# -----------------------------
-# Main (thin wrapper)
-# -----------------------------
+    print(f"  baseline-only:   {nll_base / num_markets:.3f}")
+    print(f"  posterior-mean:  {nll_post / num_markets:.3f}")
+    print(f"  oracle (truth):  {nll_oracle / num_markets:.3f}")
 
 
 def main() -> None:
-    # --- DGP + phase-1 model config ---
+    # DGP and baseline-model configuration.
     seed = 123
     num_products = 15
     num_groups = 5
@@ -394,11 +330,10 @@ def main() -> None:
     eval_include_outside = True
     eval_against_empirical = True
 
-    # --- shrinkage (phase-2) config ---
+    # Shrinkage posterior and chain configuration.
     shrink_seed = 0
 
     posterior_config = ChoiceLearnPosteriorConfig(
-        eps=1e-15,
         alpha_mean=1.0,
         alpha_var=1.0,
         E_bar_mean=0.0,
@@ -425,8 +360,8 @@ def main() -> None:
 
     chain_seed = tf.constant([shrink_seed, 0], dtype=tf.int32)
 
-    # --- Phase 1 ---
-    out1 = run_choice_model(
+    # Phase 1: recover baseline utilities from the fixed-menu training data.
+    phase1 = run_choice_model(
         seed=seed,
         num_products=num_products,
         num_groups=num_groups,
@@ -450,8 +385,8 @@ def main() -> None:
         shuffle_buffer=shuffle_buffer,
     )
 
-    dgp = out1["dgp"]
-    delta_hat = out1["delta_hat"]
+    dgp = phase1["dgp"]
+    delta_hat = phase1["delta_hat"]
 
     print_choice_model_diagnostics(
         delta_hat=delta_hat,
@@ -465,21 +400,20 @@ def main() -> None:
         eval_against_empirical=eval_against_empirical,
     )
 
-    # --- Phase 2 ---
+    # Phase 2: tile the learned baseline logits across markets and fit the
+    # shrinkage shock decomposition to shocked market counts.
     qjt_shock = np.asarray(dgp["qjt_shock"], dtype=np.float64)
     q0t_shock = np.asarray(dgp["q0t_shock"], dtype=np.float64)
-
-    T = int(qjt_shock.shape[0])
 
     delta_hat_tf = tf.constant(
         np.asarray(delta_hat, dtype=np.float64), dtype=tf.float64
     )
-    delta_cl_tf = tf.tile(delta_hat_tf[None, :], [T, 1])
+    delta_cl_tf = tf.tile(delta_hat_tf[None, :], [qjt_shock.shape[0], 1])
 
     qjt_tf = tf.constant(qjt_shock, dtype=tf.float64)
     q0t_tf = tf.constant(q0t_shock, dtype=tf.float64)
 
-    res2 = run_market_shock_estimator(
+    samples = run_chain(
         delta_cl=delta_cl_tf,
         qjt=qjt_tf,
         q0t=q0t_tf,
@@ -487,11 +421,12 @@ def main() -> None:
         shrinkage_config=shrinkage_config,
         seed=chain_seed,
     )
+    summary = summarize_samples(samples)
 
     print_market_shock_diagnostics(
         delta_hat=delta_hat,
         dgp=dgp,
-        res=res2,
+        summary=summary,
     )
 
 

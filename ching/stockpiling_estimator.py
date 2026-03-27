@@ -1,9 +1,9 @@
-"""Run the Ching stockpiling MCMC chain and summarize retained samples."""
+"""Run the Ching-style stockpiling MCMC chain and summarize draws."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -11,6 +11,7 @@ import tensorflow_probability as tfp
 from ching.stockpiling_diagnostics import (
     StockpilingChunkSummary,
     StockpilingChunkTrace,
+    build_mcmc_summary,
     report_chunk_progress,
     report_run_summary,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "StockpilingConfig",
     "StockpilingState",
     "StockpilingKernelResults",
+    "StockpilingRunResult",
     "StockpilingHybridKernel",
     "build_initial_state",
     "run_chain",
@@ -41,7 +43,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class StockpilingConfig:
-    """Store sampler controls, proposal scales, and tuning placeholders."""
+    """Store the sampler controls and proposal scales."""
 
     num_results: int
     num_burnin_steps: int
@@ -51,12 +53,6 @@ class StockpilingConfig:
     k_v: tf.Tensor
     k_fc: tf.Tensor
     k_u_scale: tf.Tensor
-    pilot_num_steps: int
-    target_accept_low: float
-    target_accept_high: float
-    grow_factor: float
-    shrink_factor: float
-    max_tuning_rounds: int
 
 
 class StockpilingState(NamedTuple):
@@ -70,7 +66,7 @@ class StockpilingState(NamedTuple):
 
 
 class StockpilingKernelResults(NamedTuple):
-    """Store scalar block-acceptance diagnostics for one transition step."""
+    """Store scalar block acceptance diagnostics for one transition step."""
 
     beta_accept: tf.Tensor
     alpha_accept: tf.Tensor
@@ -79,15 +75,24 @@ class StockpilingKernelResults(NamedTuple):
     u_scale_accept: tf.Tensor
 
 
+@dataclass(frozen=True)
+class StockpilingRunResult:
+    """Store retained samples and reporting summaries from one chain run."""
+
+    samples: StockpilingState
+    chunk_summaries: list[StockpilingChunkSummary]
+    mcmc_summary: dict[str, Any]
+
+
 def _num_chunks(n_steps: int, chunk_size: int) -> int:
-    """Return the number of chunks needed for a given step count."""
+    """Return the number of chunks required for n_steps transitions."""
     if n_steps <= 0:
         return 0
     return (n_steps + chunk_size - 1) // chunk_size
 
 
 def _last_state(samples: StockpilingState) -> StockpilingState:
-    """Extract the terminal state from a chunk of sampled states."""
+    """Return the terminal state from a sampled chunk."""
     return StockpilingState(
         z_beta=samples.z_beta[-1],
         z_alpha=samples.z_alpha[-1],
@@ -98,8 +103,8 @@ def _last_state(samples: StockpilingState) -> StockpilingState:
 
 
 def _concat_sample_chunks(chunks: list[StockpilingState]) -> StockpilingState:
-    """Concatenate retained sample chunks into one state trace."""
-    if len(chunks) == 0:
+    """Concatenate retained chunks into one stacked sample object."""
+    if not chunks:
         raise ValueError("No retained sample chunks were produced.")
 
     return StockpilingState(
@@ -112,7 +117,7 @@ def _concat_sample_chunks(chunks: list[StockpilingState]) -> StockpilingState:
 
 
 def _raw_trace_to_dataclass(raw_trace: dict[str, tf.Tensor]) -> StockpilingChunkTrace:
-    """Convert the raw trace dictionary into a StockpilingChunkTrace."""
+    """Convert the raw TFP trace dictionary into a diagnostics dataclass."""
     return StockpilingChunkTrace(
         beta=raw_trace["beta"],
         mean_alpha=raw_trace["mean_alpha"],
@@ -129,13 +134,13 @@ def _raw_trace_to_dataclass(raw_trace: dict[str, tf.Tensor]) -> StockpilingChunk
 
 
 def build_initial_state(M: int, J: int) -> StockpilingState:
-    """Construct the default initial state for the stockpiling chain."""
+    """Build the default unconstrained initial state."""
     return StockpilingState(
         z_beta=tf.constant(0.0, dtype=tf.float64),
-        z_alpha=tf.zeros([J], dtype=tf.float64),
-        z_v=tf.zeros([J], dtype=tf.float64),
-        z_fc=tf.zeros([J], dtype=tf.float64),
-        z_u_scale=tf.zeros([M], dtype=tf.float64),
+        z_alpha=tf.zeros((J,), dtype=tf.float64),
+        z_v=tf.zeros((J,), dtype=tf.float64),
+        z_fc=tf.zeros((J,), dtype=tf.float64),
+        z_u_scale=tf.zeros((M,), dtype=tf.float64),
     )
 
 
@@ -151,11 +156,11 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
         self._posterior = posterior
         self._config = config
 
-        self._k_beta = tf.convert_to_tensor(config.k_beta, dtype=tf.float64)
-        self._k_alpha = tf.convert_to_tensor(config.k_alpha, dtype=tf.float64)
-        self._k_v = tf.convert_to_tensor(config.k_v, dtype=tf.float64)
-        self._k_fc = tf.convert_to_tensor(config.k_fc, dtype=tf.float64)
-        self._k_u_scale = tf.convert_to_tensor(config.k_u_scale, dtype=tf.float64)
+        self._k_beta = config.k_beta
+        self._k_alpha = config.k_alpha
+        self._k_v = config.k_v
+        self._k_fc = config.k_fc
+        self._k_u_scale = config.k_u_scale
 
         self._parameters = {
             "posterior": posterior,
@@ -163,7 +168,7 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
         }
 
     @property
-    def parameters(self):
+    def parameters(self) -> dict[str, Any]:
         """Return the kernel parameters required by the TFP interface."""
         return self._parameters
 
@@ -176,7 +181,7 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
         self,
         current_state: StockpilingState,
     ) -> StockpilingKernelResults:
-        """Initialize the acceptance diagnostics for the first step."""
+        """Initialize acceptance diagnostics for the first transition."""
         del current_state
         zero = tf.constant(0.0, dtype=tf.float64)
         return StockpilingKernelResults(
@@ -207,7 +212,6 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
             k_beta=self._k_beta,
             seed=seeds[0],
         )
-
         z_alpha_new, alpha_accept = alpha_one_step(
             posterior=self._posterior,
             z_beta=z_beta_new,
@@ -218,7 +222,6 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
             k_alpha=self._k_alpha,
             seed=seeds[1],
         )
-
         z_v_new, v_accept = v_one_step(
             posterior=self._posterior,
             z_beta=z_beta_new,
@@ -229,7 +232,6 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
             k_v=self._k_v,
             seed=seeds[2],
         )
-
         z_fc_new, fc_accept = fc_one_step(
             posterior=self._posterior,
             z_beta=z_beta_new,
@@ -240,7 +242,6 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
             k_fc=self._k_fc,
             seed=seeds[3],
         )
-
         z_u_scale_new, u_scale_accept = u_scale_one_step(
             posterior=self._posterior,
             z_beta=z_beta_new,
@@ -252,21 +253,21 @@ class StockpilingHybridKernel(tfp.mcmc.TransitionKernel):
             seed=seeds[4],
         )
 
-        new_state = StockpilingState(
+        next_state = StockpilingState(
             z_beta=z_beta_new,
             z_alpha=z_alpha_new,
             z_v=z_v_new,
             z_fc=z_fc_new,
             z_u_scale=z_u_scale_new,
         )
-        new_results = StockpilingKernelResults(
+        next_results = StockpilingKernelResults(
             beta_accept=beta_accept,
             alpha_accept=alpha_accept,
             v_accept=v_accept,
             fc_accept=fc_accept,
             u_scale_accept=u_scale_accept,
         )
-        return new_state, new_results
+        return next_state, next_results
 
     def copy(self, **kwargs):
         """Return a copy of the kernel with updated parameters."""
@@ -281,23 +282,16 @@ def _make_trace(
     kernel_results: StockpilingKernelResults,
 ) -> dict[str, tf.Tensor]:
     """Build the per-draw diagnostics recorded during sampling."""
-    if posterior.fix_u_scale:
-        z_u_scale_eff = (
-            tf.zeros_like(current_state.z_u_scale) + posterior.fixed_z_u_scale
-        )
-    else:
-        z_u_scale_eff = current_state.z_u_scale
-
     theta = unconstrained_to_theta(
         {
             "z_beta": current_state.z_beta,
             "z_alpha": current_state.z_alpha,
             "z_v": current_state.z_v,
             "z_fc": current_state.z_fc,
-            "z_u_scale": z_u_scale_eff,
+            "z_u_scale": current_state.z_u_scale,
         }
     )
-    joint_lp = posterior.joint_logpost(
+    joint_logpost = posterior.joint_logpost(
         z_beta=current_state.z_beta,
         z_alpha=current_state.z_alpha,
         z_v=current_state.z_v,
@@ -311,7 +305,7 @@ def _make_trace(
         "mean_v": tf.reduce_mean(theta["v"]),
         "mean_fc": tf.reduce_mean(theta["fc"]),
         "mean_u_scale": tf.reduce_mean(theta["u_scale"]),
-        "joint_logpost": joint_lp,
+        "joint_logpost": joint_logpost,
         "beta_accept": kernel_results.beta_accept,
         "alpha_accept": kernel_results.alpha_accept,
         "v_accept": kernel_results.v_accept,
@@ -334,8 +328,8 @@ def run_chain(
     stockpiling_config: StockpilingConfig,
     initial_state: StockpilingState,
     seed: tf.Tensor,
-) -> StockpilingState:
-    """Validate inputs, run the chain, and return retained draws."""
+) -> StockpilingRunResult:
+    """Validate inputs, run the chain, and return samples plus summaries."""
     run_chain_validate_input(
         a_mnjt=a_mnjt,
         s_mjt=s_mjt,
@@ -368,79 +362,61 @@ def run_chain(
         inventory_maps=inventory_maps,
         pi_I0=pi_I0,
     )
-
     kernel = StockpilingHybridKernel(
         posterior=posterior,
         config=stockpiling_config,
     )
 
-    def trace_fn(
-        current_state: StockpilingState,
-        kernel_results: StockpilingKernelResults,
-    ) -> dict[str, tf.Tensor]:
-        """Record the per-draw diagnostics reported at chunk boundaries."""
-        return _make_trace(
-            posterior=posterior,
-            current_state=current_state,
-            kernel_results=kernel_results,
-        )
-
-    @tf.function(jit_compile=True, reduce_retracing=True)
+    @tf.function(jit_compile=True)
     def _run_chunk(
         current_state: StockpilingState,
         previous_kernel_results: StockpilingKernelResults,
         num_steps: tf.Tensor,
         chunk_seed: tf.Tensor,
-    ):
-        """Run one chunk of the chain and return samples, trace, and kernel results."""
+    ) -> tuple[StockpilingState, dict[str, tf.Tensor], StockpilingKernelResults]:
+        """Run one compiled chunk of transitions."""
         return tfp.mcmc.sample_chain(
             num_results=num_steps,
-            num_burnin_steps=0,
             current_state=current_state,
             previous_kernel_results=previous_kernel_results,
             kernel=kernel,
-            trace_fn=trace_fn,
+            trace_fn=lambda state, results: _make_trace(posterior, state, results),
             return_final_kernel_results=True,
             seed=chunk_seed,
         )
 
-    state = initial_state
-    kernel_results = kernel.bootstrap_results(initial_state)
-
-    burnin_chunks = _num_chunks(
+    total_burnin_chunks = _num_chunks(
         stockpiling_config.num_burnin_steps,
         stockpiling_config.chunk_size,
     )
-    result_chunks = _num_chunks(
+    total_retained_chunks = _num_chunks(
         stockpiling_config.num_results,
         stockpiling_config.chunk_size,
     )
-    total_chunks = burnin_chunks + result_chunks
+    total_chunks = total_burnin_chunks + total_retained_chunks
 
     chunk_seeds = tf.random.experimental.stateless_split(seed, num=total_chunks)
 
-    chunk_idx = 0
-    chunk_summaries: list[StockpilingChunkSummary] = []
+    state = initial_state
+    kernel_results = kernel.bootstrap_results(initial_state)
     retained_chunks: list[StockpilingState] = []
+    chunk_summaries: list[StockpilingChunkSummary] = []
 
-    def run_phase(remaining_steps: int, retain: bool) -> int:
-        """Execute one chunked phase of the chain."""
+    chunk_idx = 0
+
+    def run_phase(num_steps: int, retain: bool) -> None:
+        """Run either the burn-in or retained phase chunk by chunk."""
         nonlocal chunk_idx, state, kernel_results
 
-        while remaining_steps > 0:
-            this_chunk = min(stockpiling_config.chunk_size, remaining_steps)
-
-            chunk_samples, raw_trace, kernel_results = _run_chunk(
+        remaining = int(num_steps)
+        while remaining > 0:
+            chunk_len = min(stockpiling_config.chunk_size, remaining)
+            samples, raw_trace, kernel_results = _run_chunk(
                 current_state=state,
                 previous_kernel_results=kernel_results,
-                num_steps=tf.constant(this_chunk, dtype=tf.int32),
+                num_steps=tf.constant(chunk_len, dtype=tf.int32),
                 chunk_seed=chunk_seeds[chunk_idx],
             )
-
-            state = _last_state(chunk_samples)
-
-            if retain:
-                retained_chunks.append(chunk_samples)
 
             trace = _raw_trace_to_dataclass(raw_trace)
             summary = report_chunk_progress(
@@ -450,52 +426,48 @@ def run_chain(
             )
             chunk_summaries.append(summary)
 
-            remaining_steps -= this_chunk
-            chunk_idx += 1
+            state = _last_state(samples)
+            if retain:
+                retained_chunks.append(samples)
 
-        return remaining_steps
+            remaining -= chunk_len
+            chunk_idx += 1
 
     run_phase(stockpiling_config.num_burnin_steps, retain=False)
     run_phase(stockpiling_config.num_results, retain=True)
 
-    if len(chunk_summaries) > 0:
-        report_run_summary(chunk_summaries)
+    report_run_summary(chunk_summaries)
 
-    return _concat_sample_chunks(retained_chunks)
+    samples = _concat_sample_chunks(retained_chunks)
+    n_saved = int(samples.z_beta.shape[0])
+    mcmc_summary = build_mcmc_summary(
+        summaries=chunk_summaries,
+        n_saved=n_saved,
+    )
+
+    return StockpilingRunResult(
+        samples=samples,
+        chunk_summaries=chunk_summaries,
+        mcmc_summary=mcmc_summary,
+    )
 
 
-def summarize_samples(
-    samples: StockpilingState,
-    posterior_config: StockpilingPosteriorConfig,
-) -> dict[str, tf.Tensor]:
-    """Compute posterior mean summaries from retained chain output."""
-    if posterior_config.fix_u_scale:
-        z_u_scale_eff = tf.zeros_like(
-            samples.z_u_scale, dtype=tf.float64
-        ) + tf.constant(posterior_config.fixed_z_u_scale, dtype=tf.float64)
-    else:
-        z_u_scale_eff = samples.z_u_scale
-
+def summarize_samples(samples: StockpilingState) -> dict[str, tf.Tensor]:
+    """Summarize retained draws by posterior means on the constrained scale."""
     theta = unconstrained_to_theta(
         {
             "z_beta": samples.z_beta,
             "z_alpha": samples.z_alpha,
             "z_v": samples.z_v,
             "z_fc": samples.z_fc,
-            "z_u_scale": z_u_scale_eff,
+            "z_u_scale": samples.z_u_scale,
         }
     )
 
-    beta_hat = tf.reduce_mean(theta["beta"], axis=0)
-    alpha_hat = tf.reduce_mean(theta["alpha"], axis=0)
-    v_hat = tf.reduce_mean(theta["v"], axis=0)
-    fc_hat = tf.reduce_mean(theta["fc"], axis=0)
-    u_scale_hat = tf.reduce_mean(theta["u_scale"], axis=0)
-
     return {
-        "beta_hat": beta_hat,
-        "alpha_hat": alpha_hat,
-        "v_hat": v_hat,
-        "fc_hat": fc_hat,
-        "u_scale_hat": u_scale_hat,
+        "beta": tf.reduce_mean(theta["beta"], axis=0),
+        "alpha": tf.reduce_mean(theta["alpha"], axis=0),
+        "v": tf.reduce_mean(theta["v"], axis=0),
+        "fc": tf.reduce_mean(theta["fc"], axis=0),
+        "u_scale": tf.reduce_mean(theta["u_scale"], axis=0),
     }

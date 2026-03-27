@@ -9,9 +9,7 @@ import tensorflow as tf
 
 @dataclass(frozen=True)
 class ChoiceLearnPosteriorConfig:
-    """Store fixed hyperparameters and numerical settings for posterior evaluation."""
-
-    eps: float
+    """Store fixed prior hyperparameters for posterior evaluation."""
 
     alpha_mean: float
     alpha_var: float
@@ -31,8 +29,6 @@ class ChoiceLearnPosteriorTF:
 
     def __init__(self, config: ChoiceLearnPosteriorConfig):
         """Cache fixed constants and prior terms used across posterior evaluations."""
-
-        self.eps = tf.constant(config.eps, dtype=tf.float64)
 
         self.alpha_mean = tf.constant(config.alpha_mean, dtype=tf.float64)
         self.alpha_var = tf.constant(config.alpha_var, dtype=tf.float64)
@@ -60,77 +56,109 @@ class ChoiceLearnPosteriorTF:
         self._log_T0_sq = tf.math.log(self.T0_sq)
         self._log_T1_sq = tf.math.log(self.T1_sq)
 
-        self._lp0_alpha = -0.5 * (self._log_two_pi + self._log_alpha_var)
-        self._lp0_E_bar = -0.5 * (self._log_two_pi + self._log_E_bar_var)
+        self._alpha_log_normalizer = -0.5 * (self._log_two_pi + self._log_alpha_var)
+        self._E_bar_log_normalizer = -0.5 * (self._log_two_pi + self._log_E_bar_var)
 
-    def _mean_utility_t(
+    def _utilities(
         self,
-        delta_cl_t: tf.Tensor,
+        delta_cl: tf.Tensor,
         alpha: tf.Tensor,
-        E_bar_t: tf.Tensor,
-        njt_t: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the mean utility vector for one market."""
+        """Return mean utilities for one market or a batch of markets."""
 
-        return alpha * delta_cl_t + E_bar_t + njt_t
+        return alpha * delta_cl + E_bar[..., None] + njt
 
-    def _log_choice_probs_t(
+    def _log_choice_probs(
         self,
-        delta_t: tf.Tensor,
+        utilities: tf.Tensor,
     ) -> tuple[tf.Tensor, tf.Tensor]:
-        """Compute inside-good and outside-good log probabilities for one market."""
+        """Return inside-good and outside-good log probabilities.
 
-        zeros = tf.zeros((1,), dtype=tf.float64)
-        delta_aug = tf.concat([zeros, delta_t], axis=0)
-        log_denom = tf.reduce_logsumexp(delta_aug)
-        log_sjt_t = delta_t - log_denom
-        log_s0t = -log_denom
-        return log_sjt_t, log_s0t
+        The outside option is normalized to zero utility. This helper works for both
+        one-market inputs of shape ``(J,)`` and batched inputs of shape ``(T, J)``.
+        """
 
-    def _market_loglik_impl(
-        self,
-        qjt_t: tf.Tensor,
-        q0t_t: tf.Tensor,
-        delta_cl_t: tf.Tensor,
-        alpha: tf.Tensor,
-        E_bar_t: tf.Tensor,
-        njt_t: tf.Tensor,
-    ) -> tf.Tensor:
-        """Return the one-market log-likelihood contribution."""
-
-        delta_t = self._mean_utility_t(
-            delta_cl_t=delta_cl_t,
-            alpha=alpha,
-            E_bar_t=E_bar_t,
-            njt_t=njt_t,
+        zero_column = tf.zeros(
+            tf.concat([tf.shape(utilities)[:-1], [1]], axis=0),
+            dtype=tf.float64,
         )
-        log_sjt_t, log_s0t = self._log_choice_probs_t(delta_t=delta_t)
+        augmented_utilities = tf.concat([zero_column, utilities], axis=-1)
+        log_denom = tf.reduce_logsumexp(augmented_utilities, axis=-1)
 
-        sjt_t = tf.clip_by_value(tf.exp(log_sjt_t), self.eps, 1.0)
-        s0t = tf.clip_by_value(tf.exp(log_s0t), self.eps, 1.0)
+        log_inside_probs = utilities - log_denom[..., None]
+        log_outside_prob = -log_denom
+        return log_inside_probs, log_outside_prob
 
-        return tf.reduce_sum(qjt_t * tf.math.log(sjt_t)) + q0t_t * tf.math.log(s0t)
+    def _log_likelihood_terms(
+        self,
+        qjt: tf.Tensor,
+        q0t: tf.Tensor,
+        delta_cl: tf.Tensor,
+        alpha: tf.Tensor,
+        E_bar: tf.Tensor,
+        njt: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return per-market log-likelihood contributions.
 
-    def _logprior_E_bar_t(self, E_bar_t: tf.Tensor) -> tf.Tensor:
-        """Return the Gaussian log prior for one market-level common shock."""
+        For one-market inputs this returns a scalar.
+        For batched inputs this returns a vector of length ``T``.
+        """
+
+        utilities = self._utilities(
+            delta_cl=delta_cl,
+            alpha=alpha,
+            E_bar=E_bar,
+            njt=njt,
+        )
+        log_inside_probs, log_outside_prob = self._log_choice_probs(utilities=utilities)
+
+        # Stay in log space throughout. There is no need for exp/clip/log roundtrips.
+        inside_term = tf.reduce_sum(qjt * log_inside_probs, axis=-1)
+        outside_term = q0t * log_outside_prob
+        return inside_term + outside_term
+
+    def _alpha_logprior(
+        self,
+        alpha: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return the Gaussian log prior for ``alpha``."""
 
         return (
-            self._lp0_E_bar
-            - 0.5 * tf.square(E_bar_t - self.E_bar_mean) / self.E_bar_var
+            self._alpha_log_normalizer
+            - 0.5 * tf.square(alpha - self.alpha_mean) / self.alpha_var
         )
 
-    def _logprior_njt_t_given_gamma_t(
+    def _E_bar_logprior(
         self,
-        njt_t: tf.Tensor,
-        gamma_t: tf.Tensor,
+        E_bar: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the conditional log prior for one market's product shocks."""
+        """Return Gaussian log prior contributions for ``E_bar``."""
 
-        one_minus_gamma_t = 1.0 - gamma_t
-        var_t = gamma_t * self.T1_sq + one_minus_gamma_t * self.T0_sq
-        log_var_t = gamma_t * self._log_T1_sq + one_minus_gamma_t * self._log_T0_sq
-        lp_n_t = -0.5 * (self._log_two_pi + log_var_t + tf.square(njt_t) / var_t)
-        return tf.reduce_sum(lp_n_t)
+        return (
+            self._E_bar_log_normalizer
+            - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
+        )
+
+    def _njt_logprior_given_gamma(
+        self,
+        njt: tf.Tensor,
+        gamma: tf.Tensor,
+    ) -> tf.Tensor:
+        """Return conditional Gaussian log prior contributions for ``njt``.
+
+        This returns one contribution per market when the inputs are batched and a
+        scalar when the inputs correspond to a single market.
+        """
+
+        variance = gamma * self.T1_sq + (1.0 - gamma) * self.T0_sq
+        log_variance = gamma * self._log_T1_sq + (1.0 - gamma) * self._log_T0_sq
+
+        log_density = -0.5 * (
+            self._log_two_pi + log_variance + tf.square(njt) / variance
+        )
+        return tf.reduce_sum(log_density, axis=-1)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def loglik(
@@ -144,85 +172,62 @@ class ChoiceLearnPosteriorTF:
     ) -> tf.Tensor:
         """Return the total log-likelihood across markets."""
 
-        T = tf.shape(delta_cl)[0]
-
-        def _market_ll(t: tf.Tensor) -> tf.Tensor:
-            return self._market_loglik_impl(
-                qjt_t=qjt[t],
-                q0t_t=q0t[t],
-                delta_cl_t=delta_cl[t],
+        return tf.reduce_sum(
+            self._log_likelihood_terms(
+                qjt=qjt,
+                q0t=q0t,
+                delta_cl=delta_cl,
                 alpha=alpha,
-                E_bar_t=E_bar[t],
-                njt_t=njt[t],
+                E_bar=E_bar,
+                njt=njt,
             )
-
-        ll_vec = tf.map_fn(_market_ll, tf.range(T), fn_output_signature=tf.float64)
-        return tf.reduce_sum(ll_vec)
+        )
 
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def logprior_global(
+    def alpha_logprior(
         self,
         alpha: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the joint prior for the global coefficient."""
+        """Return the Gaussian log prior for ``alpha``."""
 
-        return (
-            self._lp0_alpha - 0.5 * tf.square(alpha - self.alpha_mean) / self.alpha_var
-        )
+        return self._alpha_logprior(alpha=alpha)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def logprior_E_bar_vec(
+    def E_bar_logprior(
         self,
         E_bar: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the vector of marketwise prior terms for E_bar."""
+        """Return marketwise Gaussian log prior terms for ``E_bar``."""
 
-        return (
-            self._lp0_E_bar - 0.5 * tf.square(E_bar - self.E_bar_mean) / self.E_bar_var
-        )
+        return self._E_bar_logprior(E_bar=E_bar)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def logprior_njt_given_gamma_vec(
+    def njt_logprior_given_gamma(
         self,
         njt: tf.Tensor,
         gamma: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the vector of marketwise conditional prior terms for njt."""
+        """Return marketwise conditional Gaussian log prior terms for ``njt``."""
 
-        one_minus_gamma = 1.0 - gamma
-        var = gamma * self.T1_sq + one_minus_gamma * self.T0_sq
-        log_var = gamma * self._log_T1_sq + one_minus_gamma * self._log_T0_sq
-        lp_n = -0.5 * (self._log_two_pi + log_var + tf.square(njt) / var)
-        return tf.reduce_sum(lp_n, axis=1)
-
-    @tf.function(jit_compile=True, reduce_retracing=True)
-    def continuous_prior(
-        self,
-        E_bar: tf.Tensor,
-        njt: tf.Tensor,
-        gamma: tf.Tensor,
-    ) -> tf.Tensor:
-        """Return the total prior contribution from E_bar and njt."""
-
-        return tf.reduce_sum(
-            self.logprior_E_bar_vec(E_bar=E_bar)
-            + self.logprior_njt_given_gamma_vec(njt=njt, gamma=gamma)
-        )
+        return self._njt_logprior_given_gamma(njt=njt, gamma=gamma)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def collapsed_gamma_prior(
         self,
         gamma: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the collapsed Beta-binomial prior contribution for gamma."""
+        """Return the collapsed Beta-binomial prior contribution for ``gamma``.
 
-        s = tf.reduce_sum(gamma, axis=1)
-        J = tf.cast(tf.shape(gamma)[1], tf.float64)
+        This integrates out the market-level inclusion probability ``phi``.
+        """
+
+        active_counts = tf.reduce_sum(gamma, axis=1)
+        num_products = tf.cast(tf.shape(gamma)[1], tf.float64)
 
         log_beta_post = (
-            tf.math.lgamma(self.a_phi + s)
-            + tf.math.lgamma(self.b_phi + (J - s))
-            - tf.math.lgamma(self.a_phi + self.b_phi + J)
+            tf.math.lgamma(self.a_phi + active_counts)
+            + tf.math.lgamma(self.b_phi + (num_products - active_counts))
+            - tf.math.lgamma(self.a_phi + self.b_phi + num_products)
         )
         return tf.reduce_sum(log_beta_post - self._log_beta_ab)
 
@@ -236,7 +241,7 @@ class ChoiceLearnPosteriorTF:
         E_bar: tf.Tensor,
         njt: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the block log posterior for alpha."""
+        """Return the block log posterior for ``alpha``."""
 
         return self.loglik(
             qjt=qjt,
@@ -245,7 +250,7 @@ class ChoiceLearnPosteriorTF:
             alpha=alpha,
             E_bar=E_bar,
             njt=njt,
-        ) + self.logprior_global(alpha=alpha)
+        ) + self._alpha_logprior(alpha=alpha)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def E_bar_block_logpost(
@@ -257,16 +262,16 @@ class ChoiceLearnPosteriorTF:
         E_bar_t: tf.Tensor,
         njt_t: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the one-market block log posterior for E_bar_t."""
+        """Return the one-market block log posterior for ``E_bar_t``."""
 
-        return self._market_loglik_impl(
-            qjt_t=qjt_t,
-            q0t_t=q0t_t,
-            delta_cl_t=delta_cl_t,
+        return self._log_likelihood_terms(
+            qjt=qjt_t,
+            q0t=q0t_t,
+            delta_cl=delta_cl_t,
             alpha=alpha,
-            E_bar_t=E_bar_t,
-            njt_t=njt_t,
-        ) + self._logprior_E_bar_t(E_bar_t=E_bar_t)
+            E_bar=E_bar_t,
+            njt=njt_t,
+        ) + self._E_bar_logprior(E_bar=E_bar_t)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def njt_block_logpost(
@@ -279,16 +284,16 @@ class ChoiceLearnPosteriorTF:
         njt_t: tf.Tensor,
         gamma_t: tf.Tensor,
     ) -> tf.Tensor:
-        """Return the one-market block log posterior for njt_t."""
+        """Return the one-market block log posterior for ``njt_t``."""
 
-        return self._market_loglik_impl(
-            qjt_t=qjt_t,
-            q0t_t=q0t_t,
-            delta_cl_t=delta_cl_t,
+        return self._log_likelihood_terms(
+            qjt=qjt_t,
+            q0t=q0t_t,
+            delta_cl=delta_cl_t,
             alpha=alpha,
-            E_bar_t=E_bar_t,
-            njt_t=njt_t,
-        ) + self._logprior_njt_t_given_gamma_t(njt_t=njt_t, gamma_t=gamma_t)
+            E_bar=E_bar_t,
+            njt=njt_t,
+        ) + self._njt_logprior_given_gamma(njt=njt_t, gamma=gamma_t)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def joint_logpost(
@@ -303,16 +308,19 @@ class ChoiceLearnPosteriorTF:
     ) -> tf.Tensor:
         """Return the full joint log posterior."""
 
-        return (
-            self.loglik(
-                qjt=qjt,
-                q0t=q0t,
-                delta_cl=delta_cl,
-                alpha=alpha,
-                E_bar=E_bar,
-                njt=njt,
-            )
-            + self.logprior_global(alpha=alpha)
-            + self.continuous_prior(E_bar=E_bar, njt=njt, gamma=gamma)
-            + self.collapsed_gamma_prior(gamma=gamma)
+        log_likelihood = self.loglik(
+            qjt=qjt,
+            q0t=q0t,
+            delta_cl=delta_cl,
+            alpha=alpha,
+            E_bar=E_bar,
+            njt=njt,
         )
+
+        # Keep the full posterior decomposition explicit in one place.
+        alpha_prior = self._alpha_logprior(alpha=alpha)
+        E_bar_prior = tf.reduce_sum(self._E_bar_logprior(E_bar=E_bar))
+        njt_prior = tf.reduce_sum(self._njt_logprior_given_gamma(njt=njt, gamma=gamma))
+        gamma_prior = self.collapsed_gamma_prior(gamma=gamma)
+
+        return log_likelihood + alpha_prior + E_bar_prior + njt_prior + gamma_prior

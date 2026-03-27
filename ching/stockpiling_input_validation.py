@@ -1,26 +1,8 @@
-"""Validate external inputs for the Ching stockpiling DGP and chain.
-
-This module now contains two separate validation layers:
-
-1. DGP input validation / normalization
-   - validate_stockpiling_dgp_inputs
-   - normalize_stockpiling_dgp_inputs
-
-2. Refactored chain input validation
-   - observed_data_validate_input
-   - posterior_validate_input
-   - sampler_validate_input
-   - init_state_validate_input
-   - seed_validate_input
-   - run_chain_validate_input
-
-The DGP validators work on NumPy-style external inputs and return canonical numpy
-arrays / Python scalars. The chain validators work on already-normalized
-TensorFlow tensors and config objects.
-"""
+"""Input validation for the Ching-style stockpiling DGP and sampler."""
 
 from __future__ import annotations
 
+from numbers import Integral, Real
 from typing import Any
 
 import numpy as np
@@ -46,46 +28,39 @@ def _require(cond: bool, msg: str) -> None:
         raise ValueError(msg)
 
 
-def _require_type(x, t, msg: str) -> None:
-    """Raise TypeError when a value is not of the required type."""
-    if not isinstance(x, t):
-        raise TypeError(msg)
-
-
 # =============================================================================
-# DGP validation helpers (NumPy / Python boundary)
+# DGP validation and normalization
 # =============================================================================
 
 
-def _as_np(x: Any, name: str, dtype) -> np.ndarray:
-    """Convert an external input to a numpy array of the requested dtype."""
+def _as_np(x: Any, name: str, dtype: Any) -> np.ndarray:
+    """Convert an external input to a NumPy array of the requested dtype."""
     try:
-        arr = np.asarray(x, dtype=dtype)
+        return np.asarray(x, dtype=dtype)
     except Exception as exc:
         raise TypeError(f"{name} could not be converted to {dtype}.") from exc
-    return arr
 
 
 def _require_ndim(x: np.ndarray, ndim: int, name: str) -> None:
-    """Validate numpy array rank."""
+    """Validate the rank of a NumPy array."""
     if x.ndim != ndim:
         raise ValueError(f"{name} must have ndim={ndim}; got shape {x.shape}.")
 
 
 def _require_shape(x: np.ndarray, shape: tuple[int, ...], name: str) -> None:
-    """Validate exact numpy array shape."""
+    """Validate the exact shape of a NumPy array."""
     if x.shape != shape:
         raise ValueError(f"{name} must have shape {shape}; got {x.shape}.")
 
 
 def _require_finite_np(x: np.ndarray, name: str) -> None:
-    """Validate that a numpy array contains only finite entries."""
+    """Validate that a NumPy array contains only finite entries."""
     if not np.isfinite(x).all():
         raise ValueError(f"{name} must be finite (no NaN/inf).")
 
 
-def _require_int_scalar(x: Any, name: str, min_value: int | None = None) -> int:
-    """Validate a Python / NumPy integer scalar."""
+def _validated_int_scalar(x: Any, name: str, min_value: int | None = None) -> int:
+    """Validate and return an integer scalar."""
     if isinstance(x, bool) or not np.isscalar(x):
         raise TypeError(f"{name} must be an integer scalar; got {type(x)}.")
     if isinstance(x, (float, np.floating)) and not float(x).is_integer():
@@ -99,8 +74,13 @@ def _require_int_scalar(x: Any, name: str, min_value: int | None = None) -> int:
     return value
 
 
-def _require_float_scalar(x: Any, name: str, min_value: float | None = None) -> float:
-    """Validate a Python / NumPy real scalar."""
+def _validated_real_scalar(
+    x: Any,
+    name: str,
+    min_value: float | None = None,
+    strict_lower: float | None = None,
+) -> float:
+    """Validate and return a finite real scalar."""
     if isinstance(x, bool) or not np.isscalar(x):
         raise TypeError(f"{name} must be a real scalar; got {type(x)}.")
     try:
@@ -111,99 +91,55 @@ def _require_float_scalar(x: Any, name: str, min_value: float | None = None) -> 
         raise ValueError(f"{name} must be finite; got {value}.")
     if min_value is not None and value < min_value:
         raise ValueError(f"{name} must be >= {min_value}; got {value}.")
+    if strict_lower is not None and value <= strict_lower:
+        raise ValueError(f"{name} must be > {strict_lower}; got {value}.")
     return value
 
 
-def _validate_price_inputs(
+def _normalize_price_inputs(
     P_price_mj: Any,
     price_vals_mj: Any,
     M: int,
     J: int,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Validate price transition matrices and price levels for the DGP."""
-    P = _as_np(P_price_mj, "P_price_mj", dtype=np.float64)
-    pv = _as_np(price_vals_mj, "price_vals_mj", dtype=np.float64)
+    """Validate and normalize price transitions and price levels."""
+    P = _as_np(P_price_mj, "P_price_mj", np.float64)
+    price_vals = _as_np(price_vals_mj, "price_vals_mj", np.float64)
 
     _require_ndim(P, 4, "P_price_mj")
-    _require_ndim(pv, 3, "price_vals_mj")
+    _require_ndim(price_vals, 3, "price_vals_mj")
 
-    if P.shape[0] != M or P.shape[1] != J:
+    if P.shape[:2] != (M, J):
         raise ValueError(
             f"P_price_mj must have leading shape (M,J)=({M},{J}); got {P.shape[:2]}."
         )
-    if pv.shape[0] != M or pv.shape[1] != J:
+    if price_vals.shape[:2] != (M, J):
         raise ValueError(
-            f"price_vals_mj must have leading shape (M,J)=({M},{J}); got {pv.shape[:2]}."
+            "price_vals_mj must have leading shape "
+            f"(M,J)=({M},{J}); got {price_vals.shape[:2]}."
         )
 
     S = int(P.shape[2])
     if P.shape[3] != S:
         raise ValueError(f"P_price_mj must have shape (M,J,S,S); got {P.shape}.")
     if S < 2:
-        raise ValueError(f"P_price_mj must have S>=2; got S={S}.")
-    if pv.shape[2] != S:
+        raise ValueError(f"P_price_mj must have S >= 2; got S={S}.")
+    if price_vals.shape[2] != S:
         raise ValueError(
-            f"price_vals_mj must have shape (M,J,S)=({M},{J},{S}); got {pv.shape}."
+            f"price_vals_mj must have shape (M,J,S)=({M},{J},{S}); got {price_vals.shape}."
         )
 
     _require_finite_np(P, "P_price_mj")
-    _require_finite_np(pv, "price_vals_mj")
+    _require_finite_np(price_vals, "price_vals_mj")
 
     if np.any(P < 0.0):
-        raise ValueError("P_price_mj must be nonnegative.")
-    row_sums = P.sum(axis=-1)
-    if not np.all(np.abs(row_sums - 1.0) <= ATOL_PROB):
+        raise ValueError("P_price_mj must be non-negative.")
+    if not np.all(np.abs(P.sum(axis=-1) - 1.0) <= ATOL_PROB):
         raise ValueError("P_price_mj must be row-stochastic along the last axis.")
-
-    if np.any(pv <= 0.0):
+    if np.any(price_vals <= 0.0):
         raise ValueError("price_vals_mj must be strictly positive.")
 
-    return P, pv, S
-
-
-def validate_stockpiling_dgp_inputs(
-    delta_true: Any,
-    E_bar_true: Any,
-    njt_true: Any,
-    price_vals_mj: Any,
-    P_price_mj: Any,
-    N: int,
-    T: int,
-    I_max: int,
-    waste_cost: float,
-    seed: int,
-    tol: float,
-    max_iter: int,
-) -> None:
-    """Validate inputs to the Phase-3 stockpiling DGP generator."""
-    delta = _as_np(delta_true, "delta_true", dtype=np.float64)
-    _require_ndim(delta, 1, "delta_true")
-    _require_finite_np(delta, "delta_true")
-    J = int(delta.shape[0])
-    if J < 1:
-        raise ValueError(f"delta_true must have length J>=1; got J={J}.")
-
-    E_bar = _as_np(E_bar_true, "E_bar_true", dtype=np.float64)
-    _require_ndim(E_bar, 1, "E_bar_true")
-    _require_finite_np(E_bar, "E_bar_true")
-    M = int(E_bar.shape[0])
-    if M < 1:
-        raise ValueError(f"E_bar_true must have length M>=1; got M={M}.")
-
-    njt = _as_np(njt_true, "njt_true", dtype=np.float64)
-    _require_ndim(njt, 2, "njt_true")
-    _require_shape(njt, (M, J), "njt_true")
-    _require_finite_np(njt, "njt_true")
-
-    _require_int_scalar(N, "N", min_value=1)
-    _require_int_scalar(T, "T", min_value=1)
-    _require_int_scalar(I_max, "I_max", min_value=0)
-    _require_float_scalar(waste_cost, "waste_cost", min_value=0.0)
-    _require_int_scalar(seed, "seed", min_value=0)
-    _require_float_scalar(tol, "tol", min_value=0.0)
-    _require_int_scalar(max_iter, "max_iter", min_value=1)
-
-    _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
+    return P, price_vals, S
 
 
 def normalize_stockpiling_dgp_inputs(
@@ -220,8 +156,74 @@ def normalize_stockpiling_dgp_inputs(
     tol: float,
     max_iter: int,
 ) -> dict[str, Any]:
-    """Validate and normalize DGP inputs into canonical numpy dtypes/shapes."""
-    validate_stockpiling_dgp_inputs(
+    """Validate and normalize DGP inputs into canonical NumPy objects."""
+    delta = _as_np(delta_true, "delta_true", np.float64)
+    _require_ndim(delta, 1, "delta_true")
+    _require_finite_np(delta, "delta_true")
+    J = int(delta.shape[0])
+    _require(J >= 1, f"delta_true must have length J >= 1; got J={J}.")
+
+    E_bar = _as_np(E_bar_true, "E_bar_true", np.float64)
+    _require_ndim(E_bar, 1, "E_bar_true")
+    _require_finite_np(E_bar, "E_bar_true")
+    M = int(E_bar.shape[0])
+    _require(M >= 1, f"E_bar_true must have length M >= 1; got M={M}.")
+
+    njt = _as_np(njt_true, "njt_true", np.float64)
+    _require_ndim(njt, 2, "njt_true")
+    _require_shape(njt, (M, J), "njt_true")
+    _require_finite_np(njt, "njt_true")
+
+    P, price_vals, S = _normalize_price_inputs(
+        P_price_mj=P_price_mj,
+        price_vals_mj=price_vals_mj,
+        M=M,
+        J=J,
+    )
+
+    return {
+        "seed": _validated_int_scalar(seed, "seed", min_value=0),
+        "M": M,
+        "N": _validated_int_scalar(N, "N", min_value=1),
+        "J": J,
+        "T": _validated_int_scalar(T, "T", min_value=1),
+        "I_max": _validated_int_scalar(I_max, "I_max", min_value=0),
+        "delta_true": delta,
+        "E_bar_true": E_bar,
+        "njt_true": njt,
+        "P_price_mj": P,
+        "price_vals_mj": price_vals,
+        "waste_cost": _validated_real_scalar(
+            waste_cost,
+            "waste_cost",
+            min_value=0.0,
+        ),
+        "tol": _validated_real_scalar(
+            tol,
+            "tol",
+            min_value=0.0,
+        ),
+        "max_iter": _validated_int_scalar(max_iter, "max_iter", min_value=1),
+        "S": S,
+    }
+
+
+def validate_stockpiling_dgp_inputs(
+    delta_true: Any,
+    E_bar_true: Any,
+    njt_true: Any,
+    price_vals_mj: Any,
+    P_price_mj: Any,
+    N: int,
+    T: int,
+    I_max: int,
+    waste_cost: float,
+    seed: int,
+    tol: float,
+    max_iter: int,
+) -> None:
+    """Validate inputs to the stockpiling DGP generator."""
+    normalize_stockpiling_dgp_inputs(
         delta_true=delta_true,
         E_bar_true=E_bar_true,
         njt_true=njt_true,
@@ -236,117 +238,67 @@ def normalize_stockpiling_dgp_inputs(
         max_iter=max_iter,
     )
 
-    delta = _as_np(delta_true, "delta_true", dtype=np.float64)
-    E_bar = _as_np(E_bar_true, "E_bar_true", dtype=np.float64)
-    njt = _as_np(njt_true, "njt_true", dtype=np.float64)
-
-    M = int(E_bar.shape[0])
-    J = int(delta.shape[0])
-    P, pv, S = _validate_price_inputs(P_price_mj, price_vals_mj, M=M, J=J)
-
-    return {
-        "seed": int(seed),
-        "M": M,
-        "N": int(N),
-        "J": J,
-        "T": int(T),
-        "I_max": int(I_max),
-        "delta_true": delta,
-        "E_bar_true": E_bar,
-        "njt_true": njt,
-        "P_price_mj": P,
-        "price_vals_mj": pv,
-        "waste_cost": float(waste_cost),
-        "tol": float(tol),
-        "max_iter": int(max_iter),
-        "S": S,
-    }
-
 
 # =============================================================================
-# Refactored chain validation helpers (TensorFlow boundary)
+# Chain input validation
 # =============================================================================
 
 
-def _require_int(x, name: str) -> None:
-    """Validate that a value is a non-bool Python int."""
-    _require_type(x, int, f"{name} must be an int; got {type(x)}.")
-    _require(not isinstance(x, bool), f"{name} must be an int (not bool).")
+def _require_python_int(x: Any, name: str, min_value: int | None = None) -> int:
+    """Validate and return a Python integer."""
+    if isinstance(x, bool) or not isinstance(x, Integral):
+        raise TypeError(f"{name} must be an int; got {type(x)}.")
+    value = int(x)
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}; got {value}.")
+    return value
 
 
-def _require_positive_int(x, name: str) -> None:
-    """Validate that an int is strictly positive."""
-    _require_int(x, name)
-    _require(x > 0, f"{name} must be > 0; got {x}.")
-
-
-def _require_nonnegative_int(x, name: str) -> None:
-    """Validate that an int is non-negative."""
-    _require_int(x, name)
-    _require(x >= 0, f"{name} must be >= 0; got {x}.")
-
-
-def _require_float(x, name: str) -> None:
-    """Validate that a value is a non-bool Python float."""
-    _require_type(x, float, f"{name} must be a float; got {type(x)}.")
-    _require(not isinstance(x, bool), f"{name} must be a float (not bool).")
-
-
-def _require_finite_float(x, name: str) -> None:
-    """Validate that a float is finite."""
-    _require_float(x, name)
-    _require(
-        x == x and x not in (float("inf"), float("-inf")),
-        f"{name} must be finite; got {x}.",
-    )
-
-
-def _require_positive_float(x, name: str) -> None:
-    """Validate that a float is finite and strictly positive."""
-    _require_finite_float(x, name)
-    _require(x > 0.0, f"{name} must be > 0; got {x}.")
-
-
-def _require_nonnegative_float(x, name: str) -> None:
-    """Validate that a float is finite and non-negative."""
-    _require_finite_float(x, name)
-    _require(x >= 0.0, f"{name} must be >= 0; got {x}.")
-
-
-def _require_open_unit_float(x, name: str) -> None:
-    """Validate that a float lies in the open unit interval."""
-    _require_finite_float(x, name)
-    _require(0.0 < x < 1.0, f"{name} must satisfy 0 < {name} < 1; got {x}.")
-
-
-def _require_bool(x, name: str) -> None:
-    """Validate that a value is a Python bool."""
-    _require_type(x, bool, f"{name} must be a bool; got {type(x)}.")
+def _require_python_float(
+    x: Any,
+    name: str,
+    min_value: float | None = None,
+    open_unit: bool = False,
+) -> float:
+    """Validate and return a finite Python real scalar."""
+    if isinstance(x, bool) or not isinstance(x, Real):
+        raise TypeError(f"{name} must be a real scalar; got {type(x)}.")
+    value = float(x)
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite; got {value}.")
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}; got {value}.")
+    if open_unit and not (0.0 < value < 1.0):
+        raise ValueError(f"{name} must satisfy 0 < {name} < 1; got {value}.")
+    return value
 
 
 def _require_tensor_rank(x: tf.Tensor, rank: int, name: str) -> None:
-    """Validate the rank of a tensor input."""
+    """Validate the rank of a tensor."""
     _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
     _require(
         x.shape.rank == rank,
-        f"{name} must have rank {rank}; got rank {x.shape.rank}.",
+        f"{name} must have rank {rank}; got {x.shape.rank}.",
     )
 
 
 def _require_float64_tensor(x: tf.Tensor, name: str) -> None:
-    """Validate that an input is a tf.float64 tensor."""
+    """Validate that a tensor has dtype tf.float64."""
     _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
-    _require(x.dtype == tf.float64, f"{name} must be tf.float64; got {x.dtype}.")
+    _require(
+        x.dtype == tf.float64,
+        f"{name} must have dtype tf.float64; got {x.dtype}.",
+    )
 
 
 def _require_integer_tensor(x: tf.Tensor, name: str) -> None:
-    """Validate that an input is an integer tensor."""
+    """Validate that a tensor has integer dtype."""
     _require(tf.is_tensor(x), f"{name} must be a tf.Tensor.")
     _require(x.dtype.is_integer, f"{name} must have integer dtype; got {x.dtype}.")
 
 
 def _require_scalar_float64_tensor(x: tf.Tensor, name: str) -> None:
-    """Validate that an input is a scalar tf.float64 tensor."""
+    """Validate a scalar tf.float64 tensor."""
     _require_float64_tensor(x, name)
     _require_tensor_rank(x, 0, name)
 
@@ -356,10 +308,6 @@ def _require_vector_float64_tensor(x: tf.Tensor, length: int, name: str) -> None
     _require_float64_tensor(x, name)
     _require_tensor_rank(x, 1, name)
     _require(
-        x.shape[0] is not None,
-        f"{name} must have static length {length}; got shape {x.shape}.",
-    )
-    _require(
         x.shape[0] == length,
         f"{name} must have shape ({length},); got {x.shape}.",
     )
@@ -367,34 +315,43 @@ def _require_vector_float64_tensor(x: tf.Tensor, length: int, name: str) -> None
 
 def _require_all_finite(x: tf.Tensor, name: str) -> None:
     """Validate that all tensor entries are finite."""
-    ok = bool(tf.reduce_all(tf.math.is_finite(x)).numpy())
-    _require(ok, f"{name} must be finite (no NaN/inf).")
+    _require(
+        bool(tf.reduce_all(tf.math.is_finite(x)).numpy()),
+        f"{name} must be finite (no NaN/inf).",
+    )
 
 
 def _require_all_nonnegative(x: tf.Tensor, name: str) -> None:
     """Validate that all tensor entries are non-negative."""
-    ok = bool(tf.reduce_all(x >= tf.zeros((), dtype=x.dtype)).numpy())
-    _require(ok, f"{name} must be non-negative.")
+    _require(
+        bool(tf.reduce_all(x >= tf.zeros((), dtype=x.dtype)).numpy()),
+        f"{name} must be non-negative.",
+    )
 
 
 def _require_all_positive(x: tf.Tensor, name: str) -> None:
     """Validate that all tensor entries are strictly positive."""
-    ok = bool(tf.reduce_all(x > tf.zeros((), dtype=x.dtype)).numpy())
-    _require(ok, f"{name} must be strictly positive.")
+    _require(
+        bool(tf.reduce_all(x > tf.zeros((), dtype=x.dtype)).numpy()),
+        f"{name} must be strictly positive.",
+    )
 
 
 def _require_all_binary(x: tf.Tensor, name: str) -> None:
-    """Validate that an integer tensor contains only 0/1 entries."""
-    ok = bool(tf.reduce_all(tf.logical_or(tf.equal(x, 0), tf.equal(x, 1))).numpy())
-    _require(ok, f"{name} must contain only 0/1 values.")
+    """Validate that an integer tensor contains only 0 and 1."""
+    ok = tf.reduce_all(tf.logical_or(tf.equal(x, 0), tf.equal(x, 1)))
+    _require(bool(ok.numpy()), f"{name} must contain only 0/1 values.")
 
 
 def _require_all_in_open_unit(x: tf.Tensor, name: str) -> None:
     """Validate that all tensor entries lie in the open unit interval."""
     zero = tf.zeros((), dtype=x.dtype)
     one = tf.ones((), dtype=x.dtype)
-    ok = bool(tf.reduce_all(tf.logical_and(x > zero, x < one)).numpy())
-    _require(ok, f"{name} must lie in the open unit interval entrywise.")
+    ok = tf.reduce_all(tf.logical_and(x > zero, x < one))
+    _require(
+        bool(ok.numpy()),
+        f"{name} must lie in the open unit interval entrywise.",
+    )
 
 
 def _require_prob_vector(x: tf.Tensor, name: str) -> None:
@@ -403,25 +360,25 @@ def _require_prob_vector(x: tf.Tensor, name: str) -> None:
     _require_tensor_rank(x, 1, name)
     _require(
         x.shape[0] is not None and x.shape[0] > 0,
-        f"{name} must have static length > 0; got shape {x.shape}.",
+        f"{name} must have static length > 0; got {x.shape}.",
     )
     _require_all_finite(x, name)
     _require_all_nonnegative(x, name)
     total = float(tf.reduce_sum(x).numpy())
-    _require(
-        abs(total - 1.0) <= ATOL_PROB,
-        f"{name} must sum to 1; got sum={total}.",
-    )
+    _require(abs(total - 1.0) <= ATOL_PROB, f"{name} must sum to 1; got sum={total}.")
 
 
 def _require_row_stochastic_matrix(x: tf.Tensor, name: str) -> None:
-    """Validate that the last axis forms row-stochastic probabilities."""
+    """Validate that the last axis is row-stochastic."""
     _require_float64_tensor(x, name)
     _require_all_finite(x, name)
     _require_all_nonnegative(x, name)
     row_sums = tf.reduce_sum(x, axis=-1)
-    ok = bool(tf.reduce_all(tf.abs(row_sums - 1.0) <= ATOL_PROB).numpy())
-    _require(ok, f"{name} must be row-stochastic along the last axis.")
+    ok = tf.reduce_all(tf.abs(row_sums - 1.0) <= ATOL_PROB)
+    _require(
+        bool(ok.numpy()),
+        f"{name} must be row-stochastic along the last axis.",
+    )
 
 
 def _require_seed_input(seed: tf.Tensor, name: str) -> None:
@@ -430,29 +387,25 @@ def _require_seed_input(seed: tf.Tensor, name: str) -> None:
     _require(
         seed.dtype.is_integer, f"{name} must have integer dtype; got {seed.dtype}."
     )
-    _require(
-        seed.shape.rank == 1, f"{name} must have rank 1; got rank {seed.shape.rank}."
-    )
+    _require(seed.shape.rank == 1, f"{name} must have rank 1; got {seed.shape.rank}.")
     _require(seed.shape[0] == 2, f"{name} must have shape (2,); got {seed.shape}.")
-    ok = bool(tf.reduce_all(seed >= tf.constant(0, dtype=seed.dtype)).numpy())
-    _require(ok, f"{name} must be non-negative.")
+    ok = tf.reduce_all(seed >= tf.zeros((2,), dtype=seed.dtype))
+    _require(bool(ok.numpy()), f"{name} must be non-negative.")
 
 
-def _require_inventory_maps(inventory_maps, I: int) -> None:
+def _require_inventory_maps(inventory_maps: Any, I: int) -> None:
     """Validate the precomputed inventory maps tuple."""
-    _require_type(
-        inventory_maps,
-        tuple,
-        f"inventory_maps must be a tuple; got {type(inventory_maps)}.",
-    )
+    if not isinstance(inventory_maps, tuple):
+        raise TypeError(f"inventory_maps must be a tuple; got {type(inventory_maps)}.")
     _require(len(inventory_maps) == 5, "inventory_maps must contain 5 tensors.")
 
-    I_vals, stockout_mask, at_cap_mask, idx_down, idx_up = inventory_maps
+    i_vals, stockout_mask, at_cap_mask, idx_down, idx_up = inventory_maps
 
-    _require_integer_tensor(I_vals, "inventory_maps[0] (I_vals)")
-    _require_tensor_rank(I_vals, 1, "inventory_maps[0] (I_vals)")
+    _require_integer_tensor(i_vals, "inventory_maps[0] (i_vals)")
+    _require_tensor_rank(i_vals, 1, "inventory_maps[0] (i_vals)")
     _require(
-        I_vals.shape[0] == I, f"I_vals must have shape ({I},); got {I_vals.shape}."
+        i_vals.shape[0] == I,
+        f"i_vals must have shape ({I},); got {i_vals.shape}.",
     )
 
     _require_float64_tensor(stockout_mask, "inventory_maps[1] (stockout_mask)")
@@ -479,7 +432,8 @@ def _require_inventory_maps(inventory_maps, I: int) -> None:
     _require_integer_tensor(idx_up, "inventory_maps[4] (idx_up)")
     _require_tensor_rank(idx_up, 1, "inventory_maps[4] (idx_up)")
     _require(
-        idx_up.shape[0] == I, f"idx_up must have shape ({I},); got {idx_up.shape}."
+        idx_up.shape[0] == I,
+        f"idx_up must have shape ({I},); got {idx_up.shape}.",
     )
 
 
@@ -491,10 +445,10 @@ def observed_data_validate_input(
     price_vals_mj: tf.Tensor,
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
-    inventory_maps,
+    inventory_maps: Any,
     pi_I0: tf.Tensor,
 ) -> None:
-    """Validate the observed data and fixed tensors for the stockpiling chain."""
+    """Validate the observed panel and fixed tensors for the sampler."""
     _require_integer_tensor(a_mnjt, "a_mnjt")
     _require_integer_tensor(s_mjt, "s_mjt")
     _require_float64_tensor(u_mj, "u_mj")
@@ -539,7 +493,7 @@ def observed_data_validate_input(
     M, N, J, T = a_mnjt.shape
     M_s, J_s, T_s = s_mjt.shape
     M_u, J_u = u_mj.shape
-    M_p, J_p, S_p, S_p2 = P_price_mj.shape
+    M_p, J_p, S, S2 = P_price_mj.shape
     M_v, J_v, S_v = price_vals_mj.shape
     M_l, N_l = lambda_mn.shape
     I = pi_I0.shape[0]
@@ -549,30 +503,30 @@ def observed_data_validate_input(
         f"a_mnjt must have positive dimensions; got {a_mnjt.shape}.",
     )
     _require(
-        M_s == M and J_s == J and T_s == T,
+        (M_s, J_s, T_s) == (M, J, T),
         f"s_mjt must have shape (M,J,T)=({M},{J},{T}); got {s_mjt.shape}.",
     )
     _require(
-        M_u == M and J_u == J,
+        (M_u, J_u) == (M, J),
         f"u_mj must have shape (M,J)=({M},{J}); got {u_mj.shape}.",
     )
     _require(
-        M_p == M and J_p == J,
+        (M_p, J_p) == (M, J),
         f"P_price_mj must have leading shape (M,J)=({M},{J}); got {P_price_mj.shape[:2]}.",
     )
+    _require(S == S2, f"P_price_mj must have shape (M,J,S,S); got {P_price_mj.shape}.")
+    _require(S >= 2, f"P_price_mj must have S >= 2; got S={S}.")
     _require(
-        S_p == S_p2, f"P_price_mj must have shape (M,J,S,S); got {P_price_mj.shape}."
-    )
-    _require(S_p >= 2, f"P_price_mj must have S >= 2; got S={S_p}.")
-    _require(
-        M_v == M and J_v == J and S_v == S_p,
-        f"price_vals_mj must have shape (M,J,S)=({M},{J},{S_p}); got {price_vals_mj.shape}.",
+        (M_v, J_v, S_v) == (M, J, S),
+        f"price_vals_mj must have shape (M,J,S)=({M},{J},{S}); got {price_vals_mj.shape}.",
     )
     _require(
-        M_l == M and N_l == N,
+        (M_l, N_l) == (M, N),
         f"lambda_mn must have shape (M,N)=({M},{N}); got {lambda_mn.shape}.",
     )
-    _require(I > 0, f"pi_I0 must have length > 0; got length {I}.")
+    _require(
+        I is not None and I > 0, f"pi_I0 must have length > 0; got shape {pi_I0.shape}."
+    )
 
     _require_inventory_maps(inventory_maps, I)
 
@@ -581,26 +535,24 @@ def observed_data_validate_input(
     _require_all_finite(P_price_mj, "P_price_mj")
     _require_all_finite(price_vals_mj, "price_vals_mj")
     _require_all_finite(lambda_mn, "lambda_mn")
-    _require_all_finite(pi_I0, "pi_I0")
     _require_all_finite(waste_cost, "waste_cost")
+    _require_all_finite(pi_I0, "pi_I0")
 
     _require_row_stochastic_matrix(P_price_mj, "P_price_mj")
     _require_all_positive(price_vals_mj, "price_vals_mj")
     _require_all_in_open_unit(lambda_mn, "lambda_mn")
 
-    s_ok = bool(
-        tf.reduce_all(
-            tf.logical_and(
-                s_mjt >= tf.constant(0, dtype=s_mjt.dtype),
-                s_mjt < tf.constant(S_p, dtype=s_mjt.dtype),
-            )
-        ).numpy()
+    s_ok = tf.reduce_all(
+        tf.logical_and(
+            s_mjt >= tf.zeros((), dtype=s_mjt.dtype),
+            s_mjt < tf.constant(S, dtype=s_mjt.dtype),
+        )
     )
-    _require(s_ok, f"s_mjt must take integer values in [0, {S_p - 1}].")
+    _require(bool(s_ok.numpy()), f"s_mjt must take integer values in [0, {S - 1}].")
 
 
-def posterior_validate_input(posterior_config) -> None:
-    """Validate the posterior config required to construct StockpilingPosteriorTF."""
+def posterior_validate_input(posterior_config: Any) -> None:
+    """Validate the posterior configuration."""
     required = [
         "tol",
         "max_iter",
@@ -610,45 +562,60 @@ def posterior_validate_input(posterior_config) -> None:
         "sigma_z_v",
         "sigma_z_fc",
         "sigma_z_u_scale",
-        "fix_u_scale",
-        "fixed_z_u_scale",
     ]
     missing = [name for name in required if not hasattr(posterior_config, name)]
     _require(not missing, "posterior_config missing fields: " + ", ".join(missing))
 
-    _require_nonnegative_float(posterior_config.tol, "posterior_config.tol")
-    _require_positive_int(posterior_config.max_iter, "posterior_config.max_iter")
+    _require_python_float(
+        posterior_config.tol,
+        "posterior_config.tol",
+        min_value=0.0,
+    )
+    _require_python_int(
+        posterior_config.max_iter,
+        "posterior_config.max_iter",
+        min_value=1,
+    )
 
-    _require_positive_float(posterior_config.eps, "posterior_config.eps")
+    eps = _require_python_float(
+        posterior_config.eps,
+        "posterior_config.eps",
+        min_value=0.0,
+    )
     _require(
-        posterior_config.eps < 0.5,
-        f"posterior_config.eps must satisfy 0 < eps < 0.5; got {posterior_config.eps}.",
+        0.0 < eps < 0.5,
+        f"posterior_config.eps must satisfy 0 < eps < 0.5; got {eps}.",
     )
 
-    _require_positive_float(
-        posterior_config.sigma_z_beta, "posterior_config.sigma_z_beta"
+    _require_python_float(
+        posterior_config.sigma_z_beta,
+        "posterior_config.sigma_z_beta",
+        min_value=0.0,
     )
-    _require_positive_float(
-        posterior_config.sigma_z_alpha, "posterior_config.sigma_z_alpha"
+    _require_python_float(
+        posterior_config.sigma_z_alpha,
+        "posterior_config.sigma_z_alpha",
+        min_value=0.0,
     )
-    _require_positive_float(posterior_config.sigma_z_v, "posterior_config.sigma_z_v")
-    _require_positive_float(posterior_config.sigma_z_fc, "posterior_config.sigma_z_fc")
-    _require_positive_float(
-        posterior_config.sigma_z_u_scale, "posterior_config.sigma_z_u_scale"
+    _require_python_float(
+        posterior_config.sigma_z_v,
+        "posterior_config.sigma_z_v",
+        min_value=0.0,
+    )
+    _require_python_float(
+        posterior_config.sigma_z_fc,
+        "posterior_config.sigma_z_fc",
+        min_value=0.0,
+    )
+    _require_python_float(
+        posterior_config.sigma_z_u_scale,
+        "posterior_config.sigma_z_u_scale",
+        min_value=0.0,
     )
 
-    _require_bool(posterior_config.fix_u_scale, "posterior_config.fix_u_scale")
-    _require_finite_float(
-        posterior_config.fixed_z_u_scale, "posterior_config.fixed_z_u_scale"
-    )
 
-
-def sampler_validate_input(
-    sampler_config,
-    M: int,
-    J: int,
-) -> None:
-    """Validate the compiled-chain and tuning config for the stockpiling sampler."""
+def sampler_validate_input(sampler_config: Any, M: int, J: int) -> None:
+    """Validate the sampler configuration."""
     required = [
         "num_results",
         "num_burnin_steps",
@@ -658,46 +625,24 @@ def sampler_validate_input(
         "k_v",
         "k_fc",
         "k_u_scale",
-        "pilot_num_steps",
-        "target_accept_low",
-        "target_accept_high",
-        "grow_factor",
-        "shrink_factor",
-        "max_tuning_rounds",
     ]
     missing = [name for name in required if not hasattr(sampler_config, name)]
     _require(not missing, "sampler_config missing fields: " + ", ".join(missing))
 
-    _require_positive_int(sampler_config.num_results, "sampler_config.num_results")
-    _require_nonnegative_int(
-        sampler_config.num_burnin_steps, "sampler_config.num_burnin_steps"
+    _require_python_int(
+        sampler_config.num_results,
+        "sampler_config.num_results",
+        min_value=1,
     )
-    _require_positive_int(sampler_config.chunk_size, "sampler_config.chunk_size")
-    _require_positive_int(
-        sampler_config.pilot_num_steps, "sampler_config.pilot_num_steps"
+    _require_python_int(
+        sampler_config.num_burnin_steps,
+        "sampler_config.num_burnin_steps",
+        min_value=0,
     )
-    _require_positive_int(
-        sampler_config.max_tuning_rounds, "sampler_config.max_tuning_rounds"
-    )
-
-    _require_open_unit_float(
-        sampler_config.target_accept_low, "sampler_config.target_accept_low"
-    )
-    _require_open_unit_float(
-        sampler_config.target_accept_high, "sampler_config.target_accept_high"
-    )
-    _require(
-        sampler_config.target_accept_low < sampler_config.target_accept_high,
-        "sampler_config.target_accept_low must be < sampler_config.target_accept_high.",
-    )
-
-    _require_positive_float(sampler_config.grow_factor, "sampler_config.grow_factor")
-    _require(
-        sampler_config.grow_factor > 1.0,
-        f"sampler_config.grow_factor must be > 1; got {sampler_config.grow_factor}.",
-    )
-    _require_open_unit_float(
-        sampler_config.shrink_factor, "sampler_config.shrink_factor"
+    _require_python_int(
+        sampler_config.chunk_size,
+        "sampler_config.chunk_size",
+        min_value=1,
     )
 
     _require_scalar_float64_tensor(sampler_config.k_beta, "sampler_config.k_beta")
@@ -717,10 +662,12 @@ def sampler_validate_input(
     _require_all_positive(sampler_config.k_fc, "sampler_config.k_fc")
 
     _require_vector_float64_tensor(
-        sampler_config.k_u_scale, M, "sampler_config.k_u_scale"
+        sampler_config.k_u_scale,
+        M,
+        "sampler_config.k_u_scale",
     )
     _require_all_finite(sampler_config.k_u_scale, "sampler_config.k_u_scale")
-    _require_all_positive(sampler_config.k_u_scale, "sampler_config.k_u_scale")
+    _require_all_nonnegative(sampler_config.k_u_scale, "sampler_config.k_u_scale")
 
 
 def init_state_validate_input(
@@ -732,7 +679,7 @@ def init_state_validate_input(
     M: int,
     J: int,
 ) -> None:
-    """Validate the external unconstrained initial chain state."""
+    """Validate the external unconstrained initial state."""
     _require_scalar_float64_tensor(z_beta, "z_beta")
     _require_all_finite(z_beta, "z_beta")
 
@@ -750,7 +697,7 @@ def init_state_validate_input(
 
 
 def seed_validate_input(seed: tf.Tensor) -> None:
-    """Validate the external stateless seed for the stockpiling chain."""
+    """Validate the stateless RNG seed for the sampler."""
     _require_seed_input(seed, "seed")
 
 
@@ -762,10 +709,10 @@ def run_chain_validate_input(
     price_vals_mj: tf.Tensor,
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
-    inventory_maps,
+    inventory_maps: Any,
     pi_I0: tf.Tensor,
-    posterior_config,
-    sampler_config,
+    posterior_config: Any,
+    sampler_config: Any,
     z_beta: tf.Tensor,
     z_alpha: tf.Tensor,
     z_v: tf.Tensor,
@@ -773,7 +720,7 @@ def run_chain_validate_input(
     z_u_scale: tf.Tensor,
     seed: tf.Tensor,
 ) -> None:
-    """Validate all external inputs required to run the stockpiling chain."""
+    """Validate all external inputs required to run the sampler."""
     observed_data_validate_input(
         a_mnjt=a_mnjt,
         s_mjt=s_mjt,
