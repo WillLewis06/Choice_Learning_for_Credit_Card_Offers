@@ -102,7 +102,7 @@ def main() -> None:
     beta_p_true, beta_w_true, sigma_true = -1.0, 0.5, 1.5
     seed = 123
     chain_seed = tf.constant([seed, 0], dtype=tf.int32)
-    n_draws = 200
+    n_draws = 500
 
     # Configure the BLP benchmark used for both the strong-IV and weak-IV comparisons.
     blp_config_raw = {
@@ -143,7 +143,7 @@ def main() -> None:
 
     # Set the chain length, proposal scales, and tuning controls for the shrinkage sampler.
     shrinkage_config = LuShrinkageConfig(
-        num_results=5000,
+        num_results=50000,
         num_burnin_steps=0,
         chunk_size=1000,
         k_beta=0.05,
@@ -151,9 +151,9 @@ def main() -> None:
         k_E_bar=0.05,
         k_njt=0.02,
         pilot_length=100,
-        target_low=0.2,
-        target_high=0.4,
-        max_rounds=8,
+        target_low=0.3,
+        target_high=0.5,
+        max_rounds=20,
         factor=1.5,
     )
 

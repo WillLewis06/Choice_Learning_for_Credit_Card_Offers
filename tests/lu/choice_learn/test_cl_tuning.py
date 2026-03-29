@@ -1,238 +1,158 @@
-"""
-Unit tests for lu.choice_learn.cl_tuning.
+"""Unit tests for lu.choice_learn.cl_tuning.
 
-Constraints for this test module
-- No pytest fixture injection: all tests are plain functions with no fixture args.
-- Shared assertion helpers are imported from `lu_conftest` (a normal Python module).
-- Patching uses unittest.mock.patch (not the pytest monkeypatch fixture).
+This file targets the refactored tuning API:
+- _tune_block(...)
+- tune_shrinkage(...)
 
-Notes on current implementation
-- tune_k() does not perform argument validation (validation belongs upstream).
-- tune_shrinkage() expects a "tune view" object with specific attributes
-  (constructed in cl_shrinkage.fit via SimpleNamespace).
+The old estimator-style tune view, tune_k(...), and update_* patching workflow
+are no longer part of the current design and are not tested here.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-import pytest
 import tensorflow as tf
 
 import lu.choice_learn.cl_tuning as cl_tuning
-from lu_conftest import assert_all_finite_tf
+from lu.choice_learn.cl_posterior import (
+    ChoiceLearnPosteriorConfig,
+    ChoiceLearnPosteriorTF,
+)
+from lu.choice_learn.cl_shrinkage import (
+    ChoiceLearnShrinkageConfig,
+    ChoiceLearnShrinkageState,
+)
 
 DTYPE = tf.float64
+SEED_DTYPE = tf.int32
+ATOL = 1e-12
 
 
-# -----------------------------------------------------------------------------
-# Helpers (test-only)
-# -----------------------------------------------------------------------------
-def _tiny_cl_data(seed: int = 0) -> dict:
-    """
-    Tiny (T=2, J=3) choice-learn panel for tuning tests.
-
-    Returns tf.float64 tensors (the updated codebase rejects NumPy arrays).
-    Keys
-    - T, J: int
-    - delta_cl: (T,J) tf.float64
-    - qjt: (T,J) tf.float64
-    - q0t: (T,) tf.float64
-    """
-    rng = np.random.default_rng(seed)
-    T, J = 2, 3
-
-    delta_cl = tf.constant(rng.normal(size=(T, J)).astype(np.float64), dtype=DTYPE)
-    qjt = tf.constant(
-        rng.integers(low=1, high=15, size=(T, J)).astype(np.float64), dtype=DTYPE
-    )
-    q0t = tf.constant(
-        rng.integers(low=5, high=25, size=(T,)).astype(np.float64), dtype=DTYPE
-    )
-
-    return {"T": T, "J": J, "delta_cl": delta_cl, "qjt": qjt, "q0t": q0t}
+def _tf(x) -> tf.Tensor:
+    """Create a tf.float64 constant."""
+    return tf.constant(x, dtype=DTYPE)
 
 
-def _build_tune_view(tiny_data: dict) -> SimpleNamespace:
-    """
-    Build the minimal object required by cl_tuning.tune_shrinkage().
-    Mirrors the SimpleNamespace constructed inside cl_shrinkage.fit().
-    """
-    T = int(tiny_data["T"])
-    J = int(tiny_data["J"])
-
-    # Latent state: must be tf.Variable because tune_shrinkage snapshots .read_value().
-    alpha = tf.Variable(tf.constant(1.0, dtype=DTYPE), trainable=False)
-    E_bar = tf.Variable(tf.zeros([T], dtype=DTYPE), trainable=False)
-    njt = tf.Variable(tf.zeros([T, J], dtype=DTYPE), trainable=False)
-    gamma = tf.Variable(tf.zeros([T, J], dtype=DTYPE), trainable=False)
-    phi = tf.Variable(tf.fill([T], tf.constant(0.5, dtype=DTYPE)), trainable=False)
-
-    view = SimpleNamespace(
-        # Tuning hyperparameters (filled by _set_tuning_params)
-        pilot_length=1,
-        ridge=tf.constant(1e-6, dtype=DTYPE),
-        target_low=0.3,
-        target_high=0.5,
-        max_rounds=1,
-        factor_rw=1.1,
-        factor_tmh=1.5,
-        k_alpha0=tf.constant(0.2, dtype=DTYPE),
-        k_E_bar0=tf.constant(0.2, dtype=DTYPE),
-        k_njt0=tf.constant(0.2, dtype=DTYPE),
-        tune_seed=0,
-        # Required sizes
-        T=T,
-        J=J,
-        # Data
-        qjt=tiny_data["qjt"],
-        q0t=tiny_data["q0t"],
-        delta_cl=tiny_data["delta_cl"],
-        # State
-        alpha=alpha,
-        E_bar=E_bar,
-        njt=njt,
-        gamma=gamma,
-        phi=phi,
-        # Posterior helper (not used in these tests because we patch update_*)
-        posterior=object(),
-    )
-    return view
-
-
-def _set_tuning_params(
-    view: SimpleNamespace,
-    pilot_length: int = 1,
-    ridge: float = 1e-6,
-    target_low: float = 0.3,
-    target_high: float = 0.5,
-    max_rounds: int = 1,
-    factor_rw: float = 1.1,
-    factor_tmh: float = 1.5,
-    k_alpha0: float = 0.2,
-    k_E_bar0: float = 0.2,
-    k_njt0: float = 0.2,
-    tune_seed: int = 0,
-) -> None:
-    view.pilot_length = int(pilot_length)
-    view.ridge = tf.constant(float(ridge), dtype=DTYPE)
-    view.target_low = float(target_low)
-    view.target_high = float(target_high)
-    view.max_rounds = int(max_rounds)
-    view.factor_rw = float(factor_rw)
-    view.factor_tmh = float(factor_tmh)
-
-    view.k_alpha0 = tf.constant(float(k_alpha0), dtype=DTYPE)
-    view.k_E_bar0 = tf.constant(float(k_E_bar0), dtype=DTYPE)
-    view.k_njt0 = tf.constant(float(k_njt0), dtype=DTYPE)
-    view.tune_seed = int(tune_seed)
+def _seed(a: int, b: int) -> tf.Tensor:
+    """Create a stateless seed tensor."""
+    return tf.constant([a, b], dtype=SEED_DTYPE)
 
 
 def _assert_scalar_positive(x: tf.Tensor) -> None:
+    """Assert that x is a finite positive scalar tensor."""
     x_t = tf.convert_to_tensor(x, dtype=DTYPE)
-    assert x_t.shape == ()
-    assert_all_finite_tf(x_t)
-    assert float(x_t.numpy()) > 0.0
+    if x_t.shape != ():
+        raise AssertionError(f"Expected scalar tensor, got shape {x_t.shape}.")
+    x_val = float(x_t.numpy())
+    if not np.isfinite(x_val):
+        raise AssertionError("Expected finite scalar.")
+    if not (x_val > 0.0):
+        raise AssertionError(f"Expected positive scalar, got {x_val}.")
 
 
-def _snapshot_state(view: SimpleNamespace) -> dict:
+def _make_posterior_config() -> ChoiceLearnPosteriorConfig:
+    """Build a small posterior config for tuning tests."""
+    return ChoiceLearnPosteriorConfig(
+        alpha_mean=1.0,
+        alpha_var=1.0,
+        E_bar_mean=0.0,
+        E_bar_var=1.0,
+        T0_sq=1e-2,
+        T1_sq=1.0,
+        a_phi=1.0,
+        b_phi=1.0,
+    )
+
+
+def _make_posterior() -> ChoiceLearnPosteriorTF:
+    """Create the refactored posterior object."""
+    return ChoiceLearnPosteriorTF(config=_make_posterior_config())
+
+
+def _make_problem() -> dict:
+    """Canonical tiny panel used in tuning tests."""
+    T, J = 2, 3
+
+    delta_cl = _tf([[0.2, -0.1, 0.05], [0.0, 0.3, -0.2]])
+    qjt = _tf([[10.0, 5.0, 2.0], [3.0, 7.0, 1.0]])
+    q0t = _tf([20.0, 15.0])
+
+    initial_state = ChoiceLearnShrinkageState(
+        alpha=_tf(1.2),
+        E_bar=_tf([0.05, -0.10]),
+        njt=_tf([[0.00, 0.20, -0.10], [0.05, -0.02, 0.00]]),
+        gamma=_tf([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+    )
+
     return {
-        "alpha": float(view.alpha.read_value().numpy()),
-        "E_bar": view.E_bar.read_value().numpy().copy(),
-        "njt": view.njt.read_value().numpy().copy(),
-        "gamma": view.gamma.read_value().numpy().copy(),
-        "phi": view.phi.read_value().numpy().copy(),
+        "T": T,
+        "J": J,
+        "delta_cl": delta_cl,
+        "qjt": qjt,
+        "q0t": q0t,
+        "initial_state": initial_state,
     }
 
 
-def _assert_state_unchanged(before: dict, after: dict) -> None:
-    assert before["alpha"] == after["alpha"]
-    assert np.array_equal(before["E_bar"], after["E_bar"])
-    assert np.array_equal(before["njt"], after["njt"])
-    assert np.array_equal(before["gamma"], after["gamma"])
-    assert np.array_equal(before["phi"], after["phi"])
+def _make_shrinkage_config(
+    k_alpha: float = 0.10,
+    k_E_bar: float = 0.10,
+    k_njt: float = 0.10,
+) -> ChoiceLearnShrinkageConfig:
+    """Build a small sampler config for tuning tests."""
+    return ChoiceLearnShrinkageConfig(
+        num_results=5,
+        num_burnin_steps=3,
+        chunk_size=4,
+        k_alpha=float(k_alpha),
+        k_E_bar=float(k_E_bar),
+        k_njt=float(k_njt),
+        pilot_length=2,
+        target_low=0.30,
+        target_high=0.50,
+        max_rounds=3,
+        factor=1.25,
+    )
 
 
-@contextmanager
-def _patched_updates(accept_all: bool):
-    """
-    Patch cl_tuning.update_* functions so that:
-    - proposals do not change the pilot state (identity updates)
-    - acceptance is deterministic (all accept or all reject)
-    """
-    accept_bool = tf.constant(bool(accept_all), dtype=tf.bool)
+def _snapshot_state(state: ChoiceLearnShrinkageState) -> dict[str, object]:
+    """Take a NumPy snapshot of the immutable chain state."""
+    return {
+        "alpha": float(state.alpha.numpy()),
+        "E_bar": state.E_bar.numpy().copy(),
+        "njt": state.njt.numpy().copy(),
+        "gamma": state.gamma.numpy().copy(),
+    }
 
-    def stub_update_alpha(
-        posterior,
-        rng: tf.random.Generator,
-        qjt: tf.Tensor,
-        q0t: tf.Tensor,
-        delta_cl: tf.Tensor,
-        alpha: tf.Tensor,
-        E_bar: tf.Tensor,
-        njt: tf.Tensor,
-        k_alpha: tf.Tensor,
-    ):
-        return alpha, accept_bool
 
-    def stub_update_E_bar(
-        posterior,
-        rng: tf.random.Generator,
-        qjt: tf.Tensor,
-        q0t: tf.Tensor,
-        delta_cl: tf.Tensor,
-        alpha: tf.Tensor,
-        E_bar: tf.Tensor,
-        njt: tf.Tensor,
-        gamma: tf.Tensor,
-        phi: tf.Tensor,
-        k_E_bar: tf.Tensor,
-    ):
-        accepted_vec = tf.fill(tf.shape(E_bar), accept_bool)
-        return E_bar, accepted_vec
-
-    def stub_update_njt(
-        posterior,
-        rng: tf.random.Generator,
-        qjt: tf.Tensor,
-        q0t: tf.Tensor,
-        delta_cl: tf.Tensor,
-        alpha: tf.Tensor,
-        E_bar: tf.Tensor,
-        njt: tf.Tensor,
-        gamma: tf.Tensor,
-        phi: tf.Tensor,
-        k_njt: tf.Tensor,
-        ridge: tf.Tensor,
-    ):
-        # tune_shrinkage scales acceptance as acc_sum / T_float, so set acc_sum=T if accepting all.
-        if accept_all:
-            acc_sum = tf.cast(tf.shape(njt)[0], tf.float64)  # equals T
-        else:
-            acc_sum = tf.constant(0.0, tf.float64)
-        return njt, acc_sum
-
-    with patch.object(cl_tuning, "update_alpha", stub_update_alpha):
-        with patch.object(cl_tuning, "update_E_bar", stub_update_E_bar):
-            with patch.object(cl_tuning, "update_njt", stub_update_njt):
-                yield
+def _assert_state_unchanged(
+    before: dict[str, object],
+    after: ChoiceLearnShrinkageState,
+) -> None:
+    """Assert that a chain state matches a saved snapshot."""
+    assert before["alpha"] == float(after.alpha.numpy())
+    assert np.array_equal(before["E_bar"], after.E_bar.numpy())
+    assert np.array_equal(before["njt"], after.njt.numpy())
+    assert np.array_equal(before["gamma"], after.gamma.numpy())
 
 
 # -----------------------------------------------------------------------------
-# tune_k unit tests
+# _tune_block unit tests
 # -----------------------------------------------------------------------------
-def test_tune_k_shrinks_k_when_acceptance_below_band():
-    theta0 = tf.constant(0.0, tf.float64)
-    k0 = tf.constant(1.0, tf.float64)
+def test_tune_block_shrinks_k_when_acceptance_below_band():
+    theta0 = _tf(0.0)
+    k0 = _tf(1.0)
 
-    def step_fn(theta, k):
-        return theta, tf.constant(0.0, tf.float64)  # always reject
+    def step_fn(
+        theta: tf.Tensor, k: tf.Tensor, seed: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del theta, k, seed
+        return _tf(0.0), _tf(0.0)
 
     with patch("builtins.print"):
-        k_out = cl_tuning.tune_k(
+        k_out, theta_out = cl_tuning._tune_block(
             theta0=theta0,
             step_fn=step_fn,
             k0=k0,
@@ -241,22 +161,27 @@ def test_tune_k_shrinks_k_when_acceptance_below_band():
             target_high=0.5,
             max_rounds=3,
             factor=1.1,
-            name="reject",
+            name="shrink_case",
+            seed=_seed(1, 2),
         )
 
     _assert_scalar_positive(k_out)
     assert float(k_out.numpy()) < float(k0.numpy())
+    assert theta_out.shape == theta0.shape
 
 
-def test_tune_k_grows_k_when_acceptance_above_band():
-    theta0 = tf.constant(0.0, tf.float64)
-    k0 = tf.constant(1.0, tf.float64)
+def test_tune_block_grows_k_when_acceptance_above_band():
+    theta0 = _tf(0.0)
+    k0 = _tf(1.0)
 
-    def step_fn(theta, k):
-        return theta, tf.constant(1.0, tf.float64)  # always accept
+    def step_fn(
+        theta: tf.Tensor, k: tf.Tensor, seed: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del theta, k, seed
+        return _tf(0.0), _tf(1.0)
 
     with patch("builtins.print"):
-        k_out = cl_tuning.tune_k(
+        k_out, theta_out = cl_tuning._tune_block(
             theta0=theta0,
             step_fn=step_fn,
             k0=k0,
@@ -265,22 +190,27 @@ def test_tune_k_grows_k_when_acceptance_above_band():
             target_high=0.5,
             max_rounds=3,
             factor=1.1,
-            name="accept",
+            name="grow_case",
+            seed=_seed(3, 4),
         )
 
     _assert_scalar_positive(k_out)
     assert float(k_out.numpy()) > float(k0.numpy())
+    assert theta_out.shape == theta0.shape
 
 
-def test_tune_k_keeps_k_unchanged_when_acceptance_in_band():
-    theta0 = tf.constant(0.0, tf.float64)
-    k0 = tf.constant(1.0, tf.float64)
+def test_tune_block_keeps_k_when_acceptance_in_band():
+    theta0 = _tf(0.0)
+    k0 = _tf(1.0)
 
-    def step_fn(theta, k):
-        return theta, tf.constant(0.4, tf.float64)  # in-band
+    def step_fn(
+        theta: tf.Tensor, k: tf.Tensor, seed: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del k, seed
+        return theta, _tf(0.4)
 
     with patch("builtins.print"):
-        k_out = cl_tuning.tune_k(
+        k_out, theta_out = cl_tuning._tune_block(
             theta0=theta0,
             step_fn=step_fn,
             k0=k0,
@@ -289,27 +219,31 @@ def test_tune_k_keeps_k_unchanged_when_acceptance_in_band():
             target_high=0.5,
             max_rounds=10,
             factor=1.1,
-            name="inband",
+            name="in_band_case",
+            seed=_seed(5, 6),
         )
 
     assert float(k_out.numpy()) == float(k0.numpy())
+    assert theta_out.shape == theta0.shape
 
 
-def test_tune_k_preserves_theta_shape_scalar_and_vector():
-    k0 = tf.constant(1.0, tf.float64)
+def test_tune_block_preserves_theta_shape_for_scalar_vector_and_matrix_cases():
+    k0 = _tf(1.0)
 
-    for shape_case in ["scalar", "vector"]:
-        theta0 = (
-            tf.constant(0.0, tf.float64)
-            if shape_case == "scalar"
-            else tf.constant([0.0, 1.0, -1.0], tf.float64)
-        )
+    for theta0 in [
+        _tf(0.0),
+        _tf([0.0, 1.0, -1.0]),
+        _tf([[0.0, 1.0], [-1.0, 2.0]]),
+    ]:
 
-        def step_fn(theta, k):
-            return theta, tf.constant(0.4, tf.float64)  # in-band
+        def step_fn(
+            theta: tf.Tensor, k: tf.Tensor, seed: tf.Tensor
+        ) -> tuple[tf.Tensor, tf.Tensor]:
+            del k, seed
+            return theta, _tf(0.4)
 
         with patch("builtins.print"):
-            k_out = cl_tuning.tune_k(
+            k_out, theta_out = cl_tuning._tune_block(
                 theta0=theta0,
                 step_fn=step_fn,
                 k0=k0,
@@ -318,89 +252,58 @@ def test_tune_k_preserves_theta_shape_scalar_and_vector():
                 target_high=0.5,
                 max_rounds=5,
                 factor=1.1,
-                name=f"shape_{shape_case}",
+                name="shape_case",
+                seed=_seed(7, 8),
             )
 
         _assert_scalar_positive(k_out)
+        assert tuple(theta_out.shape) == tuple(theta0.shape)
+
+
+def test_tune_block_carries_forward_terminal_theta_between_rounds():
+    theta0 = _tf(0.0)
+    k0 = _tf(1.0)
+
+    def step_fn(
+        theta: tf.Tensor, k: tf.Tensor, seed: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del k, seed
+        return theta + _tf(1.0), _tf(0.0)
+
+    with patch("builtins.print"):
+        k_out, theta_out = cl_tuning._tune_block(
+            theta0=theta0,
+            step_fn=step_fn,
+            k0=k0,
+            pilot_length=3,
+            target_low=0.3,
+            target_high=0.5,
+            max_rounds=2,
+            factor=2.0,
+            name="carry_forward_case",
+            seed=_seed(9, 10),
+        )
+
+    _assert_scalar_positive(k_out)
+    assert float(theta_out.numpy()) == 6.0
 
 
 # -----------------------------------------------------------------------------
-# tune_shrinkage wiring tests
+# tune_shrinkage orchestration tests
 # -----------------------------------------------------------------------------
-def test_tune_shrinkage_validate_input_rejects_missing_or_wrong_types():
-    data = _tiny_cl_data()
-    view = _build_tune_view(data)
-    _set_tuning_params(view)
+def test_tune_shrinkage_returns_updated_config_and_preserves_non_tuned_fields():
+    posterior = _make_posterior()
+    problem = _make_problem()
+    initial_state = problem["initial_state"]
+    config = _make_shrinkage_config()
 
-    # Missing attribute
-    delattr(view, "qjt")
-    with pytest.raises(Exception):
-        with patch("builtins.print"):
-            cl_tuning.tune_shrinkage(view)
+    tuned_values = {
+        "alpha": (_tf(0.11), initial_state.alpha),
+        "E_bar": (_tf(0.22), initial_state.E_bar),
+        "njt": (_tf(0.33), initial_state.njt),
+    }
 
-    # Wrong type for state variable (must be tf.Variable so .read_value exists)
-    view = _build_tune_view(data)
-    _set_tuning_params(view)
-    view.alpha = view.alpha.read_value()  # type: ignore[assignment]
-    with pytest.raises(Exception):
-        with patch("builtins.print"):
-            cl_tuning.tune_shrinkage(view)
-
-
-def test_tune_shrinkage_returns_three_positive_finite_scalars():
-    data = _tiny_cl_data()
-    view = _build_tune_view(data)
-    _set_tuning_params(
-        view,
-        target_low=0.0,
-        target_high=1.0,
-        max_rounds=1,
-        pilot_length=1,
-        k_alpha0=0.2,
-        k_E_bar0=0.2,
-        k_njt0=0.2,
-    )
-
-    with _patched_updates(accept_all=True):
-        with patch("builtins.print"):
-            k_alpha, k_E_bar, k_njt = cl_tuning.tune_shrinkage(view)
-
-    for k in [k_alpha, k_E_bar, k_njt]:
-        _assert_scalar_positive(k)
-
-
-def test_tune_shrinkage_does_not_mutate_sampler_state():
-    data = _tiny_cl_data()
-    view = _build_tune_view(data)
-    _set_tuning_params(
-        view, target_low=0.0, target_high=1.0, max_rounds=1, pilot_length=1
-    )
-
-    with _patched_updates(accept_all=False):
-        before = _snapshot_state(view)
-        with patch("builtins.print"):
-            _ = cl_tuning.tune_shrinkage(view)
-        after = _snapshot_state(view)
-
-    _assert_state_unchanged(before, after)
-
-
-def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
-    data = _tiny_cl_data()
-    view = _build_tune_view(data)
-    _set_tuning_params(
-        view,
-        pilot_length=1,
-        max_rounds=1,
-        target_low=0.3,
-        target_high=0.5,
-        factor_rw=1.1,
-        factor_tmh=1.5,
-    )
-
-    calls: list[tuple[str, float]] = []
-
-    def stub_tune_k(
+    def stub_tune_block(
         theta0: tf.Tensor,
         step_fn,
         k0: tf.Tensor,
@@ -410,30 +313,150 @@ def test_tune_shrinkage_uses_correct_factor_for_rw_vs_tmh():
         max_rounds: int,
         factor: float,
         name: str,
-    ) -> tf.Tensor:
-        calls.append((str(name), float(factor)))
-        return tf.convert_to_tensor(k0, dtype=tf.float64)
+        seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del (
+            theta0,
+            step_fn,
+            k0,
+            pilot_length,
+            target_low,
+            target_high,
+            max_rounds,
+            factor,
+            seed,
+        )
+        return tuned_values[name]
 
-    with patch.object(cl_tuning, "tune_k", stub_tune_k):
-        with patch("builtins.print"):
-            _ = cl_tuning.tune_shrinkage(view)
+    with patch.object(cl_tuning, "_tune_block", side_effect=stub_tune_block):
+        tuned_config = cl_tuning.tune_shrinkage(
+            posterior=posterior,
+            qjt=problem["qjt"],
+            q0t=problem["q0t"],
+            delta_cl=problem["delta_cl"],
+            initial_state=initial_state,
+            shrinkage_config=config,
+            seed=_seed(11, 12),
+        )
 
-    names = [n for (n, _) in calls]
-    assert (
-        len(calls) >= 3
-    ), f"Expected at least 3 tune_k calls, got {len(calls)} names={names}"
+    assert tuned_config.k_alpha == 0.11
+    assert tuned_config.k_E_bar == 0.22
+    assert tuned_config.k_njt == 0.33
 
-    atol = 1e-6
-    for name, factor in calls:
-        if name in ["alpha", "E_bar"]:
-            exp = float(view.factor_rw)
-            assert abs(factor - exp) <= atol, (
-                f"{name} used factor={factor}, expected factor_rw={view.factor_rw} "
-                f"(abs diff={abs(factor - exp):.3e}, atol={atol:.3e})"
-            )
-        if name in ["njt"]:
-            exp = float(view.factor_tmh)
-            assert abs(factor - exp) <= atol, (
-                f"{name} used factor={factor}, expected factor_tmh={view.factor_tmh} "
-                f"(abs diff={abs(factor - exp):.3e}, atol={atol:.3e})"
-            )
+    assert tuned_config.num_results == config.num_results
+    assert tuned_config.num_burnin_steps == config.num_burnin_steps
+    assert tuned_config.chunk_size == config.chunk_size
+    assert tuned_config.pilot_length == config.pilot_length
+    assert tuned_config.target_low == config.target_low
+    assert tuned_config.target_high == config.target_high
+    assert tuned_config.max_rounds == config.max_rounds
+    assert tuned_config.factor == config.factor
+
+
+def test_tune_shrinkage_does_not_mutate_initial_state_or_input_config():
+    posterior = _make_posterior()
+    problem = _make_problem()
+    initial_state = problem["initial_state"]
+    config = _make_shrinkage_config()
+
+    before_state = _snapshot_state(initial_state)
+    before_config = config
+
+    def stub_tune_block(
+        theta0: tf.Tensor,
+        step_fn,
+        k0: tf.Tensor,
+        pilot_length: int,
+        target_low: float,
+        target_high: float,
+        max_rounds: int,
+        factor: float,
+        name: str,
+        seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del (
+            step_fn,
+            pilot_length,
+            target_low,
+            target_high,
+            max_rounds,
+            factor,
+            name,
+            seed,
+        )
+        return k0 + _tf(0.01), theta0
+
+    with patch.object(cl_tuning, "_tune_block", side_effect=stub_tune_block):
+        tuned_config = cl_tuning.tune_shrinkage(
+            posterior=posterior,
+            qjt=problem["qjt"],
+            q0t=problem["q0t"],
+            delta_cl=problem["delta_cl"],
+            initial_state=initial_state,
+            shrinkage_config=config,
+            seed=_seed(13, 14),
+        )
+
+    _assert_state_unchanged(before_state, initial_state)
+    assert config == before_config
+    assert tuned_config is not config
+    assert tuned_config.k_alpha != config.k_alpha
+    assert tuned_config.k_E_bar != config.k_E_bar
+    assert tuned_config.k_njt != config.k_njt
+
+
+def test_tune_shrinkage_calls_blocks_in_correct_order_with_same_factor_and_distinct_seeds():
+    posterior = _make_posterior()
+    problem = _make_problem()
+    initial_state = problem["initial_state"]
+    config = _make_shrinkage_config()
+
+    calls: list[dict[str, object]] = []
+
+    def stub_tune_block(
+        theta0: tf.Tensor,
+        step_fn,
+        k0: tf.Tensor,
+        pilot_length: int,
+        target_low: float,
+        target_high: float,
+        max_rounds: int,
+        factor: float,
+        name: str,
+        seed: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        del step_fn, pilot_length, target_low, target_high, max_rounds
+        calls.append(
+            {
+                "name": name,
+                "factor": float(factor),
+                "seed": tuple(int(v) for v in seed.numpy().tolist()),
+                "k0": float(k0.numpy()),
+                "theta_shape": tuple(theta0.shape),
+            }
+        )
+        return k0, theta0
+
+    with patch.object(cl_tuning, "_tune_block", side_effect=stub_tune_block):
+        _ = cl_tuning.tune_shrinkage(
+            posterior=posterior,
+            qjt=problem["qjt"],
+            q0t=problem["q0t"],
+            delta_cl=problem["delta_cl"],
+            initial_state=initial_state,
+            shrinkage_config=config,
+            seed=_seed(15, 16),
+        )
+
+    assert [call["name"] for call in calls] == ["alpha", "E_bar", "njt"]
+
+    for call in calls:
+        assert abs(call["factor"] - config.factor) <= ATOL
+
+    seed_tuples = [call["seed"] for call in calls]
+    assert len(seed_tuples) == 3
+    assert len(set(seed_tuples)) == 3
+
+    assert calls[0]["theta_shape"] == ()
+    assert calls[1]["theta_shape"] == (problem["T"],)
+    assert calls[2]["theta_shape"] == (problem["T"], problem["J"])

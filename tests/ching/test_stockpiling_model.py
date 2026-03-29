@@ -22,7 +22,7 @@ import ching.stockpiling_model as sm
 
 
 def _to_tf_float64_dict(arrs: dict[str, np.ndarray]) -> dict[str, tf.Tensor]:
-    """Convert a dict of numpy arrays to float64 TensorFlow tensors."""
+    """Convert a dict of NumPy arrays to float64 TensorFlow tensors."""
     return {k: tf.convert_to_tensor(v, dtype=tf.float64) for k, v in arrs.items()}
 
 
@@ -31,14 +31,13 @@ def _build_tf_inputs(
     u_mj_np: np.ndarray,
     price_proc: dict[str, np.ndarray],
     lambda_mn_np: np.ndarray,
-    pi_i0_np: np.ndarray,
     dp_cfg: dict[str, float | int],
 ) -> dict[str, tf.Tensor]:
     """Build canonical TF inputs for model calls.
 
     Returns a dict containing:
       a_mnjt, s_mjt: int32
-      u_mj, price_vals_mj, P_price_mj, lambda_mn, pi_I0: float64
+      u_mj, price_vals_mj, P_price_mj, lambda_mn: float64
       waste_cost: float64
     """
     return {
@@ -50,7 +49,6 @@ def _build_tf_inputs(
         ),
         "P_price_mj": tf.convert_to_tensor(price_proc["P_price_mj"], dtype=tf.float64),
         "lambda_mn": tf.convert_to_tensor(lambda_mn_np, dtype=tf.float64),
-        "pi_I0": tf.convert_to_tensor(pi_i0_np, dtype=tf.float64),
         "waste_cost": tf.convert_to_tensor(
             float(dp_cfg["waste_cost"]), dtype=tf.float64
         ),
@@ -73,12 +71,11 @@ def _tiny_env() -> tuple[
     u_mj = cc.u_mj_np(tiny_dims)
     price_proc = cc.price_process(tiny_dims)
     lambda_mn = cc.lambda_mn_np(tiny_dims)
-    pi_i0 = cc.pi_I0_uniform(tiny_dims)
 
-    tf_inputs = _build_tf_inputs(panel, u_mj, price_proc, lambda_mn, pi_i0, dp_cfg)
+    tf_inputs = _build_tf_inputs(panel, u_mj, price_proc, lambda_mn, dp_cfg)
     z_blocks_tf = _to_tf_float64_dict(cc.z_blocks_np(tiny_dims))
 
-    maps = sm.build_inventory_maps(I_max=int(tiny_dims["I_max"]))
+    maps = cc.inventory_maps_tf(int(tiny_dims["I_max"]))
     return tiny_dims, tf_inputs, z_blocks_tf, maps
 
 

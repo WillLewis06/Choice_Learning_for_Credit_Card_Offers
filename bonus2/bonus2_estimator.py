@@ -31,19 +31,6 @@ class Bonus2SamplerConfig:
     k_b: float
 
 
-@dataclass(frozen=True)
-class Bonus2InitConfig:
-    """Store scalar initialization values for the chain state."""
-
-    init_beta_intercept: float
-    init_beta_habit: float
-    init_beta_peer: float
-    init_beta_weekday: float
-    init_beta_weekend: float
-    init_a: float
-    init_b: float
-
-
 class Bonus2State(NamedTuple):
     """Store the full Bonus Q2 chain state."""
 
@@ -211,40 +198,14 @@ def build_initial_state(
     num_markets: int,
     num_products: int,
     num_harmonics: int,
-    init_config: Bonus2InitConfig,
 ) -> Bonus2State:
-    """Build the initial chain state from scalar initial values."""
-    z_beta_intercept_j = tf.fill(
-        [num_products],
-        tf.constant(init_config.init_beta_intercept, dtype=tf.float64),
-    )
-    z_beta_habit_j = tf.fill(
-        [num_products],
-        tf.constant(init_config.init_beta_habit, dtype=tf.float64),
-    )
-    z_beta_peer_j = tf.fill(
-        [num_products],
-        tf.constant(init_config.init_beta_peer, dtype=tf.float64),
-    )
-
-    weekday_col = tf.fill(
-        [num_products, 1],
-        tf.constant(init_config.init_beta_weekday, dtype=tf.float64),
-    )
-    weekend_col = tf.fill(
-        [num_products, 1],
-        tf.constant(init_config.init_beta_weekend, dtype=tf.float64),
-    )
-    z_beta_weekend_jw = tf.concat([weekday_col, weekend_col], axis=1)
-
-    z_a_m = tf.fill(
-        [num_markets, num_harmonics],
-        tf.constant(init_config.init_a, dtype=tf.float64),
-    )
-    z_b_m = tf.fill(
-        [num_markets, num_harmonics],
-        tf.constant(init_config.init_b, dtype=tf.float64),
-    )
+    """Build the initial chain state with zero-filled parameter blocks."""
+    z_beta_intercept_j = tf.zeros([num_products], dtype=tf.float64)
+    z_beta_habit_j = tf.zeros([num_products], dtype=tf.float64)
+    z_beta_peer_j = tf.zeros([num_products], dtype=tf.float64)
+    z_beta_weekend_jw = tf.zeros([num_products, 2], dtype=tf.float64)
+    z_a_m = tf.zeros([num_markets, num_harmonics], dtype=tf.float64)
+    z_b_m = tf.zeros([num_markets, num_harmonics], dtype=tf.float64)
 
     return Bonus2State(
         z_beta_intercept_j=z_beta_intercept_j,
@@ -333,7 +294,6 @@ def _run_chunk(
     current_state: Bonus2State,
     previous_kernel_results: Bonus2HybridKernelResults,
     num_steps: tf.Tensor,
-    seed: tf.Tensor,
 ) -> tuple[Bonus2State, dict[str, tf.Tensor], Bonus2HybridKernelResults]:
     """Run one compiled sample_chain chunk."""
     samples, trace, final_kernel_results = tfp.mcmc.sample_chain(
@@ -342,7 +302,6 @@ def _run_chunk(
         kernel=kernel,
         previous_kernel_results=previous_kernel_results,
         trace_fn=lambda state, results: _trace_fn(kernel.posterior, state, results),
-        seed=seed,
         return_final_kernel_results=True,
     )
     return samples, trace, final_kernel_results
@@ -359,7 +318,6 @@ def run_chain(
     decay: float,
     posterior_config: posterior_lib.Bonus2PosteriorConfig,
     sampler_config: Bonus2SamplerConfig,
-    init_config: Bonus2InitConfig,
 ) -> tuple[Bonus2State, list[diagnostics.Bonus2ChunkSummary]]:
     """Run the full Bonus Q2 MCMC chain."""
     y_mit = tf.convert_to_tensor(y_mit, dtype=tf.int32)
@@ -414,7 +372,6 @@ def run_chain(
         num_markets=num_markets,
         num_products=num_products,
         num_harmonics=num_harmonics,
-        init_config=init_config,
     )
     kernel = Bonus2HybridKernel(
         posterior=posterior,
@@ -422,24 +379,6 @@ def run_chain(
     )
     kernel_results = kernel.bootstrap_results(current_state)
 
-    num_burnin_chunks = _num_chunks(
-        total_steps=sampler_config.num_burnin_steps,
-        chunk_size=sampler_config.chunk_size,
-    )
-    num_result_chunks = _num_chunks(
-        total_steps=sampler_config.num_results,
-        chunk_size=sampler_config.chunk_size,
-    )
-    total_chunks = num_burnin_chunks + num_result_chunks
-    base_seed = tf.random.uniform(
-        shape=(2,),
-        minval=0,
-        maxval=2**31 - 1,
-        dtype=tf.int32,
-    )
-    chunk_seeds = tf.random.experimental.stateless_split(base_seed, num=total_chunks)
-
-    seed_index = 0
     burnin_remaining = sampler_config.num_burnin_steps
     while burnin_remaining > 0:
         num_steps = min(sampler_config.chunk_size, burnin_remaining)
@@ -448,14 +387,17 @@ def run_chain(
             current_state=current_state,
             previous_kernel_results=kernel_results,
             num_steps=tf.constant(num_steps, dtype=tf.int32),
-            seed=chunk_seeds[seed_index],
         )
         current_state = _last_state(samples)
         burnin_remaining -= num_steps
-        seed_index += 1
 
     retained_chunks: list[Bonus2State] = []
     summaries: list[diagnostics.Bonus2ChunkSummary] = []
+
+    num_result_chunks = _num_chunks(
+        total_steps=sampler_config.num_results,
+        chunk_size=sampler_config.chunk_size,
+    )
 
     result_remaining = sampler_config.num_results
     chunk_idx = 0
@@ -466,7 +408,6 @@ def run_chain(
             current_state=current_state,
             previous_kernel_results=kernel_results,
             num_steps=tf.constant(num_steps, dtype=tf.int32),
-            seed=chunk_seeds[seed_index],
         )
         current_state = _last_state(samples)
         retained_chunks.append(samples)
@@ -495,7 +436,6 @@ def run_chain(
         )
 
         result_remaining -= num_steps
-        seed_index += 1
         chunk_idx += 1
 
     diagnostics.report_run_summary(summaries)

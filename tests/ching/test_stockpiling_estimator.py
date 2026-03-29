@@ -1,307 +1,502 @@
 # tests/ching/test_stockpiling_estimator.py
-"""
-Unit tests for `ching.stockpiling_estimator` (Phase-3, multi-product).
+"""Unit tests for `ching.stockpiling_estimator`.
 
-These tests focus on estimator-layer behavior only:
-- input validation passthrough (fit inputs)
-- correct return structure, shapes, and acceptance-rate aggregation
-- correct propagation of z updates across iterations
-- predict_probabilities calls the posterior prediction function with the right tensors
+This file targets the refactored Ching sampler API:
+- StockpilingConfig
+- StockpilingState
+- StockpilingKernelResults
+- StockpilingRunResult
+- StockpilingHybridKernel
+- build_initial_state(...)
+- _num_chunks(...)
+- _last_state(...)
+- _concat_sample_chunks(...)
+- run_chain(...)
+- summarize_samples(...)
 
-We patch RW-MH update kernels and iteration diagnostics to avoid expensive DP/likelihood work.
+The old estimator-style API (StockpilingEstimator, fit(), predict_probabilities())
+is no longer part of this module and is not tested here.
 """
 
 from __future__ import annotations
 
 import os
-from unittest.mock import Mock
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-# Reduce TensorFlow C++ logging (must be set before importing TF).
+# Reduce TensorFlow C++ logging before importing TensorFlow.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
+import ching_conftest as cc  # noqa: E402
 import tensorflow as tf  # noqa: E402
 
 import ching.stockpiling_estimator as est_mod  # noqa: E402
-from ching.stockpiling_estimator import StockpilingEstimator  # noqa: E402
+from ching.stockpiling_estimator import (  # noqa: E402
+    StockpilingHybridKernel,
+    StockpilingKernelResults,
+    StockpilingRunResult,
+    StockpilingState,
+    _concat_sample_chunks,
+    _last_state,
+    _num_chunks,
+    build_initial_state,
+    run_chain,
+    summarize_samples,
+)
+
+DTYPE = tf.float64
+SEED_DTYPE = tf.int32
+ATOL = 1e-12
+RTOL = 0.0
 
 
-_ATOL = 1e-12
+def _tf(x) -> tf.Tensor:
+    """Create a tf.float64 constant."""
+    return tf.constant(x, dtype=DTYPE)
 
 
-def _row_stochastic(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
-    x = rng.uniform(0.1, 1.0, size=shape)
-    x = x / x.sum(axis=-1, keepdims=True)
-    return x
+def _seed(a: int, b: int) -> tf.Tensor:
+    """Create a stateless seed tensor."""
+    return tf.constant([a, b], dtype=SEED_DTYPE)
 
 
-def _make_tiny_inputs(seed: int = 123) -> dict[str, object]:
-    rng = np.random.default_rng(seed)
+def _make_fake_trace(N: int = 4, M: int = 2, J: int = 2) -> StockpilingState:
+    """Build a fake retained trace with leading draw dimension N."""
+    z_beta = _tf(np.linspace(-1.0, 1.0, N))
+    z_alpha = _tf(np.arange(N * J, dtype=np.float64).reshape(N, J) / 10.0)
+    z_v = _tf(np.arange(N * J, dtype=np.float64).reshape(N, J) / 20.0 - 0.3)
+    z_fc = _tf(np.arange(N * J, dtype=np.float64).reshape(N, J) / 30.0 - 0.2)
+    z_u_scale = _tf(np.arange(N * M, dtype=np.float64).reshape(N, M) / 40.0 - 0.1)
 
-    M, N, J, T, S = 2, 3, 2, 4, 3
-    I_max = 2
+    return StockpilingState(
+        z_beta=z_beta,
+        z_alpha=z_alpha,
+        z_v=z_v,
+        z_fc=z_fc,
+        z_u_scale=z_u_scale,
+    )
 
-    a_mnjt = rng.integers(0, 2, size=(M, N, J, T), dtype=np.int32)
-    s_mjt = rng.integers(0, S, size=(M, J, T), dtype=np.int32)
 
-    u_mj = rng.normal(0.0, 1.0, size=(M, J)).astype(np.float64)
+def _assert_all_finite_tf(*xs: tf.Tensor) -> None:
+    """Assert that all supplied tensors contain only finite values."""
+    for x in xs:
+        x_np = tf.convert_to_tensor(x).numpy()
+        if not np.all(np.isfinite(x_np)):
+            raise AssertionError("Tensor contains non-finite values.")
 
-    price_vals_mj = rng.uniform(1.0, 5.0, size=(M, J, S)).astype(np.float64)
-    P_price_mj = _row_stochastic(rng, (M, J, S, S)).astype(np.float64)
 
-    lambda_mn = rng.uniform(0.1, 0.9, size=(M, N)).astype(np.float64)
+def _assert_state_shapes(state: StockpilingState, M: int, J: int) -> None:
+    """Basic shape contract for a single chain state."""
+    assert state.z_beta.shape == ()
+    assert tuple(state.z_alpha.shape) == (J,)
+    assert tuple(state.z_v.shape) == (J,)
+    assert tuple(state.z_fc.shape) == (J,)
+    assert tuple(state.z_u_scale.shape) == (M,)
 
-    pi_I0 = np.full((I_max + 1,), 1.0 / (I_max + 1), dtype=np.float64)
 
-    sigmas = {
-        "z_beta": 1.0,
-        "z_alpha": 1.0,
-        "z_v": 1.0,
-        "z_fc": 1.0,
-        "z_u_scale": 1.0,
+def _assert_trace_shapes(samples: StockpilingState, N: int, M: int, J: int) -> None:
+    """Basic shape contract for a retained state trace."""
+    assert tuple(samples.z_beta.shape) == (N,)
+    assert tuple(samples.z_alpha.shape) == (N, J)
+    assert tuple(samples.z_v.shape) == (N, J)
+    assert tuple(samples.z_fc.shape) == (N, J)
+    assert tuple(samples.z_u_scale.shape) == (N, M)
+
+
+def _assert_accept_scalar(x: tf.Tensor) -> None:
+    """Assert a scalar acceptance diagnostic in [0.0, 1.0]."""
+    x_t = tf.convert_to_tensor(x)
+    if x_t.shape != ():
+        raise AssertionError(f"Expected scalar acceptance diagnostic, got {x_t.shape}.")
+    if x_t.dtype != DTYPE:
+        raise AssertionError(f"Expected dtype {DTYPE}, got {x_t.dtype}.")
+    x_val = float(x_t.numpy())
+    if not np.isfinite(x_val):
+        raise AssertionError("Acceptance diagnostic is not finite.")
+    if not (0.0 <= x_val <= 1.0):
+        raise AssertionError(f"Acceptance diagnostic out of bounds: {x_val}.")
+
+
+# -----------------------------------------------------------------------------
+# Small helper tests
+# -----------------------------------------------------------------------------
+def test_num_chunks_handles_zero_exact_multiple_and_round_up() -> None:
+    assert _num_chunks(0, 5) == 0
+    assert _num_chunks(-3, 5) == 0
+    assert _num_chunks(6, 3) == 2
+    assert _num_chunks(7, 3) == 3
+    assert _num_chunks(1, 8) == 1
+
+
+def test_last_state_extracts_terminal_draw() -> None:
+    samples = _make_fake_trace(N=4, M=2, J=2)
+    state = _last_state(samples)
+
+    assert isinstance(state, StockpilingState)
+    _assert_state_shapes(state, M=2, J=2)
+
+    tf.debugging.assert_equal(state.z_beta, samples.z_beta[-1])
+    tf.debugging.assert_equal(state.z_alpha, samples.z_alpha[-1])
+    tf.debugging.assert_equal(state.z_v, samples.z_v[-1])
+    tf.debugging.assert_equal(state.z_fc, samples.z_fc[-1])
+    tf.debugging.assert_equal(state.z_u_scale, samples.z_u_scale[-1])
+
+
+def test_concat_sample_chunks_concatenates_draw_dimension() -> None:
+    chunk_1 = _make_fake_trace(N=2, M=2, J=2)
+    chunk_2 = _make_fake_trace(N=3, M=2, J=2)
+
+    out = _concat_sample_chunks([chunk_1, chunk_2])
+
+    assert isinstance(out, StockpilingState)
+    _assert_trace_shapes(out, N=5, M=2, J=2)
+
+    tf.debugging.assert_equal(out.z_beta[:2], chunk_1.z_beta)
+    tf.debugging.assert_equal(out.z_beta[2:], chunk_2.z_beta)
+    tf.debugging.assert_equal(out.z_alpha[:2], chunk_1.z_alpha)
+    tf.debugging.assert_equal(out.z_alpha[2:], chunk_2.z_alpha)
+    tf.debugging.assert_equal(out.z_v[:2], chunk_1.z_v)
+    tf.debugging.assert_equal(out.z_v[2:], chunk_2.z_v)
+    tf.debugging.assert_equal(out.z_fc[:2], chunk_1.z_fc)
+    tf.debugging.assert_equal(out.z_fc[2:], chunk_2.z_fc)
+    tf.debugging.assert_equal(out.z_u_scale[:2], chunk_1.z_u_scale)
+    tf.debugging.assert_equal(out.z_u_scale[2:], chunk_2.z_u_scale)
+
+
+def test_concat_sample_chunks_raises_on_empty_input() -> None:
+    with pytest.raises(ValueError, match="No retained sample chunks"):
+        _concat_sample_chunks([])
+
+
+# -----------------------------------------------------------------------------
+# Initial-state construction
+# -----------------------------------------------------------------------------
+def test_build_initial_state_defaults() -> None:
+    dims = cc.tiny_dims()
+    state = build_initial_state(M=int(dims["M"]), J=int(dims["J"]))
+
+    assert isinstance(state, StockpilingState)
+    _assert_state_shapes(state, M=int(dims["M"]), J=int(dims["J"]))
+
+    tf.debugging.assert_equal(state.z_beta, _tf(0.0))
+    tf.debugging.assert_equal(state.z_alpha, tf.zeros((dims["J"],), dtype=DTYPE))
+    tf.debugging.assert_equal(state.z_v, tf.zeros((dims["J"],), dtype=DTYPE))
+    tf.debugging.assert_equal(state.z_fc, tf.zeros((dims["J"],), dtype=DTYPE))
+    tf.debugging.assert_equal(state.z_u_scale, tf.zeros((dims["M"],), dtype=DTYPE))
+
+
+# -----------------------------------------------------------------------------
+# Hybrid kernel
+# -----------------------------------------------------------------------------
+def test_hybrid_kernel_bootstrap_results_are_zero() -> None:
+    bundle = cc.posterior_bundle_tf()
+    posterior = bundle["posterior"]
+    dims = bundle["dims"]
+    config = cc.sampler_config_tf(dims=dims, num_results=4, chunk_size=2)
+    initial_state = cc.initial_state_tf(dims)
+
+    kernel = StockpilingHybridKernel(
+        posterior=posterior,
+        config=config,
+    )
+
+    results = kernel.bootstrap_results(initial_state)
+
+    assert isinstance(results, StockpilingKernelResults)
+
+    for x in [
+        results.beta_accept,
+        results.alpha_accept,
+        results.v_accept,
+        results.fc_accept,
+        results.u_scale_accept,
+    ]:
+        assert x.shape == ()
+        assert x.dtype == DTYPE
+        tf.debugging.assert_equal(x, _tf(0.0))
+
+
+def test_hybrid_kernel_one_step_returns_valid_state_and_results() -> None:
+    bundle = cc.posterior_bundle_tf()
+    posterior = bundle["posterior"]
+    dims = bundle["dims"]
+    current_state = cc.initial_state_tf(dims)
+    config = cc.sampler_config_tf(dims=dims, num_results=4, chunk_size=2)
+
+    kernel = StockpilingHybridKernel(
+        posterior=posterior,
+        config=config,
+    )
+    previous_results = kernel.bootstrap_results(current_state)
+
+    def fake_beta_one_step(
+        posterior,
+        z_beta,
+        z_alpha,
+        z_v,
+        z_fc,
+        z_u_scale,
+        k_beta,
+        seed,
+    ):
+        del posterior, z_alpha, z_v, z_fc, z_u_scale, k_beta, seed
+        return z_beta + tf.constant(0.1, dtype=DTYPE), tf.constant(1.0, dtype=DTYPE)
+
+    def fake_alpha_one_step(
+        posterior,
+        z_beta,
+        z_alpha,
+        z_v,
+        z_fc,
+        z_u_scale,
+        k_alpha,
+        seed,
+    ):
+        del posterior, z_beta, z_v, z_fc, z_u_scale, k_alpha, seed
+        return z_alpha + tf.constant(0.2, dtype=DTYPE), tf.constant(0.8, dtype=DTYPE)
+
+    def fake_v_one_step(
+        posterior,
+        z_beta,
+        z_alpha,
+        z_v,
+        z_fc,
+        z_u_scale,
+        k_v,
+        seed,
+    ):
+        del posterior, z_beta, z_alpha, z_fc, z_u_scale, k_v, seed
+        return z_v + tf.constant(0.3, dtype=DTYPE), tf.constant(0.6, dtype=DTYPE)
+
+    def fake_fc_one_step(
+        posterior,
+        z_beta,
+        z_alpha,
+        z_v,
+        z_fc,
+        z_u_scale,
+        k_fc,
+        seed,
+    ):
+        del posterior, z_beta, z_alpha, z_v, z_u_scale, k_fc, seed
+        return z_fc + tf.constant(0.4, dtype=DTYPE), tf.constant(0.4, dtype=DTYPE)
+
+    def fake_u_scale_one_step(
+        posterior,
+        z_beta,
+        z_alpha,
+        z_v,
+        z_fc,
+        z_u_scale,
+        k_u_scale,
+        seed,
+    ):
+        del posterior, z_beta, z_alpha, z_v, z_fc, k_u_scale, seed
+        return z_u_scale + tf.constant(0.5, dtype=DTYPE), tf.constant(0.2, dtype=DTYPE)
+
+    with (
+        patch.object(est_mod, "beta_one_step", side_effect=fake_beta_one_step),
+        patch.object(est_mod, "alpha_one_step", side_effect=fake_alpha_one_step),
+        patch.object(est_mod, "v_one_step", side_effect=fake_v_one_step),
+        patch.object(est_mod, "fc_one_step", side_effect=fake_fc_one_step),
+        patch.object(est_mod, "u_scale_one_step", side_effect=fake_u_scale_one_step),
+    ):
+        new_state, new_results = kernel.one_step(
+            current_state=current_state,
+            previous_kernel_results=previous_results,
+            seed=_seed(1, 2),
+        )
+
+    assert isinstance(new_state, StockpilingState)
+    assert isinstance(new_results, StockpilingKernelResults)
+
+    _assert_state_shapes(new_state, M=int(dims["M"]), J=int(dims["J"]))
+    _assert_all_finite_tf(
+        new_state.z_beta,
+        new_state.z_alpha,
+        new_state.z_v,
+        new_state.z_fc,
+        new_state.z_u_scale,
+    )
+
+    tf.debugging.assert_near(new_state.z_beta, _tf(0.1), atol=ATOL, rtol=RTOL)
+    tf.debugging.assert_near(
+        new_state.z_alpha,
+        tf.fill((dims["J"],), tf.constant(0.2, dtype=DTYPE)),
+        atol=ATOL,
+        rtol=RTOL,
+    )
+    tf.debugging.assert_near(
+        new_state.z_v,
+        tf.fill((dims["J"],), tf.constant(0.3, dtype=DTYPE)),
+        atol=ATOL,
+        rtol=RTOL,
+    )
+    tf.debugging.assert_near(
+        new_state.z_fc,
+        tf.fill((dims["J"],), tf.constant(0.4, dtype=DTYPE)),
+        atol=ATOL,
+        rtol=RTOL,
+    )
+    tf.debugging.assert_near(
+        new_state.z_u_scale,
+        tf.fill((dims["M"],), tf.constant(0.5, dtype=DTYPE)),
+        atol=ATOL,
+        rtol=RTOL,
+    )
+
+    _assert_accept_scalar(new_results.beta_accept)
+    _assert_accept_scalar(new_results.alpha_accept)
+    _assert_accept_scalar(new_results.v_accept)
+    _assert_accept_scalar(new_results.fc_accept)
+    _assert_accept_scalar(new_results.u_scale_accept)
+
+    tf.debugging.assert_equal(new_results.beta_accept, _tf(1.0))
+    tf.debugging.assert_equal(new_results.alpha_accept, _tf(0.8))
+    tf.debugging.assert_equal(new_results.v_accept, _tf(0.6))
+    tf.debugging.assert_equal(new_results.fc_accept, _tf(0.4))
+    tf.debugging.assert_equal(new_results.u_scale_accept, _tf(0.2))
+
+
+# -----------------------------------------------------------------------------
+# Public chain entrypoint
+# -----------------------------------------------------------------------------
+def test_run_chain_raises_on_nonpositive_num_results() -> None:
+    inputs = cc.run_chain_inputs_tf(seed=123, num_results=2, chunk_size=1)
+    dims = inputs["dims"]
+
+    bad_config = cc.sampler_config_tf(dims=dims, num_results=0, chunk_size=1)
+
+    with pytest.raises(ValueError, match="num_results"):
+        run_chain(
+            a_mnjt=inputs["a_mnjt"],
+            s_mjt=inputs["s_mjt"],
+            u_mj=inputs["u_mj"],
+            P_price_mj=inputs["P_price_mj"],
+            price_vals_mj=inputs["price_vals_mj"],
+            lambda_mn=inputs["lambda_mn"],
+            waste_cost=inputs["waste_cost"],
+            inventory_maps=inputs["inventory_maps"],
+            posterior_config=inputs["posterior_config"],
+            stockpiling_config=bad_config,
+            initial_state=inputs["initial_state"],
+            seed=inputs["seed"],
+        )
+
+
+def test_run_chain_raises_on_bad_seed_shape() -> None:
+    inputs = cc.run_chain_inputs_tf(seed=123, num_results=2, chunk_size=1)
+    bad_seed = tf.constant([1, 2, 3], dtype=SEED_DTYPE)
+
+    with pytest.raises(ValueError, match="seed"):
+        run_chain(
+            a_mnjt=inputs["a_mnjt"],
+            s_mjt=inputs["s_mjt"],
+            u_mj=inputs["u_mj"],
+            P_price_mj=inputs["P_price_mj"],
+            price_vals_mj=inputs["price_vals_mj"],
+            lambda_mn=inputs["lambda_mn"],
+            waste_cost=inputs["waste_cost"],
+            inventory_maps=inputs["inventory_maps"],
+            posterior_config=inputs["posterior_config"],
+            stockpiling_config=inputs["stockpiling_config"],
+            initial_state=inputs["initial_state"],
+            seed=bad_seed,
+        )
+
+
+def test_run_chain_returns_retained_trace_with_num_results_draws() -> None:
+    inputs = cc.run_chain_inputs_tf(seed=123, num_results=2, chunk_size=1)
+    dims = inputs["dims"]
+
+    out = run_chain(
+        a_mnjt=inputs["a_mnjt"],
+        s_mjt=inputs["s_mjt"],
+        u_mj=inputs["u_mj"],
+        P_price_mj=inputs["P_price_mj"],
+        price_vals_mj=inputs["price_vals_mj"],
+        lambda_mn=inputs["lambda_mn"],
+        waste_cost=inputs["waste_cost"],
+        inventory_maps=inputs["inventory_maps"],
+        posterior_config=inputs["posterior_config"],
+        stockpiling_config=inputs["stockpiling_config"],
+        initial_state=inputs["initial_state"],
+        seed=inputs["seed"],
+    )
+
+    assert isinstance(out, StockpilingRunResult)
+    _assert_trace_shapes(
+        out.samples,
+        N=2,
+        M=int(dims["M"]),
+        J=int(dims["J"]),
+    )
+
+    _assert_all_finite_tf(
+        out.samples.z_beta,
+        out.samples.z_alpha,
+        out.samples.z_v,
+        out.samples.z_fc,
+        out.samples.z_u_scale,
+    )
+
+    assert len(out.chunk_summaries) == _num_chunks(2, 1)
+    assert out.mcmc_summary["n_saved"] == 2
+    assert out.mcmc_summary["num_chunks"] == _num_chunks(2, 1)
+
+    expected_summary_keys = {
+        "n_saved",
+        "beta_accept",
+        "alpha_accept",
+        "v_accept",
+        "fc_accept",
+        "u_scale_accept",
+        "num_chunks",
+        "joint_logpost_last",
     }
-
-    return {
-        "a_mnjt": a_mnjt,
-        "s_mjt": s_mjt,
-        "u_mj": u_mj,
-        "price_vals_mj": price_vals_mj,
-        "P_price_mj": P_price_mj,
-        "lambda_mn": lambda_mn,
-        "I_max": I_max,
-        "pi_I0": pi_I0,
-        "waste_cost": 0.2,
-        "tol": 1e-8,
-        "max_iter": 50,
-        "sigmas": sigmas,
-        "rng_seed": 999,
-    }
+    assert set(out.mcmc_summary.keys()) == expected_summary_keys
 
 
-def _make_estimator(seed: int = 123) -> StockpilingEstimator:
-    inp = _make_tiny_inputs(seed=seed)
-    return StockpilingEstimator(
-        a_mnjt=inp["a_mnjt"],
-        s_mjt=inp["s_mjt"],
-        u_mj=inp["u_mj"],
-        price_vals_mj=inp["price_vals_mj"],
-        P_price_mj=inp["P_price_mj"],
-        lambda_mn=inp["lambda_mn"],
-        I_max=int(inp["I_max"]),
-        pi_I0=inp["pi_I0"],
-        waste_cost=float(inp["waste_cost"]),
-        tol=float(inp["tol"]),
-        max_iter=int(inp["max_iter"]),
-        sigmas=inp["sigmas"],
-        rng_seed=int(inp["rng_seed"]),
+# -----------------------------------------------------------------------------
+# Posterior-summary output
+# -----------------------------------------------------------------------------
+def test_summarize_samples_schema_shapes_and_constrained_means() -> None:
+    samples = _make_fake_trace(N=4, M=2, J=2)
+
+    res = summarize_samples(samples)
+
+    expected_keys = {"beta", "alpha", "v", "fc", "u_scale"}
+    assert set(res.keys()) == expected_keys
+
+    assert res["beta"].shape == ()
+    assert tuple(res["alpha"].shape) == (2,)
+    assert tuple(res["v"].shape) == (2,)
+    assert tuple(res["fc"].shape) == (2,)
+    assert tuple(res["u_scale"].shape) == (2,)
+
+    _assert_all_finite_tf(
+        res["beta"],
+        res["alpha"],
+        res["v"],
+        res["fc"],
+        res["u_scale"],
     )
 
+    expected_beta = tf.reduce_mean(tf.sigmoid(samples.z_beta), axis=0)
+    expected_alpha = tf.reduce_mean(tf.exp(samples.z_alpha), axis=0)
+    expected_v = tf.reduce_mean(tf.exp(samples.z_v), axis=0)
+    expected_fc = tf.reduce_mean(tf.exp(samples.z_fc), axis=0)
+    expected_u_scale = tf.reduce_mean(tf.exp(samples.z_u_scale), axis=0)
 
-def test_fit_rejects_nonpositive_n_iter() -> None:
-    est = _make_estimator()
-    k = {"beta": 0.1, "alpha": 0.1, "v": 0.1, "fc": 0.1, "u_scale": 0.1}
-    init_theta = {
-        "beta": 0.9,
-        "alpha": np.array([1.0, 1.0]),
-        "v": np.array([1.0, 1.0]),
-        "fc": np.array([0.5, 0.5]),
-        "u_scale": np.array([1.0, 1.0]),
-    }
-
-    with pytest.raises(ValueError, match="n_iter"):
-        est.fit(n_iter=0, k=k, init_theta=init_theta)
-
-
-def test_fit_returns_expected_shapes_accept_and_z_last_with_patched_updates() -> None:
-    est = _make_estimator(seed=321)
-
-    # Patch diagnostics to avoid tf.print and to count calls.
-    call_its: list[int] = []
-
-    def fake_report_iteration_progress(z: dict[str, tf.Tensor], it: tf.Tensor) -> None:
-        call_its.append(int(it.numpy()))
-
-    # Patch update kernels to deterministic "always accept and add constant step".
-    def fake_update_z_beta_scalar(
-        z_beta: tf.Tensor,
-        z_alpha: tf.Tensor,
-        z_v: tf.Tensor,
-        z_fc: tf.Tensor,
-        z_u_scale: tf.Tensor,
-        inputs: dict,
-        sigma_z_beta: tf.Tensor,
-        k_beta: tf.Tensor,
-        rng: tf.random.Generator,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
-        z_new = z_beta + tf.constant([0.1], dtype=tf.float64)
-        accepted = tf.ones_like(z_beta, dtype=tf.bool)
-        return z_new, accepted
-
-    def fake_update_z_alpha_j(
-        z_beta: tf.Tensor,
-        z_alpha: tf.Tensor,
-        z_v: tf.Tensor,
-        z_fc: tf.Tensor,
-        z_u_scale: tf.Tensor,
-        inputs: dict,
-        sigma_z_alpha: tf.Tensor,
-        k_alpha: tf.Tensor,
-        rng: tf.random.Generator,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
-        z_new = z_alpha + tf.constant(0.2, dtype=tf.float64)
-        accepted = tf.ones_like(z_alpha, dtype=tf.bool)
-        return z_new, accepted
-
-    def fake_update_z_v_j(
-        z_beta: tf.Tensor,
-        z_alpha: tf.Tensor,
-        z_v: tf.Tensor,
-        z_fc: tf.Tensor,
-        z_u_scale: tf.Tensor,
-        inputs: dict,
-        sigma_z_v: tf.Tensor,
-        k_v: tf.Tensor,
-        rng: tf.random.Generator,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
-        z_new = z_v + tf.constant(0.3, dtype=tf.float64)
-        accepted = tf.ones_like(z_v, dtype=tf.bool)
-        return z_new, accepted
-
-    def fake_update_z_fc_j(
-        z_beta: tf.Tensor,
-        z_alpha: tf.Tensor,
-        z_v: tf.Tensor,
-        z_fc: tf.Tensor,
-        z_u_scale: tf.Tensor,
-        inputs: dict,
-        sigma_z_fc: tf.Tensor,
-        k_fc: tf.Tensor,
-        rng: tf.random.Generator,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
-        z_new = z_fc + tf.constant(0.4, dtype=tf.float64)
-        accepted = tf.ones_like(z_fc, dtype=tf.bool)
-        return z_new, accepted
-
-    def fake_update_z_u_scale_m(
-        z_beta: tf.Tensor,
-        z_alpha: tf.Tensor,
-        z_v: tf.Tensor,
-        z_fc: tf.Tensor,
-        z_u_scale: tf.Tensor,
-        inputs: dict,
-        sigma_z_u_scale: tf.Tensor,
-        k_u_scale: tf.Tensor,
-        rng: tf.random.Generator,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
-        z_new = z_u_scale + tf.constant(0.5, dtype=tf.float64)
-        accepted = tf.ones_like(z_u_scale, dtype=tf.bool)
-        return z_new, accepted
-
-    est_mod.report_iteration_progress = fake_report_iteration_progress
-    est_mod.update_z_beta_scalar = fake_update_z_beta_scalar
-    est_mod.update_z_alpha_j = fake_update_z_alpha_j
-    est_mod.update_z_v_j = fake_update_z_v_j
-    est_mod.update_z_fc_j = fake_update_z_fc_j
-    est_mod.update_z_u_scale_m = fake_update_z_u_scale_m
-
-    k = {"beta": 0.11, "alpha": 0.12, "v": 0.13, "fc": 0.14, "u_scale": 0.15}
-
-    init_theta = {
-        "beta": 0.9,
-        "alpha": np.array([1.0, 2.0]),
-        "v": np.array([0.5, 1.5]),
-        "fc": np.array([0.2, 0.4]),
-        "u_scale": np.array([1.0, 1.2]),
-    }
-
-    out = est.fit(n_iter=3, k=k, init_theta=init_theta)
-
-    # Diagnostics called each iteration
-    assert call_its == [0, 1, 2]
-
-    # Return structure
-    assert set(out.keys()) == {"theta_mean", "accept", "n_saved", "z_last"}
-    assert out["n_saved"] == 3
-
-    theta_mean = out["theta_mean"]
-    accept = out["accept"]
-    z_last = out["z_last"]
-
-    # Shapes
-    assert theta_mean["beta"].shape == ()
-    assert theta_mean["alpha"].shape == (est.J,)
-    assert theta_mean["v"].shape == (est.J,)
-    assert theta_mean["fc"].shape == (est.J,)
-    assert theta_mean["u_scale"].shape == (est.M,)
-
-    # Acceptance rates: all ones due to patched kernels
-    for key in ["beta", "alpha", "v", "fc", "u_scale"]:
-        assert key in accept
-        np.testing.assert_allclose(accept[key], 1.0, rtol=0.0, atol=_ATOL)
-
-    # z_last matches initial z + n_iter * delta (in unconstrained space)
-    beta0 = float(init_theta["beta"])
-    z_beta0 = np.array([np.log(beta0) - np.log(1.0 - beta0)], dtype=np.float64)
-    z_alpha0 = np.log(np.asarray(init_theta["alpha"], dtype=np.float64))
-    z_v0 = np.log(np.asarray(init_theta["v"], dtype=np.float64))
-    z_fc0 = np.log(np.asarray(init_theta["fc"], dtype=np.float64))
-    z_u_scale0 = np.log(np.asarray(init_theta["u_scale"], dtype=np.float64))
-
-    np.testing.assert_allclose(
-        z_last["z_beta"].numpy(), z_beta0 + 3 * 0.1, rtol=0.0, atol=_ATOL
+    tf.debugging.assert_near(res["beta"], expected_beta, atol=ATOL, rtol=RTOL)
+    tf.debugging.assert_near(res["alpha"], expected_alpha, atol=ATOL, rtol=RTOL)
+    tf.debugging.assert_near(res["v"], expected_v, atol=ATOL, rtol=RTOL)
+    tf.debugging.assert_near(res["fc"], expected_fc, atol=ATOL, rtol=RTOL)
+    tf.debugging.assert_near(
+        res["u_scale"],
+        expected_u_scale,
+        atol=ATOL,
+        rtol=RTOL,
     )
-    np.testing.assert_allclose(
-        z_last["z_alpha"].numpy(), z_alpha0 + 3 * 0.2, rtol=0.0, atol=_ATOL
-    )
-    np.testing.assert_allclose(
-        z_last["z_v"].numpy(), z_v0 + 3 * 0.3, rtol=0.0, atol=_ATOL
-    )
-    np.testing.assert_allclose(
-        z_last["z_fc"].numpy(), z_fc0 + 3 * 0.4, rtol=0.0, atol=_ATOL
-    )
-    np.testing.assert_allclose(
-        z_last["z_u_scale"].numpy(), z_u_scale0 + 3 * 0.5, rtol=0.0, atol=_ATOL
-    )
-
-    # Estimator fields are populated
-    assert est.z is not None
-    assert est.theta_mean is not None
-    assert est.accept is not None
-    assert est.n_saved == 3
-
-
-def test_predict_probabilities_calls_backend_and_returns_tensor() -> None:
-    est = _make_estimator(seed=777)
-
-    backend = Mock()
-
-    def fake_predict_p_buy_mnjt_from_theta(
-        theta: dict[str, tf.Tensor], inputs: dict
-    ) -> tf.Tensor:
-        backend(theta=theta, inputs=inputs)
-        M = int(inputs["a_mnjt"].shape[0])
-        N = int(inputs["a_mnjt"].shape[1])
-        J = int(inputs["a_mnjt"].shape[2])
-        T = int(inputs["a_mnjt"].shape[3])
-        return tf.fill((M, N, J, T), tf.constant(0.5, dtype=tf.float64))
-
-    est_mod.predict_p_buy_mnjt_from_theta = fake_predict_p_buy_mnjt_from_theta
-
-    theta = {
-        "beta": tf.constant(0.9, dtype=tf.float64),
-        "alpha": tf.constant([1.0, 2.0], dtype=tf.float64),
-        "v": tf.constant([0.5, 1.5], dtype=tf.float64),
-        "fc": tf.constant([0.2, 0.4], dtype=tf.float64),
-        "u_scale": tf.constant([1.0, 1.2], dtype=tf.float64),
-    }
-
-    p = est.predict_probabilities(theta=theta)
-    assert p.shape == (est.M, est.N, est.J, est.T)
-    assert p.dtype == tf.float64
-    np.testing.assert_allclose(p.numpy(), 0.5, rtol=0.0, atol=_ATOL)
-
-    assert backend.call_count == 1
-    called = backend.call_args.kwargs
-    assert set(called["theta"].keys()) == {"beta", "alpha", "v", "fc", "u_scale"}

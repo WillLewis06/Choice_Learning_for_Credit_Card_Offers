@@ -43,10 +43,9 @@ __all__ = [
 
 @dataclass(frozen=True)
 class StockpilingConfig:
-    """Store the sampler controls and proposal scales."""
+    """Store retained-sampling controls and proposal scales."""
 
     num_results: int
-    num_burnin_steps: int
     chunk_size: int
     k_beta: tf.Tensor
     k_alpha: tf.Tensor
@@ -323,13 +322,12 @@ def run_chain(
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
     inventory_maps,
-    pi_I0: tf.Tensor,
     posterior_config: StockpilingPosteriorConfig,
     stockpiling_config: StockpilingConfig,
     initial_state: StockpilingState,
     seed: tf.Tensor,
 ) -> StockpilingRunResult:
-    """Validate inputs, run the chain, and return samples plus summaries."""
+    """Validate inputs, run retained chunks, and return samples plus summaries."""
     run_chain_validate_input(
         a_mnjt=a_mnjt,
         s_mjt=s_mjt,
@@ -339,7 +337,6 @@ def run_chain(
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
         inventory_maps=inventory_maps,
-        pi_I0=pi_I0,
         posterior_config=posterior_config,
         sampler_config=stockpiling_config,
         z_beta=initial_state.z_beta,
@@ -360,7 +357,6 @@ def run_chain(
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
         inventory_maps=inventory_maps,
-        pi_I0=pi_I0,
     )
     kernel = StockpilingHybridKernel(
         posterior=posterior,
@@ -374,7 +370,7 @@ def run_chain(
         num_steps: tf.Tensor,
         chunk_seed: tf.Tensor,
     ) -> tuple[StockpilingState, dict[str, tf.Tensor], StockpilingKernelResults]:
-        """Run one compiled chunk of transitions."""
+        """Run one compiled chunk of retained transitions."""
         return tfp.mcmc.sample_chain(
             num_results=num_steps,
             current_state=current_state,
@@ -385,16 +381,10 @@ def run_chain(
             seed=chunk_seed,
         )
 
-    total_burnin_chunks = _num_chunks(
-        stockpiling_config.num_burnin_steps,
-        stockpiling_config.chunk_size,
-    )
-    total_retained_chunks = _num_chunks(
+    total_chunks = _num_chunks(
         stockpiling_config.num_results,
         stockpiling_config.chunk_size,
     )
-    total_chunks = total_burnin_chunks + total_retained_chunks
-
     chunk_seeds = tf.random.experimental.stateless_split(seed, num=total_chunks)
 
     state = initial_state
@@ -402,39 +392,30 @@ def run_chain(
     retained_chunks: list[StockpilingState] = []
     chunk_summaries: list[StockpilingChunkSummary] = []
 
+    remaining = int(stockpiling_config.num_results)
     chunk_idx = 0
 
-    def run_phase(num_steps: int, retain: bool) -> None:
-        """Run either the burn-in or retained phase chunk by chunk."""
-        nonlocal chunk_idx, state, kernel_results
+    while remaining > 0:
+        chunk_len = min(stockpiling_config.chunk_size, remaining)
+        samples, raw_trace, kernel_results = _run_chunk(
+            current_state=state,
+            previous_kernel_results=kernel_results,
+            num_steps=tf.constant(chunk_len, dtype=tf.int32),
+            chunk_seed=chunk_seeds[chunk_idx],
+        )
 
-        remaining = int(num_steps)
-        while remaining > 0:
-            chunk_len = min(stockpiling_config.chunk_size, remaining)
-            samples, raw_trace, kernel_results = _run_chunk(
-                current_state=state,
-                previous_kernel_results=kernel_results,
-                num_steps=tf.constant(chunk_len, dtype=tf.int32),
-                chunk_seed=chunk_seeds[chunk_idx],
-            )
+        trace = _raw_trace_to_dataclass(raw_trace)
+        summary = report_chunk_progress(
+            trace=trace,
+            chunk_idx=chunk_idx + 1,
+            total_chunks=total_chunks,
+        )
+        chunk_summaries.append(summary)
+        retained_chunks.append(samples)
 
-            trace = _raw_trace_to_dataclass(raw_trace)
-            summary = report_chunk_progress(
-                trace=trace,
-                chunk_idx=chunk_idx + 1,
-                total_chunks=total_chunks,
-            )
-            chunk_summaries.append(summary)
-
-            state = _last_state(samples)
-            if retain:
-                retained_chunks.append(samples)
-
-            remaining -= chunk_len
-            chunk_idx += 1
-
-    run_phase(stockpiling_config.num_burnin_steps, retain=False)
-    run_phase(stockpiling_config.num_results, retain=True)
+        state = _last_state(samples)
+        remaining -= chunk_len
+        chunk_idx += 1
 
     report_run_summary(chunk_summaries)
 

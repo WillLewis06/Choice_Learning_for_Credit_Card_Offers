@@ -5,8 +5,10 @@ Shared Bonus2 test builders.
 This file is intentionally not a pytest conftest module and does not define pytest
 fixtures. Tests should import and call these helpers directly.
 
-Key conventions (Bonus2):
-  y_mit:         (M, N, T) int32 choices; 0=outside, c=j+1 for inside product j (j=0..J-1)
+Key conventions (Bonus2)
+------------------------
+Observed panel:
+  y_mit:         (M, N, T) int32 choices; 0=outside, c=j+1 for inside product j
   delta_mj:      (M, J) float64 phase-1 baseline utilities
   is_weekend_t:  (T,) int32 in {0,1}
   season_sin_kt: (K, T) float64 seasonal basis
@@ -15,13 +17,20 @@ Key conventions (Bonus2):
   lookback:      scalar int32 >= 1
   decay:         scalar float64 in (0,1)
 
-Config scalars (init_theta):
-  beta_intercept, beta_habit, beta_peer,
-  beta_weekend_weekday, beta_weekend_weekend,
-  a_m, b_m
+Posterior inputs:
+  y_mit, delta_mj, is_weekend_t, season_sin_kt, season_cos_kt, h_mntj, p_mntj
 
-z-block keys (sigmas / step_size_z):
-  z_beta_intercept_j, z_beta_habit_j, z_beta_peer_j, z_beta_weekend_jw, z_a_m, z_b_m
+Posterior config fields:
+  sigma_z_beta_intercept_j, sigma_z_beta_habit_j, sigma_z_beta_peer_j,
+  sigma_z_beta_weekend_jw, sigma_z_a_m, sigma_z_b_m
+
+Sampler config fields:
+  num_results, num_burnin_steps, chunk_size,
+  k_beta_intercept, k_beta_habit, k_beta_peer, k_beta_weekend, k_a, k_b
+
+Chain state blocks:
+  z_beta_intercept_j, z_beta_habit_j, z_beta_peer_j,
+  z_beta_weekend_jw, z_a_m, z_b_m
 """
 
 from __future__ import annotations
@@ -54,7 +63,7 @@ quiet_tf_logger()
 
 
 def seed_everything(seed: int) -> None:
-    """Set NumPy and TensorFlow RNG seeds for deterministic test runs."""
+    """Set NumPy and TensorFlow RNG seeds for reproducible test setup."""
     np.random.seed(int(seed))
     tf.random.set_seed(int(seed))
 
@@ -211,7 +220,8 @@ def season_features_np(
 
 
 def neighbors_m_np(
-    dims: dict[str, int], pattern: str = "ring"
+    dims: dict[str, int],
+    pattern: str = "ring",
 ) -> list[list[list[int]]]:
     """
     Build neighbors_m with shape [M][N][deg_i].
@@ -271,7 +281,7 @@ def panel_np(
     weekend_pattern: str = "0101",
 ) -> dict[str, Any]:
     """
-    Build a canonical Bonus2 panel dict matching bonus2_input_validation.validate_bonus2_panel.
+    Build a canonical Bonus2 panel dict matching the current validation/estimation inputs.
 
     Returns dict with keys:
       y_mit, delta_mj, is_weekend_t, season_sin_kt, season_cos_kt,
@@ -303,70 +313,84 @@ def panel_np(
 
 
 # =============================================================================
-# Config builders (init_theta / sigmas / step sizes)
+# Config builders (posterior / sampler)
 # =============================================================================
 
 
-def init_theta_scalars(overrides: dict[str, float] | None = None) -> dict[str, float]:
-    """
-    Build scalar init_theta dict required by Bonus2Estimator.
-
-    Required keys:
-      beta_intercept, beta_habit, beta_peer,
-      beta_weekend_weekday, beta_weekend_weekend,
-      a_m, b_m
-    """
+def posterior_config_kwargs(
+    overrides: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Build valid Bonus2PosteriorConfig kwargs."""
     base = {
-        "beta_intercept": 0.0,
-        "beta_habit": 0.0,
-        "beta_peer": 0.0,
-        "beta_weekend_weekday": 0.0,
-        "beta_weekend_weekend": 0.0,
-        "a_m": 0.0,
-        "b_m": 0.0,
+        "sigma_z_beta_intercept_j": 1.0,
+        "sigma_z_beta_habit_j": 1.0,
+        "sigma_z_beta_peer_j": 1.0,
+        "sigma_z_beta_weekend_jw": 1.0,
+        "sigma_z_a_m": 1.0,
+        "sigma_z_b_m": 1.0,
     }
     if overrides:
-        for k, v in overrides.items():
-            if k not in base:
-                raise ValueError(f"init_theta_scalars: unexpected key '{k}'")
-            base[k] = float(v)
+        for key, value in overrides.items():
+            if key not in base:
+                raise ValueError(
+                    f"posterior_config_kwargs: unexpected key '{key}'",
+                )
+            base[key] = float(value)
     return base
 
 
-def sigmas_z(overrides: dict[str, float] | None = None) -> dict[str, float]:
-    """Build positive per-block prior scales keyed by z-block names."""
-    base = {
-        "z_beta_intercept_j": 1.0,
-        "z_beta_habit_j": 1.0,
-        "z_beta_peer_j": 1.0,
-        "z_beta_weekend_jw": 1.0,
-        "z_a_m": 1.0,
-        "z_b_m": 1.0,
+def posterior_config(
+    overrides: dict[str, float] | None = None,
+):
+    """Build a Bonus2PosteriorConfig instance."""
+    from bonus2.bonus2_posterior import Bonus2PosteriorConfig  # noqa: WPS433
+
+    return Bonus2PosteriorConfig(**posterior_config_kwargs(overrides=overrides))
+
+
+def sampler_config_kwargs(
+    overrides: dict[str, float | int] | None = None,
+) -> dict[str, float | int]:
+    """Build valid Bonus2SamplerConfig kwargs."""
+    base: dict[str, float | int] = {
+        "num_results": 8,
+        "num_burnin_steps": 12,
+        "chunk_size": 5,
+        "k_beta_intercept": 0.05,
+        "k_beta_habit": 0.05,
+        "k_beta_peer": 0.05,
+        "k_beta_weekend": 0.05,
+        "k_a": 0.05,
+        "k_b": 0.05,
     }
     if overrides:
-        for k, v in overrides.items():
-            if k not in base:
-                raise ValueError(f"sigmas_z: unexpected key '{k}'")
-            base[k] = float(v)
+        for key, value in overrides.items():
+            if key not in base:
+                raise ValueError(
+                    f"sampler_config_kwargs: unexpected key '{key}'",
+                )
+            base[key] = value
     return base
 
 
-def step_size_z(overrides: dict[str, float] | None = None) -> dict[str, float]:
-    """Build positive per-block RW proposal scales keyed by z-block names."""
-    base = {
-        "z_beta_intercept_j": 0.05,
-        "z_beta_habit_j": 0.05,
-        "z_beta_peer_j": 0.05,
-        "z_beta_weekend_jw": 0.05,
-        "z_a_m": 0.05,
-        "z_b_m": 0.05,
-    }
-    if overrides:
-        for k, v in overrides.items():
-            if k not in base:
-                raise ValueError(f"step_size_z: unexpected key '{k}'")
-            base[k] = float(v)
-    return base
+def sampler_config(
+    overrides: dict[str, float | int] | None = None,
+):
+    """Build a Bonus2SamplerConfig instance."""
+    from bonus2.bonus2_estimator import Bonus2SamplerConfig  # noqa: WPS433
+
+    kwargs = sampler_config_kwargs(overrides=overrides)
+    return Bonus2SamplerConfig(
+        num_results=int(kwargs["num_results"]),
+        num_burnin_steps=int(kwargs["num_burnin_steps"]),
+        chunk_size=int(kwargs["chunk_size"]),
+        k_beta_intercept=float(kwargs["k_beta_intercept"]),
+        k_beta_habit=float(kwargs["k_beta_habit"]),
+        k_beta_peer=float(kwargs["k_beta_peer"]),
+        k_beta_weekend=float(kwargs["k_beta_weekend"]),
+        k_a=float(kwargs["k_a"]),
+        k_b=float(kwargs["k_b"]),
+    )
 
 
 # =============================================================================
@@ -399,8 +423,61 @@ def z_blocks_np(dims: dict[str, int], fill: float = 0.0) -> dict[str, np.ndarray
     }
 
 
+def z_blocks_tf(
+    dims: dict[str, int] | None = None,
+    fill: float = 0.0,
+    z_blocks: dict[str, Any] | None = None,
+) -> dict[str, tf.Tensor]:
+    """Build tf.float64 z-block tensors from dims or NumPy-backed blocks."""
+    if z_blocks is None:
+        if dims is None:
+            raise ValueError("z_blocks_tf: provide dims or z_blocks.")
+        z_blocks = z_blocks_np(dims=dims, fill=fill)
+
+    return {
+        "z_beta_intercept_j": tf.convert_to_tensor(
+            z_blocks["z_beta_intercept_j"],
+            dtype=tf.float64,
+        ),
+        "z_beta_habit_j": tf.convert_to_tensor(
+            z_blocks["z_beta_habit_j"],
+            dtype=tf.float64,
+        ),
+        "z_beta_peer_j": tf.convert_to_tensor(
+            z_blocks["z_beta_peer_j"],
+            dtype=tf.float64,
+        ),
+        "z_beta_weekend_jw": tf.convert_to_tensor(
+            z_blocks["z_beta_weekend_jw"],
+            dtype=tf.float64,
+        ),
+        "z_a_m": tf.convert_to_tensor(z_blocks["z_a_m"], dtype=tf.float64),
+        "z_b_m": tf.convert_to_tensor(z_blocks["z_b_m"], dtype=tf.float64),
+    }
+
+
+def state_tf(
+    dims: dict[str, int] | None = None,
+    fill: float = 0.0,
+    z_blocks: dict[str, Any] | None = None,
+):
+    """Build a Bonus2State from dims or NumPy-backed z-blocks."""
+    from bonus2.bonus2_estimator import Bonus2State  # noqa: WPS433
+
+    z_tf = z_blocks_tf(dims=dims, fill=fill, z_blocks=z_blocks)
+    return Bonus2State(
+        z_beta_intercept_j=z_tf["z_beta_intercept_j"],
+        z_beta_habit_j=z_tf["z_beta_habit_j"],
+        z_beta_peer_j=z_tf["z_beta_peer_j"],
+        z_beta_weekend_jw=z_tf["z_beta_weekend_jw"],
+        z_a_m=z_tf["z_a_m"],
+        z_b_m=z_tf["z_b_m"],
+    )
+
+
 def theta_true_np(
-    dims: dict[str, int], pattern: str = "nonzero"
+    dims: dict[str, int],
+    pattern: str = "nonzero",
 ) -> dict[str, np.ndarray]:
     """
     Build a structurally-valid theta dict for predictive/recovery tests.
@@ -449,18 +526,36 @@ def theta_true_np(
     }
 
 
+def theta_tf(theta: dict[str, Any]) -> dict[str, tf.Tensor]:
+    """Convert a NumPy-backed theta dictionary to tf.float64 tensors."""
+    return {
+        "beta_intercept_j": tf.convert_to_tensor(
+            theta["beta_intercept_j"],
+            dtype=tf.float64,
+        ),
+        "beta_habit_j": tf.convert_to_tensor(theta["beta_habit_j"], dtype=tf.float64),
+        "beta_peer_j": tf.convert_to_tensor(theta["beta_peer_j"], dtype=tf.float64),
+        "beta_weekend_jw": tf.convert_to_tensor(
+            theta["beta_weekend_jw"],
+            dtype=tf.float64,
+        ),
+        "a_m": tf.convert_to_tensor(theta["a_m"], dtype=tf.float64),
+        "b_m": tf.convert_to_tensor(theta["b_m"], dtype=tf.float64),
+    }
+
+
 # =============================================================================
 # TF input assembly helpers
 # =============================================================================
 
 
-def posterior_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
+def model_state_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
     """
-    Convert a canonical panel dict into PosteriorInputs tensors.
+    Convert a canonical panel dict into tensors needed to build deterministic states.
 
     Returns dict with keys:
       y_mit, delta_mj, is_weekend_t, season_sin_kt, season_cos_kt,
-      peer_adj_m, lookback, decay
+      peer_adj_m, lookback, decay, n_products
     """
     y_np = np.asarray(panel["y_mit"], dtype=np.int32)
     delta_np = np.asarray(panel["delta_mj"], dtype=np.float64)
@@ -468,7 +563,8 @@ def posterior_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
     sin_np = np.asarray(panel["season_sin_kt"], dtype=np.float64)
     cos_np = np.asarray(panel["season_cos_kt"], dtype=np.float64)
 
-    M, N, _T = (int(x) for x in y_np.shape)
+    num_consumers = int(y_np.shape[1])
+    num_products = int(delta_np.shape[1])
 
     # Import locally so tests can import this file without requiring package wiring
     # until they call this function.
@@ -476,7 +572,7 @@ def posterior_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
 
     peer_adj_m = bonus2_model.build_peer_adjacency(
         neighbors_m=panel["neighbors_m"],
-        n_consumers=N,
+        n_consumers=num_consumers,
     )
 
     return {
@@ -488,6 +584,37 @@ def posterior_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
         "peer_adj_m": peer_adj_m,
         "lookback": tf.convert_to_tensor(int(panel["lookback"]), dtype=tf.int32),
         "decay": tf.convert_to_tensor(float(panel["decay"]), dtype=tf.float64),
+        "n_products": tf.constant(num_products, dtype=tf.int32),
+    }
+
+
+def posterior_inputs_tf(panel: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert a canonical panel dict into Bonus2PosteriorInputs tensors.
+
+    Returns dict with keys:
+      y_mit, delta_mj, is_weekend_t, season_sin_kt, season_cos_kt, h_mntj, p_mntj
+    """
+    inputs = model_state_inputs_tf(panel=panel)
+
+    from bonus2 import bonus2_model as bonus2_model  # noqa: WPS433
+
+    h_mntj, p_mntj = bonus2_model.build_deterministic_states(
+        y_mit=inputs["y_mit"],
+        n_products=inputs["n_products"],
+        peer_adj_m=inputs["peer_adj_m"],
+        lookback=inputs["lookback"],
+        decay=inputs["decay"],
+    )
+
+    return {
+        "y_mit": inputs["y_mit"],
+        "delta_mj": inputs["delta_mj"],
+        "is_weekend_t": inputs["is_weekend_t"],
+        "season_sin_kt": inputs["season_sin_kt"],
+        "season_cos_kt": inputs["season_cos_kt"],
+        "h_mntj": h_mntj,
+        "p_mntj": p_mntj,
     }
 
 

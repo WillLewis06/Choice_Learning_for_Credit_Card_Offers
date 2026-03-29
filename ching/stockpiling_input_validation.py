@@ -446,7 +446,6 @@ def observed_data_validate_input(
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
     inventory_maps: Any,
-    pi_I0: tf.Tensor,
 ) -> None:
     """Validate the observed panel and fixed tensors for the sampler."""
     _require_integer_tensor(a_mnjt, "a_mnjt")
@@ -456,7 +455,6 @@ def observed_data_validate_input(
     _require_float64_tensor(price_vals_mj, "price_vals_mj")
     _require_float64_tensor(lambda_mn, "lambda_mn")
     _require_scalar_float64_tensor(waste_cost, "waste_cost")
-    _require_prob_vector(pi_I0, "pi_I0")
 
     _require_tensor_rank(a_mnjt, 4, "a_mnjt")
     _require_tensor_rank(s_mjt, 3, "s_mjt")
@@ -496,7 +494,6 @@ def observed_data_validate_input(
     M_p, J_p, S, S2 = P_price_mj.shape
     M_v, J_v, S_v = price_vals_mj.shape
     M_l, N_l = lambda_mn.shape
-    I = pi_I0.shape[0]
 
     _require(
         M > 0 and N > 0 and J > 0 and T > 0,
@@ -524,10 +521,19 @@ def observed_data_validate_input(
         (M_l, N_l) == (M, N),
         f"lambda_mn must have shape (M,N)=({M},{N}); got {lambda_mn.shape}.",
     )
-    _require(
-        I is not None and I > 0, f"pi_I0 must have length > 0; got shape {pi_I0.shape}."
-    )
 
+    _require(
+        isinstance(inventory_maps, tuple) and len(inventory_maps) == 5,
+        "inventory_maps must contain 5 tensors.",
+    )
+    i_vals = inventory_maps[0]
+    _require_integer_tensor(i_vals, "inventory_maps[0] (i_vals)")
+    _require_tensor_rank(i_vals, 1, "inventory_maps[0] (i_vals)")
+    _require(
+        i_vals.shape[0] is not None and i_vals.shape[0] > 0,
+        f"inventory_maps[0] (i_vals) must have static length > 0; got {i_vals.shape}.",
+    )
+    I = i_vals.shape[0]
     _require_inventory_maps(inventory_maps, I)
 
     _require_all_binary(a_mnjt, "a_mnjt")
@@ -536,7 +542,6 @@ def observed_data_validate_input(
     _require_all_finite(price_vals_mj, "price_vals_mj")
     _require_all_finite(lambda_mn, "lambda_mn")
     _require_all_finite(waste_cost, "waste_cost")
-    _require_all_finite(pi_I0, "pi_I0")
 
     _require_row_stochastic_matrix(P_price_mj, "P_price_mj")
     _require_all_positive(price_vals_mj, "price_vals_mj")
@@ -618,7 +623,6 @@ def sampler_validate_input(sampler_config: Any, M: int, J: int) -> None:
     """Validate the sampler configuration."""
     required = [
         "num_results",
-        "num_burnin_steps",
         "chunk_size",
         "k_beta",
         "k_alpha",
@@ -633,11 +637,6 @@ def sampler_validate_input(sampler_config: Any, M: int, J: int) -> None:
         sampler_config.num_results,
         "sampler_config.num_results",
         min_value=1,
-    )
-    _require_python_int(
-        sampler_config.num_burnin_steps,
-        "sampler_config.num_burnin_steps",
-        min_value=0,
     )
     _require_python_int(
         sampler_config.chunk_size,
@@ -710,7 +709,6 @@ def run_chain_validate_input(
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
     inventory_maps: Any,
-    pi_I0: tf.Tensor,
     posterior_config: Any,
     sampler_config: Any,
     z_beta: tf.Tensor,
@@ -730,7 +728,6 @@ def run_chain_validate_input(
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
         inventory_maps=inventory_maps,
-        pi_I0=pi_I0,
     )
     posterior_validate_input(posterior_config)
 

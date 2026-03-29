@@ -1,10 +1,15 @@
-"""
-Unit tests for lu.choice_learn.cl_updates.
+"""Unit tests for lu.choice_learn.cl_updates.
+
+This file targets the refactored update API:
+- alpha_one_step
+- E_bar_one_step
+- njt_one_step
+- gamma_one_step
 
 Constraints
 - No pytest fixture injection: all tests are plain functions with no fixture args.
 - Shared assertion helpers are imported from `lu_conftest` (a normal Python module).
-- Each test constructs its own tf.random.Generator to avoid cross-test coupling.
+- Stateless TensorFlow seeds are used to avoid cross-test coupling.
 """
 
 from __future__ import annotations
@@ -12,51 +17,60 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 
-from lu.choice_learn.cl_posterior import LuPosteriorTF
+from lu.choice_learn.cl_posterior import (
+    ChoiceLearnPosteriorConfig,
+    ChoiceLearnPosteriorTF,
+)
 from lu.choice_learn.cl_updates import (
-    update_E_bar,
-    update_alpha,
-    update_gamma,
-    update_njt,
-    update_phi,
+    E_bar_one_step,
+    alpha_one_step,
+    gamma_one_step,
+    njt_one_step,
 )
 from lu_conftest import (
     assert_all_finite_tf,
     assert_binary_01_tf,
-    assert_in_open_unit_interval_tf,
 )
 
 DTYPE = tf.float64
-K = tf.constant(0.1, dtype=DTYPE)
-RIDGE = tf.constant(1e-6, dtype=DTYPE)
+SEED_DTYPE = tf.int32
 
-_POSTERIOR_CONFIG = {
-    "alpha_mean": 1.0,
-    "alpha_var": 1.0,
-    "E_bar_mean": 0.0,
-    "E_bar_var": 1.0,
-    "T0_sq": 0.01,
-    "T1_sq": 1.0,
-    "a_phi": 2.0,
-    "b_phi": 2.0,
-}
+K_ALPHA = tf.constant(0.1, dtype=DTYPE)
+K_E_BAR = tf.constant(0.1, dtype=DTYPE)
+K_NJT = tf.constant(0.1, dtype=DTYPE)
 
 
-def _posterior() -> LuPosteriorTF:
-    return LuPosteriorTF(_POSTERIOR_CONFIG)
+def _seed(a: int, b: int) -> tf.Tensor:
+    """Create a stateless seed tensor of shape (2,)."""
+    return tf.constant([a, b], dtype=SEED_DTYPE)
 
 
-def _rng(seed: int) -> tf.random.Generator:
-    return tf.random.Generator.from_seed(seed)
+def _posterior_config() -> ChoiceLearnPosteriorConfig:
+    """Build a small posterior config for one-step update tests."""
+    return ChoiceLearnPosteriorConfig(
+        alpha_mean=1.0,
+        alpha_var=1.0,
+        E_bar_mean=0.0,
+        E_bar_var=1.0,
+        T0_sq=0.01,
+        T1_sq=1.0,
+        a_phi=2.0,
+        b_phi=2.0,
+    )
+
+
+def _posterior() -> ChoiceLearnPosteriorTF:
+    """Create the refactored choice-learn posterior object."""
+    return ChoiceLearnPosteriorTF(config=_posterior_config())
 
 
 def _tiny_problem() -> dict:
     """
-    Canonical tiny panel used in update-step tests.
+    Canonical tiny panel used in one-step update tests.
 
     Shapes
     - delta_cl, qjt: (T, J) with T=2, J=3
-    - q0t, E_bar, phi: (T,)
+    - q0t, E_bar: (T,)
     - alpha: scalar
     - njt, gamma: (T, J)
     """
@@ -71,9 +85,7 @@ def _tiny_problem() -> dict:
     E_bar = tf.constant([0.1, -0.2], dtype=DTYPE)
 
     njt = tf.constant([[0.0, 0.2, -0.1], [0.05, -0.02, 0.0]], dtype=DTYPE)
-
-    gamma = tf.cast(njt > 0.0, DTYPE)
-    phi = tf.constant([0.6, 0.4], dtype=DTYPE)
+    gamma = tf.constant([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=DTYPE)
 
     return {
         "T": T,
@@ -85,91 +97,157 @@ def _tiny_problem() -> dict:
         "E_bar": E_bar,
         "njt": njt,
         "gamma": gamma,
-        "phi": phi,
     }
 
 
-def _assert_bool_like_tf(x: tf.Tensor) -> None:
-    """
-    Accept either tf.bool tensors, or numeric tensors taking values in {0,1}.
-    Works for scalars and vectors.
-    """
+def _assert_binary_accept_scalar(x: tf.Tensor) -> None:
+    """Assert a scalar acceptance indicator in {0.0, 1.0}."""
     x_t = tf.convert_to_tensor(x)
-    if x_t.dtype == tf.bool:
-        return
+    if x_t.shape != ():
+        raise AssertionError(
+            f"Expected scalar acceptance indicator, got shape {x_t.shape}."
+        )
+    if x_t.dtype != DTYPE:
+        raise AssertionError(f"Expected dtype {DTYPE}, got {x_t.dtype}.")
 
-    xv = x_t.numpy()
-    if xv.size == 0:
-        raise AssertionError("Expected non-empty bool-like tensor.")
-
-    xv_r = np.round(xv)
-    if not np.all(np.isfinite(xv)):
-        raise AssertionError("Bool-like tensor contains non-finite values.")
-    if not np.all(np.abs(xv - xv_r) <= 1e-12):
-        raise AssertionError("Bool-like tensor contains values not close to {0,1}.")
-    if not np.all((xv_r == 0.0) | (xv_r == 1.0)):
-        raise AssertionError("Bool-like tensor contains values outside {0,1}.")
+    x_val = float(x_t.numpy())
+    if x_val not in (0.0, 1.0):
+        raise AssertionError(
+            f"Expected acceptance indicator in {{0.0, 1.0}}, got {x_val}."
+        )
 
 
-def test_update_alpha_returns_scalar_and_bool_and_is_finite():
+def _assert_accept_rate_scalar(x: tf.Tensor) -> None:
+    """Assert a scalar acceptance rate in [0.0, 1.0]."""
+    x_t = tf.convert_to_tensor(x)
+    if x_t.shape != ():
+        raise AssertionError(f"Expected scalar acceptance rate, got shape {x_t.shape}.")
+    if x_t.dtype != DTYPE:
+        raise AssertionError(f"Expected dtype {DTYPE}, got {x_t.dtype}.")
+
+    x_val = float(x_t.numpy())
+    if not np.isfinite(x_val):
+        raise AssertionError("Acceptance rate is not finite.")
+    if not (0.0 <= x_val <= 1.0):
+        raise AssertionError(f"Acceptance rate out of bounds: {x_val} not in [0, 1].")
+
+
+def test_alpha_one_step_returns_scalar_and_binary_accept_indicator():
     posterior = _posterior()
-    rng = _rng(1)
     tiny = _tiny_problem()
 
-    alpha_new, accepted = update_alpha(
+    alpha_new, accepted = alpha_one_step(
         posterior=posterior,
-        rng=rng,
         qjt=tiny["qjt"],
         q0t=tiny["q0t"],
         delta_cl=tiny["delta_cl"],
         alpha=tiny["alpha"],
         E_bar=tiny["E_bar"],
         njt=tiny["njt"],
-        k_alpha=K,
+        k_alpha=K_ALPHA,
+        seed=_seed(1, 2),
     )
 
     assert alpha_new.shape == ()
     assert alpha_new.dtype == DTYPE
-    _assert_bool_like_tf(accepted)
     assert_all_finite_tf(alpha_new)
+    _assert_binary_accept_scalar(accepted)
 
 
-def test_update_E_bar_returns_vector_and_accept_vector():
+def test_alpha_one_step_is_deterministic_for_fixed_seed():
     posterior = _posterior()
-    rng = _rng(2)
     tiny = _tiny_problem()
-    T = tiny["T"]
+    seed = _seed(11, 12)
 
-    E_bar_new, accepted = update_E_bar(
+    out_1 = alpha_one_step(
         posterior=posterior,
-        rng=rng,
         qjt=tiny["qjt"],
         q0t=tiny["q0t"],
         delta_cl=tiny["delta_cl"],
         alpha=tiny["alpha"],
         E_bar=tiny["E_bar"],
         njt=tiny["njt"],
-        gamma=tiny["gamma"],
-        phi=tiny["phi"],
-        k_E_bar=K,
+        k_alpha=K_ALPHA,
+        seed=seed,
+    )
+    out_2 = alpha_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        k_alpha=K_ALPHA,
+        seed=seed,
+    )
+
+    tf.debugging.assert_equal(out_1[0], out_2[0])
+    tf.debugging.assert_equal(out_1[1], out_2[1])
+
+
+def test_E_bar_one_step_returns_vector_and_accept_rate():
+    posterior = _posterior()
+    tiny = _tiny_problem()
+    T = tiny["T"]
+
+    E_bar_new, accept_rate = E_bar_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        k_E_bar=K_E_BAR,
+        seed=_seed(3, 4),
     )
 
     assert tuple(E_bar_new.shape) == (T,)
     assert E_bar_new.dtype == DTYPE
-    assert tuple(accepted.shape) == (T,)
-    _assert_bool_like_tf(accepted)
     assert_all_finite_tf(E_bar_new)
+    _assert_accept_rate_scalar(accept_rate)
 
 
-def test_update_njt_returns_matrix_and_acc_sum_bounds():
+def test_E_bar_one_step_is_deterministic_for_fixed_seed():
     posterior = _posterior()
-    rng = _rng(3)
+    tiny = _tiny_problem()
+    seed = _seed(13, 14)
+
+    out_1 = E_bar_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        k_E_bar=K_E_BAR,
+        seed=seed,
+    )
+    out_2 = E_bar_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        k_E_bar=K_E_BAR,
+        seed=seed,
+    )
+
+    tf.debugging.assert_equal(out_1[0], out_2[0])
+    tf.debugging.assert_equal(out_1[1], out_2[1])
+
+
+def test_njt_one_step_returns_matrix_and_accept_rate():
+    posterior = _posterior()
     tiny = _tiny_problem()
     T, J = tiny["T"], tiny["J"]
 
-    njt_new, acc_sum = update_njt(
+    njt_new, accept_rate = njt_one_step(
         posterior=posterior,
-        rng=rng,
         qjt=tiny["qjt"],
         q0t=tiny["q0t"],
         delta_cl=tiny["delta_cl"],
@@ -177,33 +255,60 @@ def test_update_njt_returns_matrix_and_acc_sum_bounds():
         E_bar=tiny["E_bar"],
         njt=tiny["njt"],
         gamma=tiny["gamma"],
-        phi=tiny["phi"],
-        k_njt=K,
-        ridge=RIDGE,
+        k_njt=K_NJT,
+        seed=_seed(5, 6),
     )
 
     assert tuple(njt_new.shape) == (T, J)
     assert njt_new.dtype == DTYPE
-    assert acc_sum.shape == ()
-    assert acc_sum.dtype == DTYPE
-
-    assert_all_finite_tf(njt_new, acc_sum)
-
-    acc = float(acc_sum.numpy())
-    assert 0.0 <= acc <= float(T), f"acc_sum out of bounds: {acc} not in [0, {T}]"
+    assert_all_finite_tf(njt_new)
+    _assert_accept_rate_scalar(accept_rate)
 
 
-def test_update_gamma_returns_binary_matrix():
+def test_njt_one_step_is_deterministic_for_fixed_seed():
     posterior = _posterior()
-    rng = _rng(4)
+    tiny = _tiny_problem()
+    seed = _seed(15, 16)
+
+    out_1 = njt_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        gamma=tiny["gamma"],
+        k_njt=K_NJT,
+        seed=seed,
+    )
+    out_2 = njt_one_step(
+        posterior=posterior,
+        qjt=tiny["qjt"],
+        q0t=tiny["q0t"],
+        delta_cl=tiny["delta_cl"],
+        alpha=tiny["alpha"],
+        E_bar=tiny["E_bar"],
+        njt=tiny["njt"],
+        gamma=tiny["gamma"],
+        k_njt=K_NJT,
+        seed=seed,
+    )
+
+    tf.debugging.assert_equal(out_1[0], out_2[0])
+    tf.debugging.assert_equal(out_1[1], out_2[1])
+
+
+def test_gamma_one_step_returns_binary_matrix():
+    posterior = _posterior()
     tiny = _tiny_problem()
     T, J = tiny["T"], tiny["J"]
 
-    gamma_new = update_gamma(
+    gamma_new = gamma_one_step(
         posterior=posterior,
-        rng=rng,
         njt=tiny["njt"],
-        phi=tiny["phi"],
+        gamma=tiny["gamma"],
+        seed=_seed(7, 8),
     )
 
     assert tuple(gamma_new.shape) == (T, J)
@@ -212,19 +317,22 @@ def test_update_gamma_returns_binary_matrix():
     assert_binary_01_tf(gamma_new)
 
 
-def test_update_phi_returns_vector_in_open_unit_interval():
+def test_gamma_one_step_is_deterministic_for_fixed_seed():
     posterior = _posterior()
-    rng = _rng(5)
     tiny = _tiny_problem()
-    T = tiny["T"]
+    seed = _seed(17, 18)
 
-    phi_new = update_phi(
+    out_1 = gamma_one_step(
         posterior=posterior,
-        rng=rng,
+        njt=tiny["njt"],
         gamma=tiny["gamma"],
+        seed=seed,
+    )
+    out_2 = gamma_one_step(
+        posterior=posterior,
+        njt=tiny["njt"],
+        gamma=tiny["gamma"],
+        seed=seed,
     )
 
-    assert tuple(phi_new.shape) == (T,)
-    assert phi_new.dtype == DTYPE
-    assert_all_finite_tf(phi_new)
-    assert_in_open_unit_interval_tf(phi_new)
+    tf.debugging.assert_equal(out_1, out_2)

@@ -3,104 +3,166 @@
 Unit tests for `bonus2.bonus2_posterior`.
 
 Coverage:
-- Normal(0, sigma^2) block prior (dropping constants): `logprior_normal_sum`
-- Likelihood wrappers: `loglik_mnt` and `loglik` (shape, finiteness, sum consistency)
-- Block log-target: `log_target_block_normal_prior` combines likelihood + specified block prior only
+- `Bonus2PosteriorTF` likelihood wrappers: `loglik_mnt` and `loglik`
+- Public block priors against the closed-form Gaussian quadratic prior
+- `logprior_all` as the sum of block priors
+- Block log posterior methods as likelihood plus the specified block prior only
+- `joint_logpost` as `loglik + logprior_all`
 """
 
 from __future__ import annotations
-
-from unittest.mock import patch
 
 import numpy as np
 
 import bonus2_conftest as bc  # sets TF_CPP_MIN_LOG_LEVEL before importing TF
 import tensorflow as tf
 
-from bonus2 import bonus2_model as bm
 from bonus2 import bonus2_posterior as bp
 
+ATOL = 1e-12
+RTOL = 0.0
 
-def _build_inputs_tf(panel_np: dict[str, object]) -> dict[str, object]:
-    """Convert a canonical panel dict into PosteriorInputs tensors."""
-    y_mit = tf.convert_to_tensor(
-        np.asarray(panel_np["y_mit"], dtype=np.int32), tf.int32
-    )
-    delta_mj = tf.convert_to_tensor(
-        np.asarray(panel_np["delta_mj"], dtype=np.float64), tf.float64
-    )
-    is_weekend_t = tf.convert_to_tensor(
-        np.asarray(panel_np["is_weekend_t"], dtype=np.int32), tf.int32
-    )
-    season_sin_kt = tf.convert_to_tensor(
-        np.asarray(panel_np["season_sin_kt"], dtype=np.float64), tf.float64
-    )
-    season_cos_kt = tf.convert_to_tensor(
-        np.asarray(panel_np["season_cos_kt"], dtype=np.float64), tf.float64
-    )
 
-    lookback = tf.convert_to_tensor(int(panel_np["lookback"]), tf.int32)
-    decay = tf.convert_to_tensor(float(panel_np["decay"]), tf.float64)
-
-    _m, n, _t = (int(x) for x in y_mit.shape)
-    peer_adj_m = bm.build_peer_adjacency(
-        neighbors_m=panel_np["neighbors_m"], n_consumers=n
-    )
-
-    return {
-        "y_mit": y_mit,
-        "delta_mj": delta_mj,
-        "is_weekend_t": is_weekend_t,
-        "season_sin_kt": season_sin_kt,
-        "season_cos_kt": season_cos_kt,
-        "peer_adj_m": peer_adj_m,
-        "lookback": lookback,
-        "decay": decay,
-    }
+def _make_posterior(
+    panel_np: dict[str, object],
+    config_overrides: dict[str, float] | None = None,
+) -> tuple[bp.Bonus2PosteriorTF, bp.Bonus2PosteriorConfig, dict[str, object]]:
+    """Build a Bonus2PosteriorTF and return it with its config and inputs."""
+    config = bc.posterior_config(overrides=config_overrides)
+    inputs = bc.posterior_inputs_tf(panel_np)
+    posterior = bp.Bonus2PosteriorTF(config=config, inputs=inputs)
+    return posterior, config, inputs
 
 
 def _z_zero_tf(dims: dict[str, int]) -> dict[str, tf.Tensor]:
     """Zero-filled z dict with correct block shapes and float64 dtype."""
-    m, j, k = int(dims["M"]), int(dims["J"]), int(dims["K"])
-    return {
-        "z_beta_intercept_j": tf.zeros((j,), tf.float64),
-        "z_beta_habit_j": tf.zeros((j,), tf.float64),
-        "z_beta_peer_j": tf.zeros((j,), tf.float64),
-        "z_beta_weekend_jw": tf.zeros((j, 2), tf.float64),
-        "z_a_m": tf.zeros((m, k), tf.float64),
-        "z_b_m": tf.zeros((m, k), tf.float64),
-    }
+    return bc.z_blocks_tf(dims=dims, fill=0.0)
 
 
-def _sigma_z_tf(keys: tuple[str, ...], value: float = 1.0) -> dict[str, tf.Tensor]:
-    """Scalar float64 sigma per z-block key."""
-    v = tf.convert_to_tensor(float(value), tf.float64)
-    return {k: v for k in keys}
+def _closed_form_logprior(z_block: tf.Tensor, sigma: float) -> float:
+    """Closed-form Gaussian quadratic prior used by the posterior block priors."""
+    z_np = tf.convert_to_tensor(z_block).numpy()
+    return float(-0.5 * np.sum((z_np / float(sigma)) ** 2))
 
 
-def test_logprior_normal_sum_matches_formula() -> None:
-    z = tf.convert_to_tensor(np.asarray([1.0, -2.0, 3.0], dtype=np.float64), tf.float64)
+def test_logprior_beta_habit_matches_formula() -> None:
+    dims = bc.tiny_dims()
+    panel = bc.panel_np(dims=dims, hyper=bc.tiny_hyperparams())
+    posterior, config, _inputs = _make_posterior(panel)
 
-    sigma_scalar = tf.convert_to_tensor(2.0, tf.float64)
-    out_scalar = bp.logprior_normal_sum(z_block=z, sigma=sigma_scalar).numpy()
-    expected_scalar = -0.5 * np.sum((z.numpy() / 2.0) ** 2)
-    np.testing.assert_allclose(out_scalar, expected_scalar, rtol=0, atol=1e-12)
-
-    sigma_vec = tf.convert_to_tensor(
-        np.asarray([1.0, 2.0, 4.0], dtype=np.float64), tf.float64
+    z_beta_habit_j = tf.convert_to_tensor(
+        np.asarray([0.5, -1.0, 2.0], dtype=np.float64),
+        dtype=tf.float64,
     )
-    out_vec = bp.logprior_normal_sum(z_block=z, sigma=sigma_vec).numpy()
-    expected_vec = -0.5 * np.sum((z.numpy() / sigma_vec.numpy()) ** 2)
-    np.testing.assert_allclose(out_vec, expected_vec, rtol=0, atol=1e-12)
 
-    # Nontrivial shape reduction
-    z2 = tf.convert_to_tensor(
-        np.asarray([[1.0, 2.0], [-1.0, 0.5]], dtype=np.float64), tf.float64
+    out = posterior.logprior_beta_habit(
+        z_beta_habit_j=z_beta_habit_j,
+    ).numpy()
+
+    expected = _closed_form_logprior(
+        z_block=z_beta_habit_j,
+        sigma=config.sigma_z_beta_habit_j,
     )
-    sigma2 = tf.convert_to_tensor(0.5, tf.float64)
-    out2 = bp.logprior_normal_sum(z_block=z2, sigma=sigma2).numpy()
-    expected2 = -0.5 * np.sum((z2.numpy() / 0.5) ** 2)
-    np.testing.assert_allclose(out2, expected2, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_logprior_beta_weekend_matches_formula() -> None:
+    dims = bc.tiny_dims()
+    panel = bc.panel_np(dims=dims, hyper=bc.tiny_hyperparams())
+    posterior, config, _inputs = _make_posterior(panel)
+
+    z_beta_weekend_jw = tf.convert_to_tensor(
+        np.asarray(
+            [
+                [0.25, -0.50],
+                [1.00, 0.75],
+                [-1.50, 0.10],
+            ],
+            dtype=np.float64,
+        ),
+        dtype=tf.float64,
+    )
+
+    out = posterior.logprior_beta_weekend(
+        z_beta_weekend_jw=z_beta_weekend_jw,
+    ).numpy()
+
+    expected = _closed_form_logprior(
+        z_block=z_beta_weekend_jw,
+        sigma=config.sigma_z_beta_weekend_jw,
+    )
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_logprior_all_equals_sum_of_block_priors() -> None:
+    dims = bc.tiny_dims()
+    panel = bc.panel_np(dims=dims, hyper=bc.tiny_hyperparams())
+    posterior, _config, _inputs = _make_posterior(panel)
+
+    z = _z_zero_tf(dims)
+    z["z_beta_intercept_j"] = tf.convert_to_tensor(
+        np.asarray([0.10, -0.20, 0.30], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_habit_j"] = tf.convert_to_tensor(
+        np.asarray([0.40, 0.00, -0.50], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_peer_j"] = tf.convert_to_tensor(
+        np.asarray([-0.10, 0.20, 0.30], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_weekend_jw"] = tf.convert_to_tensor(
+        np.asarray(
+            [
+                [0.20, -0.10],
+                [0.00, 0.30],
+                [-0.40, 0.50],
+            ],
+            dtype=np.float64,
+        ),
+        dtype=tf.float64,
+    )
+    z["z_a_m"] = tf.convert_to_tensor(
+        np.asarray([[-0.20], [0.15]], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_b_m"] = tf.convert_to_tensor(
+        np.asarray([[0.05], [-0.25]], dtype=np.float64),
+        dtype=tf.float64,
+    )
+
+    out = posterior.logprior_all(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    ).numpy()
+
+    expected = (
+        posterior.logprior_beta_intercept(
+            z_beta_intercept_j=z["z_beta_intercept_j"],
+        )
+        + posterior.logprior_beta_habit(
+            z_beta_habit_j=z["z_beta_habit_j"],
+        )
+        + posterior.logprior_beta_peer(
+            z_beta_peer_j=z["z_beta_peer_j"],
+        )
+        + posterior.logprior_beta_weekend(
+            z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        )
+        + posterior.logprior_a(
+            z_a_m=z["z_a_m"],
+        )
+        + posterior.logprior_b(
+            z_b_m=z["z_b_m"],
+        )
+    ).numpy()
+
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)
 
 
 def test_loglik_mnt_runs_end_to_end_and_is_finite_and_loglik_is_sum() -> None:
@@ -112,20 +174,34 @@ def test_loglik_mnt_runs_end_to_end_and_is_finite_and_loglik_is_sum() -> None:
         neighbor_pattern="asymmetric",
         weekend_pattern="0101",
     )
-    inputs = _build_inputs_tf(panel)
+    posterior, _config, _inputs = _make_posterior(panel)
     z = _z_zero_tf(dims)
 
-    ll_mnt = bp.loglik_mnt(z=z, inputs=inputs)
+    ll_mnt = posterior.loglik_mnt(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    )
     assert tuple(ll_mnt.shape) == (dims["M"], dims["N"], dims["T"])
     ll_mnt_np = ll_mnt.numpy()
     assert np.isfinite(ll_mnt_np).all()
 
-    ll = bp.loglik(z=z, inputs=inputs)
+    ll = posterior.loglik(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    )
     assert tuple(ll.shape) == ()
     ll_np = ll.numpy()
     assert np.isfinite(ll_np)
 
-    np.testing.assert_allclose(ll_np, ll_mnt_np.sum(), rtol=0, atol=1e-10)
+    np.testing.assert_allclose(ll_np, ll_mnt_np.sum(), rtol=RTOL, atol=1e-10)
 
 
 def test_loglik_runs_with_K0_no_seasonality() -> None:
@@ -137,57 +213,184 @@ def test_loglik_runs_with_K0_no_seasonality() -> None:
         neighbor_pattern="ring",
         weekend_pattern="0101",
     )
-    inputs = _build_inputs_tf(panel)
+    posterior, _config, _inputs = _make_posterior(panel)
     z = _z_zero_tf(dims)
 
-    ll_mnt = bp.loglik_mnt(z=z, inputs=inputs)
+    ll_mnt = posterior.loglik_mnt(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    )
     assert tuple(ll_mnt.shape) == (dims["M"], dims["N"], dims["T"])
     assert np.isfinite(ll_mnt.numpy()).all()
 
-    ll = bp.loglik(z=z, inputs=inputs)
+    ll = posterior.loglik(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    )
     assert np.isfinite(ll.numpy())
 
 
-def test_log_target_block_normal_prior_combines_ll_and_block_prior_with_patch() -> None:
+def test_beta_habit_block_logpost_equals_loglik_plus_block_prior() -> None:
     dims = bc.tiny_dims()
-    panel = bc.panel_np(dims=dims, hyper=bc.tiny_hyperparams())
-    inputs = _build_inputs_tf(panel)
-
+    panel = bc.panel_np(
+        dims=dims,
+        hyper=bc.tiny_hyperparams(),
+        y_pattern="alternating",
+        neighbor_pattern="asymmetric",
+        weekend_pattern="0101",
+    )
+    posterior, _config, _inputs = _make_posterior(panel)
     z = _z_zero_tf(dims)
-    sigma_z = _sigma_z_tf(bp.Z_KEYS, value=2.0)
-
-    # Target block with nonzero entries.
-    z_key = "z_beta_habit_j"
-    z[z_key] = tf.convert_to_tensor(
-        np.asarray([0.5, -1.0, 2.0], dtype=np.float64), tf.float64
+    z["z_beta_habit_j"] = tf.convert_to_tensor(
+        np.asarray([0.5, -1.0, 2.0], dtype=np.float64),
+        dtype=tf.float64,
     )
 
-    # Make another block huge; should not matter because only the specified block prior is included.
-    z["z_beta_peer_j"] = tf.fill((dims["J"],), tf.constant(1.0e6, tf.float64))
+    out = posterior.beta_habit_block_logpost(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    ).numpy()
 
-    ll_const = tf.constant(123.0, tf.float64)
-    expected_lp = bp.logprior_normal_sum(z_block=z[z_key], sigma=sigma_z[z_key]).numpy()
-    expected = ll_const.numpy() + expected_lp
-
-    with patch("bonus2.bonus2_posterior.loglik", return_value=ll_const) as mocked:
-        out = bp.log_target_block_normal_prior(
-            z=z, z_key=z_key, inputs=inputs, sigma_z=sigma_z
+    expected = (
+        posterior.loglik(
+            z_beta_intercept_j=z["z_beta_intercept_j"],
+            z_beta_habit_j=z["z_beta_habit_j"],
+            z_beta_peer_j=z["z_beta_peer_j"],
+            z_beta_weekend_jw=z["z_beta_weekend_jw"],
+            z_a_m=z["z_a_m"],
+            z_b_m=z["z_b_m"],
         )
-        out_np = out.numpy()
-
-        np.testing.assert_allclose(out_np, expected, rtol=0, atol=1e-12)
-
-        mocked.assert_called_once()
-        # Ensure signature is respected.
-        args, kwargs = mocked.call_args
-        assert kwargs["z"] is z
-        assert kwargs["inputs"] is inputs
-
-    # Guard: changing other blocks should not change the target (since their priors are omitted).
-    z2 = dict(z)
-    z2["z_beta_peer_j"] = tf.fill((dims["J"],), tf.constant(-1.0e6, tf.float64))
-    with patch("bonus2.bonus2_posterior.loglik", return_value=ll_const):
-        out2 = bp.log_target_block_normal_prior(
-            z=z2, z_key=z_key, inputs=inputs, sigma_z=sigma_z
+        + posterior.logprior_beta_habit(
+            z_beta_habit_j=z["z_beta_habit_j"],
         )
-        np.testing.assert_allclose(out2.numpy(), expected, rtol=0, atol=1e-12)
+    ).numpy()
+
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_a_block_logpost_equals_loglik_plus_block_prior() -> None:
+    dims = bc.tiny_dims()
+    panel = bc.panel_np(
+        dims=dims,
+        hyper=bc.tiny_hyperparams(),
+        y_pattern="mixed",
+        neighbor_pattern="ring",
+        weekend_pattern="0101",
+    )
+    posterior, _config, _inputs = _make_posterior(panel)
+    z = _z_zero_tf(dims)
+    z["z_a_m"] = tf.convert_to_tensor(
+        np.asarray([[-0.25], [0.75]], dtype=np.float64),
+        dtype=tf.float64,
+    )
+
+    out = posterior.a_block_logpost(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    ).numpy()
+
+    expected = (
+        posterior.loglik(
+            z_beta_intercept_j=z["z_beta_intercept_j"],
+            z_beta_habit_j=z["z_beta_habit_j"],
+            z_beta_peer_j=z["z_beta_peer_j"],
+            z_beta_weekend_jw=z["z_beta_weekend_jw"],
+            z_a_m=z["z_a_m"],
+            z_b_m=z["z_b_m"],
+        )
+        + posterior.logprior_a(
+            z_a_m=z["z_a_m"],
+        )
+    ).numpy()
+
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)
+
+
+def test_joint_logpost_equals_loglik_plus_logprior_all() -> None:
+    dims = bc.tiny_dims()
+    panel = bc.panel_np(
+        dims=dims,
+        hyper=bc.tiny_hyperparams(),
+        y_pattern="alternating",
+        neighbor_pattern="asymmetric",
+        weekend_pattern="0101",
+    )
+    posterior, _config, _inputs = _make_posterior(panel)
+    z = _z_zero_tf(dims)
+    z["z_beta_intercept_j"] = tf.convert_to_tensor(
+        np.asarray([0.10, -0.15, 0.05], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_habit_j"] = tf.convert_to_tensor(
+        np.asarray([0.20, 0.00, -0.30], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_peer_j"] = tf.convert_to_tensor(
+        np.asarray([-0.10, 0.25, 0.15], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_beta_weekend_jw"] = tf.convert_to_tensor(
+        np.asarray(
+            [
+                [0.10, -0.05],
+                [0.00, 0.20],
+                [-0.30, 0.40],
+            ],
+            dtype=np.float64,
+        ),
+        dtype=tf.float64,
+    )
+    z["z_a_m"] = tf.convert_to_tensor(
+        np.asarray([[-0.20], [0.10]], dtype=np.float64),
+        dtype=tf.float64,
+    )
+    z["z_b_m"] = tf.convert_to_tensor(
+        np.asarray([[0.05], [-0.15]], dtype=np.float64),
+        dtype=tf.float64,
+    )
+
+    out = posterior.joint_logpost(
+        z_beta_intercept_j=z["z_beta_intercept_j"],
+        z_beta_habit_j=z["z_beta_habit_j"],
+        z_beta_peer_j=z["z_beta_peer_j"],
+        z_beta_weekend_jw=z["z_beta_weekend_jw"],
+        z_a_m=z["z_a_m"],
+        z_b_m=z["z_b_m"],
+    ).numpy()
+
+    expected = (
+        posterior.loglik(
+            z_beta_intercept_j=z["z_beta_intercept_j"],
+            z_beta_habit_j=z["z_beta_habit_j"],
+            z_beta_peer_j=z["z_beta_peer_j"],
+            z_beta_weekend_jw=z["z_beta_weekend_jw"],
+            z_a_m=z["z_a_m"],
+            z_b_m=z["z_b_m"],
+        )
+        + posterior.logprior_all(
+            z_beta_intercept_j=z["z_beta_intercept_j"],
+            z_beta_habit_j=z["z_beta_habit_j"],
+            z_beta_peer_j=z["z_beta_peer_j"],
+            z_beta_weekend_jw=z["z_beta_weekend_jw"],
+            z_a_m=z["z_a_m"],
+            z_b_m=z["z_b_m"],
+        )
+    ).numpy()
+
+    np.testing.assert_allclose(out, expected, rtol=RTOL, atol=ATOL)

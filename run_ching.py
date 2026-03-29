@@ -39,20 +39,12 @@ from run_zhang_with_lu import (
 )
 
 
-def uniform_pi_I0(I_max: int) -> np.ndarray:
-    """Return the uniform initial inventory distribution over {0, ..., I_max}."""
-    pi = np.ones(I_max + 1, dtype=np.float64)
-    return pi / pi.sum()
-
-
 CFG_PHASE1: dict[str, Any] = {
     "seed": 123,
     "num_products": 10,
     "num_groups": 2,
     "num_markets": 5,
     "N_base": 2_000,
-    "N_shock": 1_000,
-    "num_features": 10,
     "N_shock": 1_000,
     "num_features": 10,
     "x_sd": 1.0,
@@ -62,14 +54,13 @@ CFG_PHASE1: dict[str, Any] = {
     "sd_E": 0.5,
     "p_active": 0.5,
     "sd_u": 0.5,
-    "depth": 2,
-    "width": 64,
-    "heads": 4,
-    "epochs": 50,
+    "depth": 5,
+    "width": 128,
+    "heads": 8,
+    "epochs": 100,
     "batch_size": 256,
     "learning_rate": 1e-3,
     "shuffle_buffer": 1000,
-    "eval_include_outside": True,
     "eval_against_empirical": True,
 }
 
@@ -86,9 +77,9 @@ CFG_PHASE2: dict[str, Any] = {
         "b_phi": 1.0,
     },
     "shrinkage": {
-        "num_results": 200,
+        "num_results": 2000,
         "num_burnin_steps": 0,
-        "chunk_size": 100,
+        "chunk_size": 200,
         "k_alpha": 2.0,
         "k_E_bar": 2.0,
         "k_njt": 0.5,
@@ -108,8 +99,6 @@ CFG_PHASE3: dict[str, Any] = {
     "waste_cost": 1.0,
     "dp_tol": 1e-5,
     "dp_max_iter": 200,
-    "pi_I0": uniform_pi_I0(10),
-    "price_seed": 777,
     "p_stay": 0.85,
     "P_noise_sd": 0.05,
     "P_min_prob": 1e-6,
@@ -118,7 +107,6 @@ CFG_PHASE3: dict[str, Any] = {
     "discount_low": 0.10,
     "discount_high": 0.35,
     "price_noise_sd": 0.02,
-    "mcmc_seed": 0,
     "posterior": {
         "tol": 1e-5,
         "max_iter": 200,
@@ -130,8 +118,7 @@ CFG_PHASE3: dict[str, Any] = {
         "sigma_z_u_scale": 2.0,
     },
     "sampler": {
-        "num_results": 100,
-        "num_burnin_steps": 0,
+        "num_results": 500,
         "chunk_size": 50,
         "k_beta": 0.10,
         "k_alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.05, dtype=np.float64),
@@ -307,7 +294,6 @@ def _build_phase3_sampler_config(cfg: dict[str, Any]) -> StockpilingConfig:
     scfg = cfg["sampler"]
     return StockpilingConfig(
         num_results=int(scfg["num_results"]),
-        num_burnin_steps=int(scfg["num_burnin_steps"]),
         chunk_size=int(scfg["chunk_size"]),
         k_beta=tf.constant(float(scfg["k_beta"]), dtype=tf.float64),
         k_alpha=tf.constant(
@@ -365,7 +351,7 @@ def summarize_stockpiling_panel(panel: dict[str, Any]) -> None:
 
 
 def run_phase1(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Run Phase 1 and print diagnostics."""
+    """Run Phase 1 and print inside-choice diagnostics."""
     print("=== Phase 1: Baseline choice model ===")
     out = run_choice_model(
         seed=int(cfg["seed"]),
@@ -396,11 +382,7 @@ def run_phase1(cfg: dict[str, Any]) -> dict[str, Any]:
         delta_hat=out["delta_hat"],
         delta_true=dgp["delta_true"],
         qj_base=dgp["qj_base"],
-        q0_base=int(dgp["q0_base"]),
         p_base=dgp["p_base"],
-        p0_base=float(dgp["p0_base"]),
-        N_base=int(cfg["N_base"]),
-        eval_include_outside=bool(cfg["eval_include_outside"]),
         eval_against_empirical=bool(cfg["eval_against_empirical"]),
     )
     return out
@@ -495,11 +477,14 @@ def run_phase3_estimation(
     panel: dict[str, Any],
     P_price_mj: np.ndarray,
     price_vals_mj: np.ndarray,
+    mcmc_seed: int,
 ) -> dict[str, Any]:
     """Run the Phase-3 chain and summarize retained samples."""
     a = np.asarray(panel["a_mnjt"])
     M = int(a.shape[0])
     J = int(a.shape[2])
+
+    initial_state = build_initial_state(M=M, J=J)
 
     run_result = run_chain(
         a_mnjt=tf.constant(panel["a_mnjt"], dtype=tf.int32),
@@ -510,11 +495,10 @@ def run_phase3_estimation(
         lambda_mn=tf.constant(panel["lambda_mn"], dtype=tf.float64),
         waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
         inventory_maps=build_inventory_maps(int(cfg["I_max"])),
-        pi_I0=tf.constant(np.asarray(cfg["pi_I0"], dtype=np.float64), dtype=tf.float64),
         posterior_config=_build_phase3_posterior_config(cfg),
         stockpiling_config=_build_phase3_sampler_config(cfg),
-        initial_state=build_initial_state(M=M, J=J),
-        seed=tf.constant([int(cfg["mcmc_seed"]), 0], dtype=tf.int32),
+        initial_state=initial_state,
+        seed=tf.constant([int(mcmc_seed), 0], dtype=tf.int32),
     )
 
     theta_hat_tf = summarize_samples(run_result.samples)
@@ -529,7 +513,7 @@ def run_phase3_estimation(
     return {
         "samples": run_result.samples,
         "theta_hat": theta_hat,
-        "initial_state": build_initial_state(M=M, J=J),
+        "initial_state": initial_state,
         "posterior_config": _build_phase3_posterior_config(cfg),
         "chunk_summaries": run_result.chunk_summaries,
         "mcmc_summary": run_result.mcmc_summary,
@@ -564,7 +548,6 @@ def run_phase3_evaluation(
         lambda_mn=tf.constant(lam, dtype=tf.float64),
         waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
         inventory_maps=build_inventory_maps(int(cfg["I_max"])),
-        pi_I0=tf.constant(np.asarray(cfg["pi_I0"], dtype=np.float64), dtype=tf.float64),
     )
 
     fitted_state = _theta_to_state(theta_hat, M=M)
@@ -632,11 +615,15 @@ def main() -> None:
     M = int(E_bar_used.shape[0])
     J = int(delta_used.shape[0])
 
+    phase3_price_seed = 777
+    phase3_dgp_seed = phase3_price_seed + 1
+    phase3_mcmc_seed = 0
+
     P_price_mj, price_vals_mj = build_price_processes(
         M=M,
         J=J,
         S=int(CFG_PHASE3["S"]),
-        seed_price=int(CFG_PHASE3["price_seed"]),
+        seed_price=phase3_price_seed,
         p_stay=float(CFG_PHASE3["p_stay"]),
         P_noise_sd=float(CFG_PHASE3["P_noise_sd"]),
         P_min_prob=float(CFG_PHASE3["P_min_prob"]),
@@ -659,7 +646,7 @@ def main() -> None:
         njt_used=njt_used,
         P_price_mj=P_price_mj,
         price_vals_mj=price_vals_mj,
-        seed_dgp=int(CFG_PHASE3["price_seed"]) + 1,
+        seed_dgp=phase3_dgp_seed,
     )
     summarize_stockpiling_panel(panel)
 
@@ -668,6 +655,7 @@ def main() -> None:
         panel=panel,
         P_price_mj=P_price_mj,
         price_vals_mj=price_vals_mj,
+        mcmc_seed=phase3_mcmc_seed,
     )
 
     run_phase3_evaluation(

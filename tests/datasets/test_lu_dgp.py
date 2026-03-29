@@ -3,7 +3,6 @@ import pytest
 
 from datasets.lu_dgp import (
     BasicLuChoiceModel,
-    _generate_market_shares,
     generate_market,
     generate_market_conditions,
 )
@@ -29,7 +28,7 @@ def assert_finite_np(x: np.ndarray, name: str = "array") -> None:
 
 def _assert_prob_simplex(sjt: np.ndarray, s0t: np.ndarray, atol: float = 1e-12) -> None:
     """
-    sjt: (T,J), s0t: (T,)
+    sjt: (T, J), s0t: (T,)
     Checks: finite, bounds, and s0t + sum_j sjt == 1 marketwise.
     """
     assert_finite_np(sjt, name="sjt")
@@ -79,10 +78,11 @@ def test_generate_market_conditions_contract_all_types():
       - shapes
       - finiteness
       - wjt support
+      - sparse-support return contract
     """
     T, J = 7, 11
     for dgp_type in [1, 2, 3, 4]:
-        wjt, Ejt, ujt, alpha = generate_market_conditions(
+        wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
             T=T, J=J, dgp_type=dgp_type, seed=123
         )
 
@@ -90,36 +90,55 @@ def test_generate_market_conditions_contract_all_types():
         assert Ejt.shape == (T, J)
         assert ujt.shape == (T, J)
         assert alpha.shape == (T, J)
+        assert E_bar_t.shape == (T,)
+        assert njt.shape == (T, J)
 
         assert_finite_np(wjt, name="wjt")
         assert_finite_np(Ejt, name="Ejt")
         assert_finite_np(ujt, name="ujt")
         assert_finite_np(alpha, name="alpha")
+        assert_finite_np(E_bar_t, name="E_bar_t")
+        assert_finite_np(njt, name="njt")
 
         assert np.min(wjt) >= 1.0
         assert np.max(wjt) <= 2.0
+
+        if dgp_type in [1, 2]:
+            assert support_true is not None
+            assert support_true.shape == (T, J)
+            assert support_true.dtype == bool
+            assert np.array_equal(support_true, njt != 0.0)
+        else:
+            assert support_true is None
 
 
 def test_generate_market_conditions_njt_structure_sparse_dgp12():
     """
     For DGP 1/2:
-      - E_bar_t is fixed at -1, so njt = Ejt + 1
+      - E_bar_t is fixed at -1
+      - Ejt = E_bar_t[:, None] + njt
       - n_active = int(0.4*J)
       - for j < n_active: njt[t,j] = +1 if j even else -1
       - for j >= n_active: njt[t,j] = 0
+      - support_true == (njt != 0)
     """
     T, J = 10, 15
     n_active = int(0.4 * J)
     expected_active = np.array([1.0 if (j % 2 == 0) else -1.0 for j in range(n_active)])
 
     for dgp_type in [1, 2]:
-        wjt, Ejt, ujt, alpha = generate_market_conditions(
+        wjt, Ejt, ujt, alpha, E_bar_t, njt, support_true = generate_market_conditions(
             T=T, J=J, dgp_type=dgp_type, seed=123
         )
-        njt = Ejt + 1.0
+
+        assert np.all(E_bar_t == -1.0)
+        assert np.allclose(Ejt, E_bar_t[:, None] + njt)
 
         assert np.all(njt[:, :n_active] == expected_active[None, :])
         assert np.all(njt[:, n_active:] == 0.0)
+
+        assert support_true is not None
+        assert np.array_equal(support_true, njt != 0.0)
 
         assert_finite_np(wjt, name="wjt")
         assert_finite_np(ujt, name="ujt")
@@ -128,7 +147,7 @@ def test_generate_market_conditions_njt_structure_sparse_dgp12():
 
 def test_generate_market_conditions_alpha_rules_all_types():
     """
-    Alpha rules (using njt = Ejt + 1 because E_bar_t = -1):
+    Alpha rules:
       - dgp 1,3: alpha == 0
       - dgp 2: alpha = +0.3 if njt==+1, -0.3 if njt==-1, else 0
       - dgp 4: alpha = +0.3 if njt>=1/3, -0.3 if njt<=-1/3, else 0
@@ -137,10 +156,9 @@ def test_generate_market_conditions_alpha_rules_all_types():
     thr = 1.0 / 3.0
 
     for dgp_type in [1, 2, 3, 4]:
-        _, Ejt, _, alpha = generate_market_conditions(
+        _, _, _, alpha, _, njt, _ = generate_market_conditions(
             T=T, J=J, dgp_type=dgp_type, seed=123
         )
-        njt = Ejt + 1.0
 
         if dgp_type in [1, 3]:
             assert np.all(alpha == 0.0)
@@ -187,7 +205,7 @@ def test_utilities_output_shape_and_finite():
     pjt, wjt, Ejt = _deterministic_panel(T, J)
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-    assert uijt.shape == (T, N_sim, J)
+    assert uijt.shape == (N_sim, T, J)
     assert_finite_np(uijt, name="uijt")
 
 
@@ -198,7 +216,7 @@ def test_utilities_sigma_zero_constant_across_consumers():
     pjt, wjt, Ejt = _deterministic_panel(T, J)
     uijt = model.utilities(pjt=pjt, wjt=wjt, Ejt=Ejt)
 
-    assert np.allclose(uijt, uijt[:, :1, :], atol=0.0, rtol=0.0)
+    assert np.allclose(uijt, uijt[:1, :, :], atol=0.0, rtol=0.0)
 
 
 def test_utilities_reduces_when_beta_w_zero_and_Ejt_zero():
@@ -214,53 +232,8 @@ def test_utilities_reduces_when_beta_w_zero_and_Ejt_zero():
     if beta_p_i.ndim == 0:
         beta_p_i = np.full((N_sim,), float(beta_p_i), dtype=float)
 
-    expected = beta_p_i[None, :, None] * pjt[:, None, :]
+    expected = beta_p_i[:, None, None] * pjt[None, :, :]
     assert np.allclose(uijt, expected)
-
-
-# -----------------------------------------------------------------------------
-# _generate_market_shares
-# -----------------------------------------------------------------------------
-def test_generate_market_shares_rejects_non_3d_uijt():
-    with pytest.raises(ValueError):
-        _generate_market_shares(np.zeros((3, 4), dtype=float))
-
-
-def test_generate_market_shares_contract_and_extremes():
-    T, J, N_sim = 4, 7, 50
-
-    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
-    sjt, s0t = _generate_market_shares(uijt)
-
-    assert sjt.shape == (T, J)
-    assert s0t.shape == (T,)
-    _assert_prob_simplex(sjt, s0t)
-
-    for level in [-50.0, 50.0]:
-        u_ext = np.full((T, N_sim, J), level, dtype=float)
-        sjt_e, s0t_e = _generate_market_shares(u_ext)
-        _assert_prob_simplex(sjt_e, s0t_e)
-
-        if level < 0:
-            assert np.all(s0t_e > 1.0 - 1e-10)
-            assert np.all(sjt_e < 1e-10)
-        else:
-            assert np.all(s0t_e < 1e-10)
-            assert np.all(np.abs(sjt_e.sum(axis=1) - 1.0) < 1e-10)
-
-
-def test_generate_market_shares_monotone_under_additive_shift():
-    T, J, N_sim = 4, 6, 40
-    uijt = np.linspace(-0.5, 0.5, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
-
-    sjt0, s0t0 = _generate_market_shares(uijt)
-    sjt1, s0t1 = _generate_market_shares(uijt + 1.0)
-
-    assert np.all(s0t1 < s0t0)
-    assert np.all(sjt1.sum(axis=1) > sjt0.sum(axis=1))
-
-    _assert_prob_simplex(sjt0, s0t0)
-    _assert_prob_simplex(sjt1, s0t1)
 
 
 # -----------------------------------------------------------------------------
@@ -271,11 +244,50 @@ def test_generate_market_rejects_non_3d_uijt():
         generate_market(uijt=np.zeros((3, 4), dtype=float), N=100, seed=123)
 
 
+def test_generate_market_contract_and_extremes():
+    T, J, N_sim = 4, 7, 50
+
+    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(N_sim, T, J)
+    sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=500, seed=123)
+
+    assert sjt.shape == (T, J)
+    assert s0t.shape == (T,)
+    assert qjt.shape == (T, J)
+    assert q0t.shape == (T,)
+    _assert_prob_simplex(sjt, s0t)
+
+    for level in [-50.0, 50.0]:
+        u_ext = np.full((N_sim, T, J), level, dtype=float)
+        sjt_e, s0t_e, _, _ = generate_market(uijt=u_ext, N=500, seed=123)
+        _assert_prob_simplex(sjt_e, s0t_e)
+
+        if level < 0:
+            assert np.all(s0t_e > 1.0 - 1e-10)
+            assert np.all(sjt_e < 1e-10)
+        else:
+            assert np.all(s0t_e < 1e-10)
+            assert np.all(np.abs(sjt_e.sum(axis=1) - 1.0) < 1e-10)
+
+
+def test_generate_market_monotone_under_additive_shift():
+    T, J, N_sim = 4, 6, 40
+    uijt = np.linspace(-0.5, 0.5, T * N_sim * J, dtype=float).reshape(N_sim, T, J)
+
+    sjt0, s0t0, _, _ = generate_market(uijt=uijt, N=400, seed=123)
+    sjt1, s0t1, _, _ = generate_market(uijt=uijt + 1.0, N=400, seed=123)
+
+    assert np.all(s0t1 < s0t0)
+    assert np.all(sjt1.sum(axis=1) > sjt0.sum(axis=1))
+
+    _assert_prob_simplex(sjt0, s0t0)
+    _assert_prob_simplex(sjt1, s0t1)
+
+
 def test_generate_market_count_identity_and_shapes():
     T, J, N_sim = 5, 8, 200
     N = 2000
 
-    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(T, N_sim, J)
+    uijt = np.linspace(-1.0, 1.0, T * N_sim * J, dtype=float).reshape(N_sim, T, J)
     sjt, s0t, qjt, q0t = generate_market(uijt=uijt, N=N, seed=123)
 
     assert sjt.shape == (T, J)

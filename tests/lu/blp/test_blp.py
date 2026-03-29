@@ -6,6 +6,8 @@ Contracts under test
 1) Instrument builders:
    - `build_strong_IVs(wjt, ujt)` and `build_weak_IVs(wjt)` return finite arrays with
      shape (n_markets, n_products, n_instruments).
+   - Instrument columns match the fixed Lu(25) Section 4 benchmark definitions.
+   - Public input-contract checks raise on invalid shapes.
 
 2) End-to-end fit robustness (given internally-consistent arrays):
    - `BLPEstimator.fit()` completes on a tiny synthetic panel and returns finite
@@ -13,8 +15,8 @@ Contracts under test
 
 3) Limiting case (sigma near 0):
    - When shares are generated from a sigma=0 logit model, constraining the fit to
-     a tiny sigma interval yields beta estimates close to explicit 2SLS computed
-     from the closed-form delta.
+     a tiny sigma interval yields coefficients close to explicit 2SLS computed from
+     the closed-form delta using X = [1, pjt, wjt].
 
 4) Internal objective consistency:
    - Holding the second-step weighting matrix fixed at the estimate, the GMM
@@ -25,8 +27,9 @@ Notes
 -----
 - The estimator module assumes input arrays are produced internally and already
   consistent; it does not perform explicit input validation by design.
-- Configuration is passed as a fully-specified `config` mapping (no defaults in
-  the estimator). These tests therefore provide all required config keys.
+- Configuration is passed as a fully-specified `config` mapping and validated
+  upstream. These tests therefore validate config through
+  `validate_blp_config(...)` before constructing the estimator.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import pytest
 
 from lu_conftest import assert_finite_np
 from lu.blp.blp import BLPEstimator, build_strong_IVs, build_weak_IVs
+from lu.blp.blp_input_validation import validate_blp_config
 
 # -----------------------------------------------------------------------------
 # Module constants (centralize repeated literals)
@@ -51,7 +55,7 @@ sigma_lower_default = 1e-3
 sigma_upper_default = 2.0
 sigma_grid_points_default = 8
 
-beta_sigma_near_zero_atol = 1e-2
+coef_sigma_near_zero_atol = 1e-2
 
 damping_default = 0.7
 tol_default = 1e-10
@@ -77,8 +81,8 @@ def _make_config(
     sigma_grid_points: int,
     share_tol: float,
 ) -> dict:
-    """Return a fully-specified config mapping expected by `BLPEstimator`."""
-    return {
+    """Return the validated config mapping expected by `BLPEstimator`."""
+    raw = {
         "n_draws": int(n_draws),
         "seed": int(seed),
         "sigma_lower": float(sigma_lower),
@@ -93,6 +97,7 @@ def _make_config(
         "nelder_mead_xatol": float(nelder_mead_xatol_default),
         "nelder_mead_fatol": float(nelder_mead_fatol_default),
     }
+    return validate_blp_config(raw)
 
 
 def _logit_shares_from_delta(delta_j: np.ndarray) -> tuple[np.ndarray, float]:
@@ -148,7 +153,7 @@ def _make_toy_panel(
     sjt = np.zeros((n_markets, n_products), dtype=float)
     s0t = np.zeros((n_markets,), dtype=float)
     for t in range(n_markets):
-        delta_t = beta_p_true * pjt[t] + beta_w_true * wjt[t] + ejt[t]
+        delta_t = alpha + beta_p_true * pjt[t] + beta_w_true * wjt[t] + ejt[t]
         sj, s0 = _logit_shares_from_delta(delta_t)
         sjt[t] = sj
         s0t[t] = s0
@@ -184,8 +189,10 @@ def _assert_valid_results_schema(res: dict, sjt_shape: tuple[int, int]) -> None:
     assert np.isfinite(sigma_hat)
     assert float(sigma_hat) > 0.0
 
+    int_hat = res.get("int_hat")
     beta_p_hat = res.get("beta_p_hat")
     beta_w_hat = res.get("beta_w_hat")
+    assert int_hat is not None and np.isfinite(int_hat)
     assert beta_p_hat is not None and np.isfinite(beta_p_hat)
     assert beta_w_hat is not None and np.isfinite(beta_w_hat)
 
@@ -242,21 +249,64 @@ def test_blp_build_ivs_shapes_and_finite():
     """
     Instrument builders return finite arrays with expected panel shapes.
 
-    This is a shape/finite-value contract test, not an economic-validity test.
+    This is a shape/finite-value contract test.
     """
     _, _, _, wjt, ujt, _ = _make_toy_panel(n_markets=2, n_products=5, seed=1)
 
     z_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
     z_weak = build_weak_IVs(wjt=wjt)
 
-    assert z_strong.shape[:2] == (2, 5)
-    assert z_weak.shape[:2] == (2, 5)
-
-    assert z_strong.shape[2] == 5
-    assert z_weak.shape[2] == 5
+    assert z_strong.shape == (2, 5, 5)
+    assert z_weak.shape == (2, 5, 5)
 
     assert_finite_np(z_strong, name="z_strong")
     assert_finite_np(z_weak, name="z_weak")
+
+
+def test_blp_build_ivs_exact_columns():
+    """Instrument builders match the documented fixed column definitions exactly."""
+    _, _, _, wjt, ujt, _ = _make_toy_panel(n_markets=3, n_products=4, seed=2)
+
+    z_strong = build_strong_IVs(wjt=wjt, ujt=ujt)
+    z_weak = build_weak_IVs(wjt=wjt)
+
+    assert np.array_equal(z_strong[:, :, 0], np.ones_like(wjt))
+    assert np.array_equal(z_strong[:, :, 1], wjt)
+    assert np.array_equal(z_strong[:, :, 2], wjt**2)
+    assert np.array_equal(z_strong[:, :, 3], ujt)
+    assert np.array_equal(z_strong[:, :, 4], ujt**2)
+
+    assert np.array_equal(z_weak[:, :, 0], np.ones_like(wjt))
+    assert np.array_equal(z_weak[:, :, 1], wjt)
+    assert np.array_equal(z_weak[:, :, 2], wjt**2)
+    assert np.array_equal(z_weak[:, :, 3], wjt**3)
+    assert np.array_equal(z_weak[:, :, 4], wjt**4)
+
+
+def test_blp_build_strong_ivs_invalid_shapes_raise():
+    """Strong IV builder rejects non-2D inputs and mismatched shapes."""
+    wjt = np.zeros((3, 4), dtype=float)
+    ujt = np.zeros((3, 4), dtype=float)
+
+    with pytest.raises(ValueError):
+        build_strong_IVs(wjt=wjt[0], ujt=ujt)
+
+    with pytest.raises(ValueError):
+        build_strong_IVs(wjt=wjt, ujt=ujt[..., None])
+
+    with pytest.raises(ValueError):
+        build_strong_IVs(wjt=wjt, ujt=np.zeros((3, 5), dtype=float))
+
+
+def test_blp_build_weak_ivs_invalid_shapes_raise():
+    """Weak IV builder rejects non-2D inputs."""
+    wjt = np.zeros((3, 4), dtype=float)
+
+    with pytest.raises(ValueError):
+        build_weak_IVs(wjt=wjt[0])
+
+    with pytest.raises(ValueError):
+        build_weak_IVs(wjt=wjt[..., None])
 
 
 @pytest.mark.parametrize("iv_kind", ["strong", "weak"], ids=["strong_iv", "weak_iv"])
@@ -296,13 +346,13 @@ def test_blp_sigma_near_zero_matches_explicit_2sls():
 
     Arrange:
       - generate shares from a sigma=0 logit DGP
-      - compute closed-form delta and explicit 2SLS beta
+      - compute closed-form delta and explicit 2SLS beta using X = [1, pjt, wjt]
 
     Act:
       - fit BLP with sigma constrained to a tiny interval (sigma_lower <= sigma <= sigma_upper)
 
     Assert:
-      - estimated beta is close to explicit 2SLS (within simulation tolerance)
+      - estimated coefficients are close to explicit 2SLS (within simulation tolerance)
     """
     n_markets, n_products = 6, 7
     sjt, s0t, pjt, wjt, ujt, _ = _make_toy_panel(
@@ -312,7 +362,8 @@ def test_blp_sigma_near_zero_matches_explicit_2sls():
 
     delta_cf = _delta_closed_form_sigma0(sjt=sjt, s0t=s0t)
 
-    x = np.stack([pjt, wjt], axis=2).reshape(-1, 2)
+    ones = np.ones_like(pjt, dtype=float)
+    x = np.stack([ones, pjt, wjt], axis=2).reshape(-1, 3)
     z = zjt.reshape(-1, zjt.shape[2])
     beta_2sls = _two_stage_least_squares(delta_cf.reshape(-1), x, z)
 
@@ -334,16 +385,21 @@ def test_blp_sigma_near_zero_matches_explicit_2sls():
     assert res["sigma_hat"] is not None
     assert sigma_lower <= float(res["sigma_hat"]) <= sigma_upper
 
+    int_hat = float(res["int_hat"])
     beta_p_hat = float(res["beta_p_hat"])
     beta_w_hat = float(res["beta_w_hat"])
+    assert np.isfinite(int_hat)
     assert np.isfinite(beta_p_hat)
     assert np.isfinite(beta_w_hat)
 
     assert np.isclose(
-        beta_p_hat, float(beta_2sls[0, 0]), atol=beta_sigma_near_zero_atol, rtol=0.0
+        int_hat, float(beta_2sls[0, 0]), atol=coef_sigma_near_zero_atol, rtol=0.0
     )
     assert np.isclose(
-        beta_w_hat, float(beta_2sls[1, 0]), atol=beta_sigma_near_zero_atol, rtol=0.0
+        beta_p_hat, float(beta_2sls[1, 0]), atol=coef_sigma_near_zero_atol, rtol=0.0
+    )
+    assert np.isclose(
+        beta_w_hat, float(beta_2sls[2, 0]), atol=coef_sigma_near_zero_atol, rtol=0.0
     )
 
 

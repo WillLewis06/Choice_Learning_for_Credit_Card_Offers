@@ -15,12 +15,7 @@ from datasets.bonus2_dgp import simulate_bonus2_dgp
 from run_zhang_with_lu import print_choice_model_diagnostics, run_choice_model
 
 from bonus2 import bonus2_model as b2_model
-from bonus2.bonus2_estimator import (
-    Bonus2InitConfig,
-    Bonus2SamplerConfig,
-    run_chain,
-    summarize_samples,
-)
+from bonus2.bonus2_estimator import Bonus2SamplerConfig, run_chain, summarize_samples
 from bonus2.bonus2_evaluate import evaluate_bonus2, format_evaluation_summary
 from bonus2.bonus2_posterior import Bonus2PosteriorConfig
 
@@ -47,8 +42,6 @@ CFG_PHASE1: dict[str, Any] = {
     "batch_size": 64,
     "learning_rate": 1e-3,
     "shuffle_buffer": 10_000,
-    "eval_include_outside": True,
-    "eval_against_empirical": True,
 }
 
 CFG_BONUS2: dict[str, Any] = {
@@ -86,15 +79,6 @@ CFG_BONUS2: dict[str, Any] = {
     "k_beta_weekend": 0.05,
     "k_a": 0.05,
     "k_b": 0.05,
-    "init_theta": {
-        "beta_intercept": 0.0,
-        "beta_habit": 0.0,
-        "beta_peer": 0.0,
-        "beta_weekday": 0.0,
-        "beta_weekend": 0.0,
-        "a": 0.0,
-        "b": 0.0,
-    },
     "eps": 1e-12,
 }
 
@@ -173,24 +157,9 @@ def _build_sampler_config(cfg: dict[str, Any]) -> Bonus2SamplerConfig:
     )
 
 
-def _build_init_config(cfg: dict[str, Any]) -> Bonus2InitConfig:
-    """Build the initial-state configuration."""
-    init_theta = cfg["init_theta"]
-    return Bonus2InitConfig(
-        init_beta_intercept=float(init_theta["beta_intercept"]),
-        init_beta_habit=float(init_theta["beta_habit"]),
-        init_beta_peer=float(init_theta["beta_peer"]),
-        init_beta_weekday=float(init_theta["beta_weekday"]),
-        init_beta_weekend=float(init_theta["beta_weekend"]),
-        init_a=float(init_theta["a"]),
-        init_b=float(init_theta["b"]),
-    )
-
-
 def summarize_bonus2_panel(
     panel: dict[str, Any],
     theta_true: dict[str, Any],
-    init_config: Bonus2InitConfig,
     season_period: int,
     num_harmonics: int,
 ) -> None:
@@ -247,19 +216,6 @@ def summarize_bonus2_panel(
         f"weekend_weekend={float(np.mean(theta_true['beta_weekend_jw'][:, 1])):.4f} | "
         f"a_mean={float(np.mean(theta_true['a_m'])):.4f} | "
         f"b_mean={float(np.mean(theta_true['b_m'])):.4f}"
-    )
-
-    print("initial parameter fills:")
-    print(
-        f"  intercept={init_config.init_beta_intercept:.4f} | "
-        f"habit={init_config.init_beta_habit:.4f} | "
-        f"peer={init_config.init_beta_peer:.4f}"
-    )
-    print(
-        f"  weekday={init_config.init_beta_weekday:.4f} | "
-        f"weekend={init_config.init_beta_weekend:.4f} | "
-        f"a={init_config.init_a:.4f} | "
-        f"b={init_config.init_b:.4f}"
     )
 
 
@@ -343,8 +299,8 @@ def run_phase1(cfg: dict[str, Any]) -> dict[str, Any]:
         p_base=dgp["p_base"],
         p0_base=float(dgp["p0_base"]),
         N_base=int(cfg["N_base"]),
-        eval_include_outside=bool(cfg["eval_include_outside"]),
-        eval_against_empirical=bool(cfg["eval_against_empirical"]),
+        eval_include_outside=True,
+        eval_against_empirical=True,
     )
 
     print("=== Phase 1 complete ===")
@@ -379,8 +335,6 @@ def run_bonus2_dgp(
     return {
         "panel": out["panel"],
         "theta_true": out["theta_true"],
-        "season_period": int(cfg["season_period"]),
-        "K": int(cfg["K"]),
     }
 
 
@@ -390,7 +344,6 @@ def run_bonus2_estimation(cfg: dict[str, Any], panel: dict[str, Any]) -> dict[st
 
     posterior_config = _build_posterior_config(cfg)
     sampler_config = _build_sampler_config(cfg)
-    init_config = _build_init_config(cfg)
 
     y_mit = tf.convert_to_tensor(
         np.asarray(panel["y_mit"], dtype=np.int32), dtype=tf.int32
@@ -423,7 +376,6 @@ def run_bonus2_estimation(cfg: dict[str, Any], panel: dict[str, Any]) -> dict[st
         decay=float(panel["decay"]),
         posterior_config=posterior_config,
         sampler_config=sampler_config,
-        init_config=init_config,
     )
 
     theta_hat = _to_numpy_dict(summarize_samples(samples))
@@ -457,13 +409,11 @@ def main() -> None:
     panel = dgp_out["panel"]
     theta_true = dgp_out["theta_true"]
 
-    init_config = _build_init_config(CFG_BONUS2)
     summarize_bonus2_panel(
         panel=panel,
         theta_true=theta_true,
-        init_config=init_config,
-        season_period=int(dgp_out["season_period"]),
-        num_harmonics=int(dgp_out["K"]),
+        season_period=int(CFG_BONUS2["season_period"]),
+        num_harmonics=int(CFG_BONUS2["K"]),
     )
 
     est_out = run_bonus2_estimation(CFG_BONUS2, panel=panel)

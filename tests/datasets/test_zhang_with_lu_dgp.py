@@ -1,4 +1,3 @@
-# tests/datasets/test_zhang_with_lu_dgp.py
 from __future__ import annotations
 
 import numpy as np
@@ -51,19 +50,36 @@ def test_compute_delta_true_reduces_to_quadratic_when_g_true_zero() -> None:
     np.testing.assert_allclose(delta, expected, rtol=0.0, atol=1e-12)
 
 
-def test_compute_delta_true_uses_first_feature_column_when_xj_2d() -> None:
-    x_scalar = np.asarray([-2.0, -1.0, 0.0, 0.5, 2.0], dtype=np.float64)
-    xj_2d = np.stack([x_scalar, 999.0 * np.ones_like(x_scalar)], axis=1)  # (J,2)
-
+def test_compute_delta_true_uses_all_feature_columns_when_xj_2d() -> None:
+    xj = np.asarray(
+        [
+            [1.0, 2.0],
+            [-1.0, 0.5],
+            [0.0, -3.0],
+            [2.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
     a_true = 0.4
     b_true = -0.2
-    g_true = np.asarray([0.0, 1.5, -0.3, 0.7, 2.0], dtype=np.float64)
+    g_true = np.asarray([0.0, 1.5, -0.3, 0.7], dtype=np.float64)
 
-    delta_1d = dgp.compute_delta_true(x_scalar, a_true, b_true, g_true)
-    delta_2d = dgp.compute_delta_true(xj_2d, a_true, b_true, g_true)
+    delta = dgp.compute_delta_true(xj, a_true, b_true, g_true)
 
-    assert delta_2d.shape == x_scalar.shape
-    np.testing.assert_allclose(delta_2d, delta_1d, rtol=0.0, atol=1e-12)
+    feature_sum_all = np.sum(xj, axis=0, keepdims=True)
+    feature_sum_excl = feature_sum_all - xj
+
+    linear_term = np.sum(xj, axis=1)
+    quadratic_term = np.sum(xj * xj, axis=1)
+    interaction_term = np.sum(xj * feature_sum_excl, axis=1)
+
+    expected = (
+        a_true * linear_term + b_true * quadratic_term + g_true * interaction_term
+    )
+
+    assert delta.shape == (xj.shape[0],)
+    assert np.isfinite(delta).all()
+    np.testing.assert_allclose(delta, expected, rtol=0.0, atol=1e-12)
 
 
 def test_compute_njt_true_matches_group_effect_indexing() -> None:
@@ -198,6 +214,8 @@ def test_generate_choice_learn_market_shocks_dgp_keys_shapes_and_sums() -> None:
     p0_base = out["p0_base"]
     qjt_shock = out["qjt_shock"]
     q0t_shock = out["q0t_shock"]
+    a_true = out["a_true"]
+    b_true = out["b_true"]
     g_true = out["g_true"]
     delta_true = out["delta_true"]
     E_bar_true = out["E_bar_true"]
@@ -235,6 +253,10 @@ def test_generate_choice_learn_market_shocks_dgp_keys_shapes_and_sums() -> None:
     np.testing.assert_allclose(
         float(p0_base) + float(p_base.sum()), 1.0, rtol=0.0, atol=1e-12
     )
+
+    # delta_true is consistent with returned primitives
+    delta_ref = dgp.compute_delta_true(xj, a_true, b_true, g_true)
+    np.testing.assert_allclose(delta_true, delta_ref, rtol=0.0, atol=0.0)
 
     # Finiteness of truth arrays
     assert np.isfinite(xj).all()

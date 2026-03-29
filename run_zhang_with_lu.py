@@ -95,6 +95,15 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sum(a_centered * b_centered) / denom)
 
 
+def conditional_inside_probs(logits: np.ndarray) -> np.ndarray:
+    """Return choice probabilities normalized only across inside goods."""
+
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = logits - np.max(logits)
+    exp_logits = np.exp(shifted)
+    return exp_logits / np.sum(exp_logits)
+
+
 def run_choice_model(
     seed: int,
     num_products: int,
@@ -172,40 +181,34 @@ def print_choice_model_diagnostics(
     delta_hat: np.ndarray,
     delta_true: np.ndarray,
     qj_base: np.ndarray,
-    q0_base: int,
     p_base: np.ndarray,
-    p0_base: float,
-    N_base: int,
-    eval_include_outside: bool,
     eval_against_empirical: bool,
 ) -> None:
-    """Print baseline-model diagnostics against truth and empirical shares."""
+    """Print baseline-model diagnostics conditional on an inside choice.
 
-    p_hat, p0_hat = probs_with_outside(delta_hat)
+    Phase 1 is trained only on inside-good counts, so all probability diagnostics
+    are reported after conditioning on an inside choice rather than using the
+    outside option normalization.
+    """
+
+    p_hat_inside = conditional_inside_probs(delta_hat)
+
+    p_base = np.asarray(p_base, dtype=np.float64)
+    p_true_inside = p_base / np.sum(p_base)
+
+    qj_base = np.asarray(qj_base, dtype=np.float64)
+    n_inside = int(np.sum(qj_base))
 
     print("")
     print("============================================================")
     print("PHASE 1: BASELINE CHOICE MODEL")
     print("============================================================")
-    print(f"N_base: {N_base} | N_inside: {int(qj_base.sum())} | N_outside: {q0_base}")
-    print(f"rmse_prob_inside_vs_true: {rmse(p_hat, p_base):.6f}")
-
-    if eval_include_outside:
-        print(
-            f"rmse_prob_all_vs_true:    "
-            f"{rmse(np.r_[p0_hat, p_hat], np.r_[p0_base, p_base]):.6f}"
-        )
+    print(f"N_inside: {n_inside}")
+    print(f"rmse_prob_inside_vs_true: {rmse(p_hat_inside, p_true_inside):.6f}")
 
     if eval_against_empirical:
-        share_inside = qj_base / float(N_base)
-        share_outside = q0_base / float(N_base)
-
-        print(f"rmse_prob_inside_vs_share:{rmse(p_hat, share_inside):.6f}")
-        if eval_include_outside:
-            print(
-                f"rmse_prob_all_vs_share:   "
-                f"{rmse(np.r_[p0_hat, p_hat], np.r_[share_outside, share_inside]):.6f}"
-            )
+        share_inside = qj_base / np.sum(qj_base)
+        print(f"rmse_prob_inside_vs_share:{rmse(p_hat_inside, share_inside):.6f}")
 
     # Compare centered utilities because logits are identified only up to a
     # location normalization.
@@ -299,6 +302,8 @@ def print_market_shock_diagnostics(
 
 
 def main() -> None:
+    """Run the two-phase Zhang baseline plus Lu shrinkage simulation."""
+
     # DGP and baseline-model configuration.
     seed = 123
     num_products = 15
@@ -318,16 +323,15 @@ def main() -> None:
     p_active = 0.25
     sd_u = 0.5
 
-    depth = 5
-    width = 64
-    heads = 8
+    depth = 10
+    width = 128
+    heads = 16
 
-    epochs = 50
+    epochs = 200
     batch_size = 64
     learning_rate = 1e-3
     shuffle_buffer = 1_000
 
-    eval_include_outside = True
     eval_against_empirical = True
 
     # Shrinkage posterior and chain configuration.
@@ -345,9 +349,9 @@ def main() -> None:
     )
 
     shrinkage_config = ChoiceLearnShrinkageConfig(
-        num_results=500,
+        num_results=500000,
         num_burnin_steps=0,
-        chunk_size=100,
+        chunk_size=5000,
         k_alpha=1.0,
         k_E_bar=1.0,
         k_njt=1.0,
@@ -392,11 +396,7 @@ def main() -> None:
         delta_hat=delta_hat,
         delta_true=dgp["delta_true"],
         qj_base=dgp["qj_base"],
-        q0_base=int(dgp["q0_base"]),
         p_base=dgp["p_base"],
-        p0_base=float(dgp["p0_base"]),
-        N_base=N_base,
-        eval_include_outside=eval_include_outside,
         eval_against_empirical=eval_against_empirical,
     )
 
