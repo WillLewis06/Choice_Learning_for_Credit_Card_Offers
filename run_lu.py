@@ -143,9 +143,9 @@ def main() -> None:
 
     # Set the chain length, proposal scales, and tuning controls for the shrinkage sampler.
     shrinkage_config = LuShrinkageConfig(
-        num_results=50000,
+        num_results=5000,
         num_burnin_steps=0,
-        chunk_size=1000,
+        chunk_size=500,
         k_beta=0.05,
         k_r=0.05,
         k_E_bar=0.05,

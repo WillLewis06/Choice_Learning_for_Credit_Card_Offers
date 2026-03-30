@@ -7,16 +7,18 @@ fixtures, so it provides plain Python helper functions that construct small,
 valid inputs aligned with the current public API:
 
 - observed data uses:
-    a_mnjt, s_mjt, u_mj, P_price_mj, price_vals_mj, lambda_mn, waste_cost
+    a_mnjt, s_mjt, u_mj, P_price_mj, price_vals_mj, lambda_mn, waste_cost,
+    pi_I0, inventory_maps
 - posterior config uses:
     tol, max_iter, eps, sigma_z_beta, sigma_z_alpha, sigma_z_v,
     sigma_z_fc, sigma_z_u_scale
 - sampler config uses:
     num_results, chunk_size, k_beta, k_alpha, k_v, k_fc, k_u_scale
-- initial state uses unconstrained z-blocks packed into StockpilingState
+- initial state uses explicit unconstrained z-blocks packed into
+    StockpilingState
 - end-to-end sampling uses:
-    run_chain(..., inventory_maps, posterior_config, stockpiling_config,
-              initial_state, seed)
+    run_chain(..., pi_I0, inventory_maps, posterior_config,
+              stockpiling_config, initial_state, seed)
 
 The helpers below intentionally keep dimensions tiny and deterministic so tests
 are stable and cheap to run.
@@ -211,10 +213,10 @@ def lambda_mn_np(dims: dict[str, int]) -> np.ndarray:
 
 def pi_I0_uniform(dims: dict[str, int]) -> np.ndarray:
     """
-    Build a uniform initial inventory distribution for DGP-only tests.
+    Build a uniform initial inventory distribution.
 
-    This helper is not used by the refactored posterior/sampler path, which now
-    constructs a uniform pi_I0 internally from inventory_maps.
+    This helper is used directly by the refactored posterior and sampler path,
+    both of which now take pi_I0 explicitly.
     """
     I = int(dims["I_max"]) + 1
     return np.ones((I,), dtype=np.float64) / float(I)
@@ -302,21 +304,18 @@ def initial_state_tf(
     z_blocks: dict[str, np.ndarray] | None = None,
 ):
     """
-    Build a valid StockpilingState.
+    Build a valid StockpilingState from explicit unconstrained z-blocks.
 
-    If z_blocks is omitted, this uses the core build_initial_state helper.
-    Otherwise it wraps the provided NumPy z-blocks into float64 tensors.
+    If z_blocks is omitted, deterministic default z-blocks are constructed from
+    dims and passed into the core build_initial_state helper.
     """
     import tensorflow as tf
-    from ching.stockpiling_estimator import StockpilingState, build_initial_state
-
-    M = int(dims["M"])
-    J = int(dims["J"])
+    from ching.stockpiling_estimator import build_initial_state
 
     if z_blocks is None:
-        return build_initial_state(M=M, J=J)
+        z_blocks = z_blocks_np(dims)
 
-    return StockpilingState(
+    return build_initial_state(
         z_beta=tf.convert_to_tensor(z_blocks["z_beta"], dtype=tf.float64),
         z_alpha=tf.convert_to_tensor(z_blocks["z_alpha"], dtype=tf.float64),
         z_v=tf.convert_to_tensor(z_blocks["z_v"], dtype=tf.float64),
@@ -373,6 +372,7 @@ def core_inputs_np() -> dict[str, Any]:
         "price_vals_mj": price["price_vals_mj"],
         "lambda_mn": lambda_mn_np(dims),
         "waste_cost": float(ctrl["waste_cost"]),
+        "pi_I0": pi_I0_uniform(dims),
     }
 
 
@@ -397,6 +397,7 @@ def observed_inputs_tf() -> dict[str, Any]:
         "price_vals_mj": tf.convert_to_tensor(raw["price_vals_mj"], dtype=tf.float64),
         "lambda_mn": tf.convert_to_tensor(raw["lambda_mn"], dtype=tf.float64),
         "waste_cost": tf.convert_to_tensor(raw["waste_cost"], dtype=tf.float64),
+        "pi_I0": tf.convert_to_tensor(raw["pi_I0"], dtype=tf.float64),
         "inventory_maps": inventory_maps_tf(int(dims["I_max"])),
     }
 
@@ -424,6 +425,7 @@ def posterior_bundle_tf() -> dict[str, Any]:
         price_vals_mj=observed["price_vals_mj"],
         lambda_mn=observed["lambda_mn"],
         waste_cost=observed["waste_cost"],
+        pi_I0=observed["pi_I0"],
         inventory_maps=observed["inventory_maps"],
     )
 
@@ -454,6 +456,7 @@ def run_chain_inputs_tf(
         "price_vals_mj": observed["price_vals_mj"],
         "lambda_mn": observed["lambda_mn"],
         "waste_cost": observed["waste_cost"],
+        "pi_I0": observed["pi_I0"],
         "inventory_maps": observed["inventory_maps"],
         "posterior_config": posterior_config(),
         "stockpiling_config": sampler_config_tf(

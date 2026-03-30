@@ -14,6 +14,8 @@ The main public methods exercised here are:
 - loglik
 - beta_block_logpost
 - alpha_block_logpost
+- v_block_logpost
+- fc_block_logpost
 - u_scale_block_logpost
 - joint_logpost
 - predict_p_buy_mnjt
@@ -72,8 +74,8 @@ def _minimal_posterior_Imax0(
       ccp_buy:   patched CCP tensor of shape (M, N, J, S, 1)
       z_state:   dict with keys z_beta, z_alpha, z_v, z_fc, z_u_scale
     """
-    assert a_mnjt.ndim == 4  # (M,N,J,T)
-    assert s_mjt.ndim == 3  # (M,J,T)
+    assert a_mnjt.ndim == 4  # (M, N, J, T)
+    assert s_mjt.ndim == 3  # (M, J, T)
 
     M, N, J, T = a_mnjt.shape
     assert s_mjt.shape == (M, J, T)
@@ -93,6 +95,7 @@ def _minimal_posterior_Imax0(
     price_vals_mj = tf.zeros((M, J, S), dtype=DTYPE)
     P_price_mj = tf.eye(S, dtype=DTYPE)[None, None, :, :]
     P_price_mj = tf.broadcast_to(P_price_mj, (M, J, S, S))
+    pi_I0 = tf.constant([1.0], dtype=DTYPE)
 
     config = sp.StockpilingPosteriorConfig(
         tol=1e-10,
@@ -114,6 +117,7 @@ def _minimal_posterior_Imax0(
         price_vals_mj=price_vals_mj,
         lambda_mn=tf.fill((M, N), tf.constant(0.5, dtype=DTYPE)),
         waste_cost=tf.constant(0.0, dtype=DTYPE),
+        pi_I0=pi_I0,
         inventory_maps=cc.inventory_maps_tf(0),
     )
 
@@ -322,6 +326,60 @@ def test_alpha_block_logpost_equals_reduced_loglik_plus_logprior_alpha_vec() -> 
     expected = tf.reduce_sum(
         ll_mnj, axis=[0, 1]
     ) + STANDARD_POSTERIOR.logprior_alpha_vec(z["z_alpha"])
+
+    assert tuple(out.shape) == (int(STANDARD_DIMS["J"]),)
+    tf.debugging.assert_near(out, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_v_block_logpost_equals_reduced_loglik_plus_logprior_v_vec() -> None:
+    """v_block_logpost should equal per-product reduced loglik plus v prior."""
+    z = STANDARD_Z
+
+    out = STANDARD_POSTERIOR.v_block_logpost(
+        z_beta=z["z_beta"],
+        z_alpha=z["z_alpha"],
+        z_v=z["z_v"],
+        z_fc=z["z_fc"],
+        z_u_scale=z["z_u_scale"],
+    )
+
+    ll_mnj = STANDARD_POSTERIOR.loglik_mnj(
+        z_beta=z["z_beta"],
+        z_alpha=z["z_alpha"],
+        z_v=z["z_v"],
+        z_fc=z["z_fc"],
+        z_u_scale=z["z_u_scale"],
+    )
+    expected = tf.reduce_sum(ll_mnj, axis=[0, 1]) + STANDARD_POSTERIOR.logprior_v_vec(
+        z["z_v"]
+    )
+
+    assert tuple(out.shape) == (int(STANDARD_DIMS["J"]),)
+    tf.debugging.assert_near(out, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_fc_block_logpost_equals_reduced_loglik_plus_logprior_fc_vec() -> None:
+    """fc_block_logpost should equal per-product reduced loglik plus fc prior."""
+    z = STANDARD_Z
+
+    out = STANDARD_POSTERIOR.fc_block_logpost(
+        z_beta=z["z_beta"],
+        z_alpha=z["z_alpha"],
+        z_v=z["z_v"],
+        z_fc=z["z_fc"],
+        z_u_scale=z["z_u_scale"],
+    )
+
+    ll_mnj = STANDARD_POSTERIOR.loglik_mnj(
+        z_beta=z["z_beta"],
+        z_alpha=z["z_alpha"],
+        z_v=z["z_v"],
+        z_fc=z["z_fc"],
+        z_u_scale=z["z_u_scale"],
+    )
+    expected = tf.reduce_sum(ll_mnj, axis=[0, 1]) + STANDARD_POSTERIOR.logprior_fc_vec(
+        z["z_fc"]
+    )
 
     assert tuple(out.shape) == (int(STANDARD_DIMS["J"]),)
     tf.debugging.assert_near(out, expected, atol=ATOL, rtol=RTOL)

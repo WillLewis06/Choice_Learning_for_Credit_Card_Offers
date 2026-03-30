@@ -132,14 +132,20 @@ def _raw_trace_to_dataclass(raw_trace: dict[str, tf.Tensor]) -> StockpilingChunk
     )
 
 
-def build_initial_state(M: int, J: int) -> StockpilingState:
-    """Build the default unconstrained initial state."""
+def build_initial_state(
+    z_beta: tf.Tensor,
+    z_alpha: tf.Tensor,
+    z_v: tf.Tensor,
+    z_fc: tf.Tensor,
+    z_u_scale: tf.Tensor,
+) -> StockpilingState:
+    """Build the unconstrained initial state from explicit external values."""
     return StockpilingState(
-        z_beta=tf.constant(0.0, dtype=tf.float64),
-        z_alpha=tf.zeros((J,), dtype=tf.float64),
-        z_v=tf.zeros((J,), dtype=tf.float64),
-        z_fc=tf.zeros((J,), dtype=tf.float64),
-        z_u_scale=tf.zeros((M,), dtype=tf.float64),
+        z_beta=z_beta,
+        z_alpha=z_alpha,
+        z_v=z_v,
+        z_fc=z_fc,
+        z_u_scale=z_u_scale,
     )
 
 
@@ -321,6 +327,7 @@ def run_chain(
     price_vals_mj: tf.Tensor,
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
+    pi_I0: tf.Tensor,
     inventory_maps,
     posterior_config: StockpilingPosteriorConfig,
     stockpiling_config: StockpilingConfig,
@@ -336,6 +343,7 @@ def run_chain(
         price_vals_mj=price_vals_mj,
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
+        pi_I0=pi_I0,
         inventory_maps=inventory_maps,
         posterior_config=posterior_config,
         sampler_config=stockpiling_config,
@@ -356,6 +364,7 @@ def run_chain(
         price_vals_mj=price_vals_mj,
         lambda_mn=lambda_mn,
         waste_cost=waste_cost,
+        pi_I0=pi_I0,
         inventory_maps=inventory_maps,
     )
     kernel = StockpilingHybridKernel(

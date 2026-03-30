@@ -15,7 +15,6 @@ from datasets.ching_dgp import generate_dgp
 from ching.stockpiling_estimator import (
     StockpilingConfig,
     StockpilingState,
-    build_initial_state,
     run_chain,
     summarize_samples,
 )
@@ -118,17 +117,37 @@ CFG_PHASE3: dict[str, Any] = {
         "sigma_z_u_scale": 2.0,
     },
     "sampler": {
-        "num_results": 500,
-        "chunk_size": 50,
-        "k_beta": 0.10,
-        "k_alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.05, dtype=np.float64),
-        "k_v": np.full((int(CFG_PHASE1["num_products"]),), 0.20, dtype=np.float64),
-        "k_fc": np.full((int(CFG_PHASE1["num_products"]),), 0.05, dtype=np.float64),
+        "num_results": 250,
+        "chunk_size": 25,
+        "k_beta": 0.025,
+        "k_alpha": np.full((int(CFG_PHASE1["num_products"]),), 0.1, dtype=np.float64),
+        "k_v": np.full((int(CFG_PHASE1["num_products"]),), 0.3, dtype=np.float64),
+        "k_fc": np.full((int(CFG_PHASE1["num_products"]),), 0.1, dtype=np.float64),
         "k_u_scale": np.zeros((int(CFG_PHASE1["num_markets"]),), dtype=np.float64),
     },
 }
-
-EVAL_EPS = 1e-12
+CFG_PHASE3["initial_state"] = {
+    "beta": 0.5,
+    "alpha": np.full((int(CFG_PHASE1["num_products"]),), 1.0, dtype=np.float64),
+    "v": np.full((int(CFG_PHASE1["num_products"]),), 1.0, dtype=np.float64),
+    "fc": np.full((int(CFG_PHASE1["num_products"]),), 1.0, dtype=np.float64),
+    "u_scale": np.full((int(CFG_PHASE1["num_markets"]),), 1, dtype=np.float64),
+}
+CFG_PHASE3["initial_inventory"] = {
+    "pi_I0": np.full(
+        (int(CFG_PHASE3["I_max"]) + 1,),
+        1.0 / float(int(CFG_PHASE3["I_max"]) + 1),
+        dtype=np.float64,
+    )
+}
+CFG_PHASE3["evaluation"] = {
+    "eps": 1e-12,
+}
+CFG_PHASE3["seeds"] = {
+    "price": 777,
+    "dgp": 778,
+    "mcmc": 0,
+}
 
 
 def _row_normalize(P: np.ndarray, min_prob: float) -> np.ndarray:
@@ -217,6 +236,16 @@ def build_price_processes(
     return P_price_mj, price_vals_mj
 
 
+def _as_length_vector(value: Any, length: int, name: str) -> np.ndarray:
+    """Convert a scalar or length-matched array to a float64 vector."""
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        return np.full((length,), float(arr), dtype=np.float64)
+    if arr.shape != (length,):
+        raise ValueError(f"{name} must have shape ({length},); got {arr.shape}.")
+    return arr
+
+
 def _theta_to_state(theta: dict[str, Any], M: int) -> StockpilingState:
     """Map constrained parameter values into the unconstrained sampler state."""
     beta = np.clip(np.asarray(theta["beta"], dtype=np.float64), 1e-12, 1.0 - 1e-12)
@@ -238,6 +267,19 @@ def _theta_to_state(theta: dict[str, Any], M: int) -> StockpilingState:
         z_v=tf.constant(np.log(v), dtype=tf.float64),
         z_fc=tf.constant(np.log(fc), dtype=tf.float64),
         z_u_scale=tf.constant(np.log(u_scale), dtype=tf.float64),
+    )
+
+
+def _state_to_theta(state: StockpilingState) -> dict[str, tf.Tensor]:
+    """Map an unconstrained sampler state to constrained parameters."""
+    return unconstrained_to_theta(
+        {
+            "z_beta": state.z_beta,
+            "z_alpha": state.z_alpha,
+            "z_v": state.z_v,
+            "z_fc": state.z_fc,
+            "z_u_scale": state.z_u_scale,
+        }
     )
 
 
@@ -308,7 +350,41 @@ def _build_phase3_sampler_config(cfg: dict[str, Any]) -> StockpilingConfig:
     )
 
 
-def summarize_stockpiling_panel(panel: dict[str, Any]) -> None:
+def _build_phase3_initial_state(
+    cfg: dict[str, Any],
+    M: int,
+    J: int,
+) -> StockpilingState:
+    """Construct the externally configured Phase-3 initial state."""
+    icfg = cfg["initial_state"]
+    theta0 = {
+        "beta": float(np.asarray(icfg["beta"], dtype=np.float64)),
+        "alpha": _as_length_vector(icfg["alpha"], J, "initial_state.alpha"),
+        "v": _as_length_vector(icfg["v"], J, "initial_state.v"),
+        "fc": _as_length_vector(icfg["fc"], J, "initial_state.fc"),
+        "u_scale": _as_length_vector(icfg["u_scale"], M, "initial_state.u_scale"),
+    }
+    return _theta_to_state(theta0, M=M)
+
+
+def _build_phase3_initial_inventory(
+    cfg: dict[str, Any],
+    I_max: int,
+) -> np.ndarray:
+    """Construct the externally configured initial inventory distribution."""
+    pi_I0 = np.asarray(cfg["initial_inventory"]["pi_I0"], dtype=np.float64)
+    expected_shape = (I_max + 1,)
+    if pi_I0.shape != expected_shape:
+        raise ValueError(
+            f"initial_inventory.pi_I0 must have shape {expected_shape}; got {pi_I0.shape}."
+        )
+    return pi_I0
+
+
+def summarize_stockpiling_panel(
+    panel: dict[str, Any],
+    initial_state: StockpilingState,
+) -> None:
     """Print a compact summary of the generated Phase-3 panel."""
     a = np.asarray(panel["a_mnjt"], dtype=np.float64)
     s = np.asarray(panel["s_mjt"])
@@ -329,17 +405,7 @@ def summarize_stockpiling_panel(panel: dict[str, Any]) -> None:
             f"mean_fc={float(np.mean(np.asarray(theta_true['fc'], dtype=np.float64))):.4f}"
         )
 
-    M, _, J, _ = a.shape
-    initial_state = build_initial_state(M=M, J=J)
-    theta0 = unconstrained_to_theta(
-        {
-            "z_beta": initial_state.z_beta,
-            "z_alpha": initial_state.z_alpha,
-            "z_v": initial_state.z_v,
-            "z_fc": initial_state.z_fc,
-            "z_u_scale": initial_state.z_u_scale,
-        }
-    )
+    theta0 = _state_to_theta(initial_state)
     print(
         "[Stockpiling] Init | "
         f"beta={float(theta0['beta'].numpy()):.4f} "
@@ -428,7 +494,8 @@ def run_phase2(
 
 
 def build_phase3_inputs(
-    delta_hat: np.ndarray, res2: dict[str, Any]
+    delta_hat: np.ndarray,
+    res2: dict[str, Any],
 ) -> dict[str, np.ndarray]:
     """Build the fixed Phase-3 intercept components from Phases 1-2."""
     return {
@@ -477,15 +544,11 @@ def run_phase3_estimation(
     panel: dict[str, Any],
     P_price_mj: np.ndarray,
     price_vals_mj: np.ndarray,
+    initial_state: StockpilingState,
+    pi_I0: np.ndarray,
     mcmc_seed: int,
 ) -> dict[str, Any]:
-    """Run the Phase-3 chain and summarize retained samples."""
-    a = np.asarray(panel["a_mnjt"])
-    M = int(a.shape[0])
-    J = int(a.shape[2])
-
-    initial_state = build_initial_state(M=M, J=J)
-
+    """Run the Phase-3 chain from the configured initial state and inventory prior."""
     run_result = run_chain(
         a_mnjt=tf.constant(panel["a_mnjt"], dtype=tf.int32),
         s_mjt=tf.constant(panel["s_mjt"], dtype=tf.int32),
@@ -494,6 +557,7 @@ def run_phase3_estimation(
         price_vals_mj=tf.constant(price_vals_mj, dtype=tf.float64),
         lambda_mn=tf.constant(panel["lambda_mn"], dtype=tf.float64),
         waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
+        pi_I0=tf.constant(pi_I0, dtype=tf.float64),
         inventory_maps=build_inventory_maps(int(cfg["I_max"])),
         posterior_config=_build_phase3_posterior_config(cfg),
         stockpiling_config=_build_phase3_sampler_config(cfg),
@@ -514,6 +578,7 @@ def run_phase3_estimation(
         "samples": run_result.samples,
         "theta_hat": theta_hat,
         "initial_state": initial_state,
+        "pi_I0": np.asarray(pi_I0, dtype=np.float64),
         "posterior_config": _build_phase3_posterior_config(cfg),
         "chunk_summaries": run_result.chunk_summaries,
         "mcmc_summary": run_result.mcmc_summary,
@@ -529,9 +594,10 @@ def run_phase3_evaluation(
     theta_hat: dict[str, Any],
     theta_true: dict[str, Any] | None,
     posterior_config: StockpilingPosteriorConfig,
+    pi_I0: np.ndarray,
     mcmc_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Evaluate the fitted Phase-3 model."""
+    """Evaluate the fitted Phase-3 model using the configured inventory prior."""
     a = np.asarray(panel["a_mnjt"], dtype=np.float64)
     s = np.asarray(panel["s_mjt"], dtype=np.int64)
     u = np.asarray(panel["u_mj"], dtype=np.float64)
@@ -547,6 +613,7 @@ def run_phase3_evaluation(
         price_vals_mj=tf.constant(price_vals_mj, dtype=tf.float64),
         lambda_mn=tf.constant(lam, dtype=tf.float64),
         waste_cost=tf.constant(float(cfg["waste_cost"]), dtype=tf.float64),
+        pi_I0=tf.constant(pi_I0, dtype=tf.float64),
         inventory_maps=build_inventory_maps(int(cfg["I_max"])),
     )
 
@@ -585,7 +652,7 @@ def run_phase3_evaluation(
         theta_true=theta_true_eval,
         p_buy_oracle_mnjt=p_buy_oracle_mnjt,
         mcmc=mcmc_summary,
-        eps=EVAL_EPS,
+        eps=float(cfg["evaluation"]["eps"]),
     )
 
     print("=== Phase 3: Stockpiling evaluation ===")
@@ -615,9 +682,15 @@ def main() -> None:
     M = int(E_bar_used.shape[0])
     J = int(delta_used.shape[0])
 
-    phase3_price_seed = 777
-    phase3_dgp_seed = phase3_price_seed + 1
-    phase3_mcmc_seed = 0
+    phase3_initial_state = _build_phase3_initial_state(CFG_PHASE3, M=M, J=J)
+    phase3_pi_I0 = _build_phase3_initial_inventory(
+        CFG_PHASE3,
+        I_max=int(CFG_PHASE3["I_max"]),
+    )
+
+    phase3_price_seed = int(CFG_PHASE3["seeds"]["price"])
+    phase3_dgp_seed = int(CFG_PHASE3["seeds"]["dgp"])
+    phase3_mcmc_seed = int(CFG_PHASE3["seeds"]["mcmc"])
 
     P_price_mj, price_vals_mj = build_price_processes(
         M=M,
@@ -648,13 +721,15 @@ def main() -> None:
         price_vals_mj=price_vals_mj,
         seed_dgp=phase3_dgp_seed,
     )
-    summarize_stockpiling_panel(panel)
+    summarize_stockpiling_panel(panel, initial_state=phase3_initial_state)
 
     res3 = run_phase3_estimation(
         CFG_PHASE3,
         panel=panel,
         P_price_mj=P_price_mj,
         price_vals_mj=price_vals_mj,
+        initial_state=phase3_initial_state,
+        pi_I0=phase3_pi_I0,
         mcmc_seed=phase3_mcmc_seed,
     )
 
@@ -666,6 +741,7 @@ def main() -> None:
         theta_hat=res3["theta_hat"],
         theta_true=panel["theta_true"],
         posterior_config=res3["posterior_config"],
+        pi_I0=res3["pi_I0"],
         mcmc_summary=res3["mcmc_summary"],
     )
 

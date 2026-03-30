@@ -16,6 +16,7 @@ __all__ = [
     "observed_data_validate_input",
     "posterior_validate_input",
     "sampler_validate_input",
+    "initial_inventory_validate_input",
     "init_state_validate_input",
     "seed_validate_input",
     "run_chain_validate_input",
@@ -669,6 +670,31 @@ def sampler_validate_input(sampler_config: Any, M: int, J: int) -> None:
     _require_all_nonnegative(sampler_config.k_u_scale, "sampler_config.k_u_scale")
 
 
+def initial_inventory_validate_input(
+    pi_I0: tf.Tensor,
+    inventory_maps: Any,
+) -> None:
+    """Validate the external initial inventory distribution."""
+    _require(
+        isinstance(inventory_maps, tuple) and len(inventory_maps) == 5,
+        "inventory_maps must contain 5 tensors.",
+    )
+    i_vals = inventory_maps[0]
+    _require_integer_tensor(i_vals, "inventory_maps[0] (i_vals)")
+    _require_tensor_rank(i_vals, 1, "inventory_maps[0] (i_vals)")
+    _require(
+        i_vals.shape[0] is not None and i_vals.shape[0] > 0,
+        f"inventory_maps[0] (i_vals) must have static length > 0; got {i_vals.shape}.",
+    )
+
+    I = int(i_vals.shape[0])
+    _require_prob_vector(pi_I0, "pi_I0")
+    _require(
+        pi_I0.shape[0] == I,
+        f"pi_I0 must have shape ({I},); got {pi_I0.shape}.",
+    )
+
+
 def init_state_validate_input(
     z_beta: tf.Tensor,
     z_alpha: tf.Tensor,
@@ -708,6 +734,7 @@ def run_chain_validate_input(
     price_vals_mj: tf.Tensor,
     lambda_mn: tf.Tensor,
     waste_cost: tf.Tensor,
+    pi_I0: tf.Tensor,
     inventory_maps: Any,
     posterior_config: Any,
     sampler_config: Any,
@@ -738,6 +765,10 @@ def run_chain_validate_input(
     )
 
     sampler_validate_input(sampler_config=sampler_config, M=M, J=J)
+    initial_inventory_validate_input(
+        pi_I0=pi_I0,
+        inventory_maps=inventory_maps,
+    )
     init_state_validate_input(
         z_beta=z_beta,
         z_alpha=z_alpha,

@@ -7,11 +7,11 @@ This file targets the refactored Ching sampler API:
 - StockpilingKernelResults
 - StockpilingRunResult
 - StockpilingHybridKernel
-- build_initial_state(...)
+- build_initial_state(...) from explicit z-block tensors
 - _num_chunks(...)
 - _last_state(...)
 - _concat_sample_chunks(...)
-- run_chain(...)
+- run_chain(...) with explicit pi_I0
 - summarize_samples(...)
 
 The old estimator-style API (StockpilingEstimator, fit(), predict_probabilities())
@@ -173,18 +173,41 @@ def test_concat_sample_chunks_raises_on_empty_input() -> None:
 # -----------------------------------------------------------------------------
 # Initial-state construction
 # -----------------------------------------------------------------------------
-def test_build_initial_state_defaults() -> None:
+def test_build_initial_state_from_explicit_z_blocks() -> None:
     dims = cc.tiny_dims()
-    state = build_initial_state(M=int(dims["M"]), J=int(dims["J"]))
+    z_blocks = cc.z_blocks_np(dims)
+
+    state = build_initial_state(
+        z_beta=tf.convert_to_tensor(z_blocks["z_beta"], dtype=DTYPE),
+        z_alpha=tf.convert_to_tensor(z_blocks["z_alpha"], dtype=DTYPE),
+        z_v=tf.convert_to_tensor(z_blocks["z_v"], dtype=DTYPE),
+        z_fc=tf.convert_to_tensor(z_blocks["z_fc"], dtype=DTYPE),
+        z_u_scale=tf.convert_to_tensor(z_blocks["z_u_scale"], dtype=DTYPE),
+    )
 
     assert isinstance(state, StockpilingState)
     _assert_state_shapes(state, M=int(dims["M"]), J=int(dims["J"]))
 
-    tf.debugging.assert_equal(state.z_beta, _tf(0.0))
-    tf.debugging.assert_equal(state.z_alpha, tf.zeros((dims["J"],), dtype=DTYPE))
-    tf.debugging.assert_equal(state.z_v, tf.zeros((dims["J"],), dtype=DTYPE))
-    tf.debugging.assert_equal(state.z_fc, tf.zeros((dims["J"],), dtype=DTYPE))
-    tf.debugging.assert_equal(state.z_u_scale, tf.zeros((dims["M"],), dtype=DTYPE))
+    tf.debugging.assert_equal(
+        state.z_beta,
+        tf.convert_to_tensor(z_blocks["z_beta"], dtype=DTYPE),
+    )
+    tf.debugging.assert_equal(
+        state.z_alpha,
+        tf.convert_to_tensor(z_blocks["z_alpha"], dtype=DTYPE),
+    )
+    tf.debugging.assert_equal(
+        state.z_v,
+        tf.convert_to_tensor(z_blocks["z_v"], dtype=DTYPE),
+    )
+    tf.debugging.assert_equal(
+        state.z_fc,
+        tf.convert_to_tensor(z_blocks["z_fc"], dtype=DTYPE),
+    )
+    tf.debugging.assert_equal(
+        state.z_u_scale,
+        tf.convert_to_tensor(z_blocks["z_u_scale"], dtype=DTYPE),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -378,6 +401,7 @@ def test_run_chain_raises_on_nonpositive_num_results() -> None:
             price_vals_mj=inputs["price_vals_mj"],
             lambda_mn=inputs["lambda_mn"],
             waste_cost=inputs["waste_cost"],
+            pi_I0=inputs["pi_I0"],
             inventory_maps=inputs["inventory_maps"],
             posterior_config=inputs["posterior_config"],
             stockpiling_config=bad_config,
@@ -399,6 +423,7 @@ def test_run_chain_raises_on_bad_seed_shape() -> None:
             price_vals_mj=inputs["price_vals_mj"],
             lambda_mn=inputs["lambda_mn"],
             waste_cost=inputs["waste_cost"],
+            pi_I0=inputs["pi_I0"],
             inventory_maps=inputs["inventory_maps"],
             posterior_config=inputs["posterior_config"],
             stockpiling_config=inputs["stockpiling_config"],
@@ -419,6 +444,7 @@ def test_run_chain_returns_retained_trace_with_num_results_draws() -> None:
         price_vals_mj=inputs["price_vals_mj"],
         lambda_mn=inputs["lambda_mn"],
         waste_cost=inputs["waste_cost"],
+        pi_I0=inputs["pi_I0"],
         inventory_maps=inputs["inventory_maps"],
         posterior_config=inputs["posterior_config"],
         stockpiling_config=inputs["stockpiling_config"],

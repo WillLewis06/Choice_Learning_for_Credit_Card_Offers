@@ -41,9 +41,10 @@ class StockpilingPosteriorTF:
         price_vals_mj: tf.Tensor,
         lambda_mn: tf.Tensor,
         waste_cost: tf.Tensor,
+        pi_I0: tf.Tensor,
         inventory_maps: InventoryMaps,
     ):
-        """Cache observed tensors, prior scales, and a fixed uniform inventory prior."""
+        """Cache observed tensors, prior scales, and the initial inventory prior."""
         self.tol = float(config.tol)
         self.max_iter = int(config.max_iter)
         self.eps = tf.constant(config.eps, dtype=tf.float64)
@@ -61,15 +62,9 @@ class StockpilingPosteriorTF:
         self.price_vals_mj = price_vals_mj
         self.lambda_mn = lambda_mn
         self.waste_cost = waste_cost
+        self.pi_I0 = pi_I0
         self.inventory_maps = inventory_maps
 
-        i_vals, _, _, _, _ = self.inventory_maps
-        n_inventory_states = tf.shape(i_vals)[0]
-        self.pi_I0 = tf.fill(
-            tf.reshape(n_inventory_states, (1,)),
-            tf.constant(1.0, dtype=tf.float64)
-            / tf.cast(n_inventory_states, tf.float64),
-        )
         self.lambda_mn_11 = self.lambda_mn[:, :, None, None]
 
         log_two_pi = tf.math.log(tf.constant(2.0 * 3.141592653589793, tf.float64))

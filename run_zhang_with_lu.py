@@ -349,7 +349,7 @@ def main() -> None:
     )
 
     shrinkage_config = ChoiceLearnShrinkageConfig(
-        num_results=500000,
+        num_results=50000,
         num_burnin_steps=0,
         chunk_size=5000,
         k_alpha=1.0,
