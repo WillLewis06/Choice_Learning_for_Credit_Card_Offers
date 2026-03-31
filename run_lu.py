@@ -39,7 +39,27 @@ def _to_numpy_results(results: dict) -> dict:
 
 
 def _normalize_results_for_assessment(results: dict) -> dict:
-    """Standardize estimator outputs into the assessment result format."""
+    """
+    Standardize estimator outputs into the common assessment result format.
+
+    Accepted estimator output formats:
+      1. Full shock available directly:
+         - E_full_hat
+         - optionally E_bar_hat / njt_hat
+      2. Decomposition available directly:
+         - E_bar_hat
+         - njt_hat
+      3. Residual-style BLP output:
+         - E_hat
+         - int_hat
+
+    Important:
+      - For the BLP benchmark, E_hat is the post-intercept residual shock.
+      - The Lu assessment compares against the full shock object.
+      - Therefore, when only (int_hat, E_hat) are available, reconstruct:
+            E_full_hat = int_hat + E_hat
+        before deriving E_bar_hat and njt_hat.
+    """
 
     # Start by converting any tensor outputs into NumPy form.
     out = _to_numpy_results(results)
@@ -49,6 +69,7 @@ def _normalize_results_for_assessment(results: dict) -> dict:
     njt_hat = out.get("njt_hat")
     E_full_hat = out.get("E_full_hat")
     E_hat = out.get("E_hat")
+    int_hat = out.get("int_hat")
 
     # When a full shock matrix is available, reconstruct the missing decomposition if needed.
     if E_full_hat is not None:
@@ -56,10 +77,7 @@ def _normalize_results_for_assessment(results: dict) -> dict:
         out["E_full_hat"] = E_full_hat
 
         if E_bar_hat is None:
-            if E_hat is not None:
-                E_bar_hat = np.asarray(E_hat, dtype=float)
-            else:
-                E_bar_hat = np.mean(E_full_hat, axis=1)
+            E_bar_hat = np.mean(E_full_hat, axis=1)
         else:
             E_bar_hat = np.asarray(E_bar_hat, dtype=float)
 
@@ -81,11 +99,21 @@ def _normalize_results_for_assessment(results: dict) -> dict:
         out["E_full_hat"] = E_bar_hat[:, None] + njt_hat
         return out
 
-    # When only the combined shock estimate is available, recover its row decomposition.
+    # When only a residual-style shock estimate is available, recover the full shock first.
     if E_hat is not None:
-        E_full_hat = np.asarray(E_hat, dtype=float)
+        E_hat = np.asarray(E_hat, dtype=float)
+
+        if int_hat is None:
+            raise ValueError(
+                "Estimator results include E_hat but not int_hat. "
+                "This is ambiguous for assessment because E_hat may be a "
+                "post-intercept residual rather than the full shock."
+            )
+
+        E_full_hat = float(int_hat) + E_hat
         E_bar_hat = np.mean(E_full_hat, axis=1)
         njt_hat = E_full_hat - E_bar_hat[:, None]
+
         out["E_bar_hat"] = E_bar_hat
         out["njt_hat"] = njt_hat
         out["E_full_hat"] = E_full_hat
@@ -143,9 +171,9 @@ def main() -> None:
 
     # Set the chain length, proposal scales, and tuning controls for the shrinkage sampler.
     shrinkage_config = LuShrinkageConfig(
-        num_results=5000,
+        num_results=50000,
         num_burnin_steps=0,
-        chunk_size=500,
+        chunk_size=5000,
         k_beta=0.05,
         k_r=0.05,
         k_E_bar=0.05,
