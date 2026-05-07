@@ -44,13 +44,9 @@ def _tune_block(
     theta = theta0
     k = k0
 
-    # Convert the scalar tuning controls once for the compiled pilot loop.
-    pilot_length_t = tf.constant(pilot_length, dtype=tf.int32)
     factor_t = tf.constant(factor, dtype=tf.float64)
-    target_low_t = tf.constant(target_low, dtype=tf.float64)
-    target_high_t = tf.constant(target_high, dtype=tf.float64)
+    pilot_length_t = tf.constant(pilot_length, dtype=tf.float64)
 
-    @tf.function(jit_compile=True, reduce_retracing=True)
     def _pilot(
         theta_in: tf.Tensor,
         k_in: tf.Tensor,
@@ -58,48 +54,35 @@ def _tune_block(
     ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Run a fixed-length pilot chain for one block."""
 
-        # Track the current state and cumulative acceptances within the pilot run.
-        i0 = tf.constant(0, dtype=tf.int32)
-        acc0 = tf.constant(0.0, dtype=tf.float64)
+        theta_cur = theta_in
+        seed_cur = seed_in
+        acc_sum = tf.constant(0.0, dtype=tf.float64)
 
-        def cond(i, theta_cur, acc_sum, seed_cur):
-            """Continue until the pilot run reaches its target length."""
-
-            return i < pilot_length_t
-
-        def body(i, theta_cur, acc_sum, seed_cur):
-            """Apply one block update and accumulate acceptance."""
-
+        for _ in range(pilot_length):
             seeds = tf.random.experimental.stateless_split(seed_cur, num=2)
             next_seed = seeds[0]
             step_seed = seeds[1]
 
             # Advance the current block by one proposal step under the current scale.
-            theta_new, acc_inc = step_fn(theta_cur, k_in, step_seed)
+            theta_cur, acc_inc = step_fn(theta_cur, k_in, step_seed)
             acc_sum = acc_sum + tf.cast(acc_inc, tf.float64)
-            return i + 1, theta_new, acc_sum, next_seed
+            seed_cur = next_seed
 
-        _, theta_out, acc_sum, seed_out = tf.while_loop(
-            cond=cond,
-            body=body,
-            loop_vars=(i0, theta_in, acc0, seed_in),
-            parallel_iterations=1,
-        )
-        return theta_out, acc_sum, seed_out
+        return theta_cur, acc_sum, seed_cur
 
     for round_id in range(max_rounds):
         # Evaluate the current proposal scale using one short pilot run.
         theta_end, acc_sum, seed = _pilot(theta, k, seed)
-        acc_rate = acc_sum / tf.cast(pilot_length_t, tf.float64)
+        acc_rate = acc_sum / pilot_length_t
 
         k_before = float(k.numpy())
         acc_rate_py = float(acc_rate.numpy())
 
         # Adjust the scale according to whether acceptance is too low, too high, or acceptable.
-        if acc_rate < target_low_t:
+        if acc_rate_py < target_low:
             action = "shrink"
             k = k / factor_t
-        elif acc_rate > target_high_t:
+        elif acc_rate_py > target_high:
             action = "grow"
             k = k * factor_t
         else:

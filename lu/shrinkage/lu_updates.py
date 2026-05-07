@@ -20,7 +20,6 @@ def _make_rw_kernel(
     )
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
 def beta_one_step(
     posterior: LuPosteriorTF,
     qjt: tf.Tensor,
@@ -67,7 +66,6 @@ def beta_one_step(
     return beta_new[0], beta_new[1], accepted
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
 def r_one_step(
     posterior: LuPosteriorTF,
     qjt: tf.Tensor,
@@ -113,7 +111,6 @@ def r_one_step(
     return r_new, accepted
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
 def _E_bar_market_one_step(
     posterior: LuPosteriorTF,
     qjt_t: tf.Tensor,
@@ -159,7 +156,7 @@ def _E_bar_market_one_step(
     return E_bar_t_new, accepted
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def E_bar_one_step(
     posterior: LuPosteriorTF,
     qjt: tf.Tensor,
@@ -236,7 +233,6 @@ def E_bar_one_step(
     return E_bar_new, accept_rate
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
 def _njt_market_one_step(
     posterior: LuPosteriorTF,
     qjt_t: tf.Tensor,
@@ -284,7 +280,7 @@ def _njt_market_one_step(
     return njt_t_new, accepted
 
 
-@tf.function(jit_compile=True, reduce_retracing=True)
+@tf.function(jit_compile=True)
 def njt_one_step(
     posterior: LuPosteriorTF,
     qjt: tf.Tensor,

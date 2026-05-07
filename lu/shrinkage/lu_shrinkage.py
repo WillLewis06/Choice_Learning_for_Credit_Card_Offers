@@ -436,7 +436,7 @@ def run_chain(
         )
 
     # Run one compiled chunk of the chain at a time.
-    @tf.function(jit_compile=True, reduce_retracing=True)
+    @tf.function(jit_compile=True)
     def _run_chunk(
         current_state: LuShrinkageState,
         previous_kernel_results: LuHybridKernelResults,
@@ -474,10 +474,22 @@ def run_chain(
     chunk_summaries: list[LuChunkSummary] = []
     retained_chunks: list[LuShrinkageState] = []
 
-    def run_phase(remaining_steps: int, retain: bool) -> int:
+    def run_phase(
+        remaining_steps: int,
+        retain: bool,
+        state: LuShrinkageState,
+        kernel_results: LuHybridKernelResults,
+        chunk_idx: int,
+        retained_chunks: list[LuShrinkageState],
+        chunk_summaries: list[LuChunkSummary],
+    ) -> tuple[
+        LuShrinkageState,
+        LuHybridKernelResults,
+        int,
+        list[LuShrinkageState],
+        list[LuChunkSummary],
+    ]:
         """Execute one chunked phase of the chain."""
-
-        nonlocal chunk_idx, state, kernel_results
 
         while remaining_steps > 0:
             this_chunk = min(tuned_config.chunk_size, remaining_steps)
@@ -509,11 +521,40 @@ def run_chain(
             remaining_steps -= this_chunk
             chunk_idx += 1
 
-        return remaining_steps
+        return state, kernel_results, chunk_idx, retained_chunks, chunk_summaries
 
     # Run the chain in two stages: burn-in first, then retained sampling.
-    run_phase(tuned_config.num_burnin_steps, retain=False)
-    run_phase(tuned_config.num_results, retain=True)
+    (
+        state,
+        kernel_results,
+        chunk_idx,
+        retained_chunks,
+        chunk_summaries,
+    ) = run_phase(
+        remaining_steps=tuned_config.num_burnin_steps,
+        retain=False,
+        state=state,
+        kernel_results=kernel_results,
+        chunk_idx=chunk_idx,
+        retained_chunks=retained_chunks,
+        chunk_summaries=chunk_summaries,
+    )
+
+    (
+        state,
+        kernel_results,
+        chunk_idx,
+        retained_chunks,
+        chunk_summaries,
+    ) = run_phase(
+        remaining_steps=tuned_config.num_results,
+        retain=True,
+        state=state,
+        kernel_results=kernel_results,
+        chunk_idx=chunk_idx,
+        retained_chunks=retained_chunks,
+        chunk_summaries=chunk_summaries,
+    )
 
     # Report the final run-level summary once chunk processing is complete.
     if len(chunk_summaries) > 0:
